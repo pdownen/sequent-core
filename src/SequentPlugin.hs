@@ -4,7 +4,7 @@ import GhcPlugins ( Plugin(installCoreToDos), CommandLineOption
                   , defaultPlugin
                   , reinitializeGlobals
                   , CoreM, CoreToDo(CoreDoPluginPass)
-                  , isBottomingId, idArity, isTypeArg
+                  , isBottomingId, idArity
                   , putMsg
                   , Var
                   )
@@ -46,15 +46,25 @@ commandIsBottom cmd =
     Var v -> isBottomingId v && contArgs (cmdCont cmd) >= idArity v
     _     -> False
 
-contArgs = undefined
-{-
 -- | How many immediatly visible arguments we have in a continuation.
 contArgs :: [Frame b] -> Int
-contArgs fs = length [ () | App a <- takeWhile notCase fs, not (isTypeArg a) ]
+contArgs fs =
+  length [ () | App a <- takeWhile notCase fs, not (isTypeCommand a) ]
   where notCase (Case {}) = False
         notCase _         = True
 
+-- | Does the argument to a function call look like a type?
+--
+-- Note: Arguments to function calls can be arbitrary computations
+-- (i.e. commands).  To be well-formed, a command with a type for its
+-- value should have an empty continuation, since we can't actually
+-- *do* anything to a type.  If for some reason we are doing something
+-- to a type (have a non-empty continuation), this command is
+-- nonsensical so just return false.
+isTypeCommand :: Command b -> Bool
+isTypeCommand cmd = isTypeValue (cmdValue cmd) && null (cmdCont cmd)
 
--}
-
-
+-- | Does this value look like a type?
+isTypeValue :: Value b -> Bool
+isTypeValue (Type {}) = True
+isTypeValue _         = False
