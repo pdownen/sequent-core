@@ -74,14 +74,14 @@ collectBinders _
 
 ppr_frame :: OutputableBndr b => Frame b -> SDoc
 ppr_frame (App comm)
-  = text "[] $" <+> pprParendComm comm
+  = text "_ $" <+> pprParendComm comm
 ppr_frame (Case var _ alts)
-  = hang (text "case [] of" <+> pprBndr CaseBind var) 2 $
+  = hang (text "case _ of" <+> pprBndr CaseBind var) 2 $
       vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)
 ppr_frame (Cast _)
-  = text "[] `cast` ..."
+  = text "_ `cast` ..."
 ppr_frame (Tick _)
-  = text "[] `tick` ..."
+  = text "_ `tick` ..."
 
 pprCoreAlt :: OutputableBndr b => Alt b -> SDoc
 pprCoreAlt (Alt con args rhs)

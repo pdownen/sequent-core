@@ -7,7 +7,7 @@ module Language.SequentCore.Dump (
   -- Note that translating to Sequent Core and back should give an /equivalent/
   -- program, but it may vary slightly. The effects should be benign, such as a
   -- @let@ floating around in an expression (but never across a lambda).
-  
+
   plugin
 ) where
 
@@ -32,11 +32,13 @@ plugin = defaultPlugin {
 install :: [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
 install _ todos =
   do reinitializeGlobals
-     -- This puts the dump pass at the end of the pipeline, after all
-     -- optimization. To see the pre-optimizer state, put 'dump' at the front
+     -- This puts the dump pass at the beginning of the pipeline, before any
+     -- optimization. To see the post-optimizer state, put 'dump' at the back
      -- of the list instead.
-     return $ todos ++ [dump]
-  where dump = CoreDoPluginPass "sequent-core-no-op" (sequentPass showSequentCore)
+     return $ newPass : todos
+  where
+    newPass  = CoreDoPluginPass "sequent-core-dump" passFunc
+    passFunc = sequentPass showSequentCore
 
 showSequentCore :: [SeqCoreBind] -> CoreM [SeqCoreBind]
 showSequentCore bs = do
