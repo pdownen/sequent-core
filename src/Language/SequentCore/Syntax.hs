@@ -26,7 +26,7 @@ data Value b    = Lit Literal       -- ^ A primitive literal value.
                                     -- argument to a type-level lambda.
                 | Coercion Coercion -- ^ A coercion. Used to pass evidence
                                     -- to the @cast@ operation.
-                | Var Id            -- ^ A variable.
+                | Var Var           -- ^ A variable.
 
 -- | A stack frame. A continuation is simply a list of these. Each represents
 -- the outer part of a Haskell expression, with a "hole" where a value can be

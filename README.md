@@ -179,8 +179,8 @@ since we aim to translate back and forth faithfully:
     Coercions are used by `cast` expressions: The expression
     <code>e \`cast\` c</code> is operationally the
     same as `e`, but its type is altered according to `c`. We express a cast
-    using a frame, so if `v` is a value, <code>&lt;v | _ \`cast\` c></code> is
-    the Sequent Core form of <code>v \`cast\` c</code>.
+    using a frame, so if `v` is a value, `<v | cast c>` is the Sequent Core form
+    of <code>v \`cast\` c</code>.
 *   **Ticks**  
     Finally, Core includes *ticks*, which are essentially markers for
     bookkeeping in the profiler. These wrap expressions, so we include them as
@@ -194,7 +194,7 @@ the Sequent Core syntax is closely related to Core, making the translation
 relatively simple. Here are all the constructors of the original `Core` type,
 showing where we put each one:
 
-| Constructor |
+| Constructor |       |       |         |
 | :---------- | :---- | :---- | :------ |
 | Var         | Value |       |         |
 | Lit         | Value |       |         |
