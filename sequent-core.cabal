@@ -14,7 +14,7 @@ library
                        Language.SequentCore.Plugin
                        Language.SequentCore.Pretty
                        Language.SequentCore.Syntax
-  build-depends:       base, ghc
+  build-depends:       base, ghc>=7.6
   default-language:    Haskell2010
   ghc-options:         -Wall -O2
 

@@ -57,12 +57,11 @@ patterns in the code often require substantial ad-hoc bookkeeping.
 
 We would prefer to write the above code like this:
 
-    <f | _ $ x
-       ; _ $ y
-       ; case _ of
-           True -> <g | _ $ x>
-           False -> <y | >
-       >
+    <f | $ x
+       ; $ y
+       ; case of
+           True -> <g | $ x>
+           False -> y>>
 
 We will explicate this syntax shortly, but the basic idea is apparent: The top
 of the term says what to do first, namely evaluate `f`. Next, we apply that
@@ -70,8 +69,6 @@ value to `x`, and then apply *that* value to `y`. Then, we perform a case
 analysis on that result. In the `True` case, we evaluate `g`, apply `x` to it,
 then return; in the `False` case, we evaluate y and return it directly. (By
 “return,” we mean give as the value for the whole expression.)
-
-**\[need a bit more here]**
 
 Syntax
 ------
@@ -95,7 +92,7 @@ which may be mutually recursive blocks):
     let bs in <v | f1; f2; f3>
 
 If there are no bindings, we leave off the `let ... in`, and if there are no
-frames, we leave the right side of the `|` empty.
+frames, we leave off the punctuation, writing `x` for `<x|>`.
 
 ### Application
 
@@ -108,14 +105,13 @@ so this frame is a function application missing the function part. Thus:
 
 is expressed as:
 
-    <f | _ $ x; _ $ y>
+    <f | $ x; $ y>
 
 This can be read as “Take `f` and apply it to `x`, then apply that to `y`.”
 
 In fact, the argument specified can in general be a *command*. This makes the
 lazy evaluation apparent, as a command appearing as an argument represents a
-suspended computation. When we write `x` as an argument, we actually mean the
-simple command `<x|>`, which does nothing but evaluate `x`.
+suspended computation.
 
 So a slightly more complicated example would be:
 
@@ -123,8 +119,8 @@ So a slightly more complicated example would be:
 
 which becomes:
 
-    <f | _ $ <g | _ $ x>
-       ; _ $ <h | _ $ y>>
+    <f | $ <g | $ x>
+       ; $ <h | $ y>>
 
 ### Case Analysis
 
@@ -139,14 +135,13 @@ The right-hand side of each case is a command.
 
 becomes:
 
-    <f | _ $ x
-       ; case _ of
-           Left  y -> <g | _ $ y>
-           Right z -> <h | _ $ z>>
+    <f | $ x
+       ; case of
+           Left  y -> <g | $ y>
+           Right z -> <h | $ z>>
 
 As before, Sequent Core emphasizes the execution order by putting the first
-action, the application of `f` to `x`, on top. **\[TODO Why is this a good
-thing?]**
+action, the application of `f` to `x`, on top.
 
 ### Let Bindings
 
@@ -162,10 +157,10 @@ of bindings with it. Hence:
 becomes:
 
     let
-      x = <f | $ _ y>
+      x = <f | $ y>
     in
-      <g | $ _ x
-         ; $ _ z>
+      <g | $ x
+         ; $ z>
 
 ### Miscellany
 
@@ -191,11 +186,31 @@ since we aim to translate back and forth faithfully:
     bookkeeping in the profiler. These wrap expressions, so we include them as
     frames in a similar manner to casts.
 
+### Summary
+
+In a sense, our data types do little more than divide the constructors of the
+`Core` datatype into three types, called `Value`, `Frame`, and `Command`. Thus
+the Sequent Core syntax is closely related to Core, making the translation
+relatively simple. Here are all the constructors of the original `Core` type,
+showing where we put each one:
+
+| Constructor |
+| :---------- | :---- | :---- | :------ |
+| Var         | Value |       |         |
+| Lit         | Value |       |         |
+| App         |       | Frame |         |
+| Let         |       |       | Command |
+| Case        |       | Frame |         |
+| Cast        |       | Frame |         |
+| Tick        |       | Frame |         |
+| Type        | Value |       |         |
+| Coercion    | Value |       |         | |
+
 An Example
 ----------
 
 To get a feel for Sequent Core, let us consider a simple function,
-a tail-recursive `sum` function:
+this tail-recursive `sum`:
 
     sum :: [Int] -> Int
     sum = sum' 0
@@ -233,28 +248,23 @@ pretty printer):
          {
              sum' :: Int -> [Int] -> Int
              sum' =
-               <\ (a :: Int) (ds :: [Int]) ->
-                  <ds
-                  | case _ of _
-                      { [] -> a
-                      ; : x xs ->
-                          <sum'
-                          | _ $ <+
-                                | _ $ @Int
-                                ; _ $ $fNumInt
-                                ; _ $ a
-                                ; _ $ x
-                                >
-                          ; _ $ xs
-                          >
-                      }
-                  >
-               |>
+               \ (a :: Int) (ds :: [Int]) ->
+                 <ds
+                 | case of _
+                     [] -> a
+                     x : xs ->
+                         <sum'
+                         | $ <+
+                             | $ @Int
+                             ; $ $fNumInt
+                             ; $ a
+                             ; $ x>
+                         ; $ xs>>
          }
-       in <sum' | _ $ <I# | _ $ 0>>
+       in <sum' | $ <I# | $ 0>>
 
-**\[TODO What can really be said here? There's nothing new. Maybe I should find
-a better example, but it's hard to find one that's not too big.]**
+<!-- TODO: Once we have SpecConstr, we should talk here about what benefits
+     the Sequent Core form provides. -->
 
 The Plugin Library
 ------------------

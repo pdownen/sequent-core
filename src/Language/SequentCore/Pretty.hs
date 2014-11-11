@@ -45,6 +45,8 @@ ppr_comm add_par comm
           [] -> empty
           binds -> hang (text "let") 2 (ppr_binds binds) $$ text "in"
     maybe_add_par = if null (cmdLet comm) then noParens else add_par
+    cut val []
+      = pprCoreValue val
     cut val frames
       = cat [text "<" <> pprCoreValue val, vcat $ ppr_block "|" ";" ">" $ map ppr_frame frames]
 
@@ -74,14 +76,14 @@ collectBinders _
 
 ppr_frame :: OutputableBndr b => Frame b -> SDoc
 ppr_frame (App comm)
-  = text "_ $" <+> pprParendComm comm
+  = char '$' <+> pprParendComm comm
 ppr_frame (Case var _ alts)
-  = hang (text "case _ of" <+> pprBndr CaseBind var) 2 $
+  = hang (text "case of" <+> pprBndr CaseBind var) 2 $
       vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)
 ppr_frame (Cast _)
-  = text "_ `cast` ..."
+  = text "cast ..."
 ppr_frame (Tick _)
-  = text "_ `tick` ..."
+  = text "tick ..."
 
 pprCoreAlt :: OutputableBndr b => Alt b -> SDoc
 pprCoreAlt (Alt con args rhs)
