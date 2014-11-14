@@ -1,5 +1,7 @@
 module Main where
 
+import Prelude hiding (map)
+
 fibs = 0 : 1 : zipWith (+) fibs (tail fibs)
 
 fib 0 = 0
@@ -12,3 +14,9 @@ f x = if fib 100 > 10 then f (x + 1) else 0
 main :: IO ()
 main = if fib 10 == fibs !! 10 then putStrLn "Yay!" else putStrLn "Boo!"
 
+sum :: [Int] -> Int
+sum               = sum' 0
+  where
+    sum' :: Int -> [Int] -> Int
+    sum' a []     = a
+    sum' a (x:xs) = sum' (a+x) xs
