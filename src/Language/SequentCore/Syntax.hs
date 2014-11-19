@@ -4,6 +4,7 @@ module Language.SequentCore.Syntax (
   Value(..), Frame(..), Cont, Command(..), Bind(..), Alt(..),
   SeqCoreValue, SeqCoreFrame, SeqCoreCont, SeqCoreCommand, SeqCoreBind,
     SeqCoreAlt,
+  valueCommand, varCommand, lambdas, addLets,
   fromCoreExpr, fromCoreBind, fromCoreBinds,
   commandToCoreExpr, valueToCoreExpr, frameToCoreExpr,
   toCoreBind, toCoreBinds, toCoreAlt
@@ -26,7 +27,7 @@ data Value b    = Lit Literal       -- ^ A primitive literal value.
                                     -- argument to a type-level lambda.
                 | Coercion Coercion -- ^ A coercion. Used to pass evidence
                                     -- to the @cast@ operation.
-                | Var Var           -- ^ A variable.
+                | Var Id            -- ^ A term variable.
 
 -- | A stack frame. A continuation is simply a list of these. Each represents
 -- the outer part of a Haskell expression, with a "hole" where a value can be
@@ -64,12 +65,24 @@ data Bind b     = NonRec b (Command b)
 
 data Alt b      = Alt AltCon [b] (Command b)
 
-type SeqCoreValue   = Value Var
-type SeqCoreFrame   = Frame Var
-type SeqCoreCont    = Cont Var
+type SeqCoreValue   = Value   Var
+type SeqCoreFrame   = Frame   Var
+type SeqCoreCont    = Cont    Var
 type SeqCoreCommand = Command Var
-type SeqCoreBind    = Bind Var
-type SeqCoreAlt     = Alt Var
+type SeqCoreBind    = Bind    Var
+type SeqCoreAlt     = Alt     Var
+
+valueCommand :: Value b -> Command b
+valueCommand v = Command { cmdLet = [], cmdValue = v, cmdCont = [] }
+
+varCommand :: Id -> Command b
+varCommand x = valueCommand (Var x)
+
+lambdas :: [b] -> Command b -> Command b
+lambdas xs body = foldr (\x c -> valueCommand (Lam x c)) body xs
+
+addLets :: [Bind b] -> Command b -> Command b
+addLets bs c = c { cmdLet = bs ++ cmdLet c }
 
 fromCoreExpr :: GHC.Expr b -> Command b
 fromCoreExpr = go [] []
