@@ -10,6 +10,72 @@
 -- <http://research.microsoft.com/en-us/um/people/simonpj/papers/spec-constr Call-pattern specialization for Haskell programs>,
 -- Simon Peyton Jones, submitted to ICFP 2007. 
 
+{-
+
+The idea of the SpecConstr (specialization by constructor) pass is to find
+instances of calls whose arguments are constructor invocations and replace them
+with calls to specialized versions of the called functions, thereby hoping to
+avoid needless allocation and case analysis. For instance, consider the
+following (contrived) example, found in @examples/SpecConstrExpl.hs@:
+
+    facOrNeg :: Either Int Int -> Int
+    facOrNeg (Left 0) = 1
+    facOrNeg (Left n) = n * facOrNeg (Left (n-1))
+    facOrNeg (Right n) = -n
+
+Depending one whether its argument is @Left@ or @Right, @forOrNeg@ acts as
+either the @fac@ or @neg@. But note the recursive call @facOrNeg (Left (n-1))@:
+We know it will always be evaluated by one of the first two clauses, which
+pulls the @Int@ out again. Thus each recursive call involves creating a Left
+value only to deconstruct it immediately.
+
+The result of SpecConstr is the introduction of a companion function:
+
+    facOrNeg :: Either Int Int -> Int
+    facOrNeg (Left 0) = 1
+    facOrNeg (Left n) = n * facOrNegLeft (n-1)
+    facOrNeg (Right n) = -n
+
+    facOrNegLeft :: Int -> Int
+    facOrNegLeft 0 = 1
+    facOrNegLeft n = n * facOrNegLeft (n-1)
+
+Now there are no superfluous constructions or matchings of Left values.
+
+Implementation
+--------------
+
+The basic strategy is the same as for the original Core version of SpecConstr.
+During the traversal:
+
+* Track whether each variable is bound as a function or argument (top-down flow)
+* Record whenever a function is called, along with the arguments, or an
+  argument is case-analyzed (bottom-up flow)
+* At each binding site for a recursive function, check whether the body calls
+  the function with a saturated constructor application as at least one argument
+  that is case-analyzed somewhere else in the body; if so, produce a specialized
+  function and a rewrite rule
+
+Like many passes, this one relies heavily on the fact that the simplifier will
+run afterward: We don't actually replace calls by the specialized versions, we
+only produce the rules that will do so.
+
+Formally, the SPJ paper gives six criteria that a function call must pass in
+order to give rise to a specialization:
+
+H1 The function is bound to a lambda
+H2 The body of the lambda isn't too big
+H3 The binding is recursive and the call is in its RHS
+H4 The call is saturated
+H5 At least one of the arguments is a constructor application
+H6 That argument is case-analysed somewhere in the RHS
+
+Criteria H3 and H4 are met during the course of traversal. The others are
+checked at the binding site for each recursive function; see the auxiliary
+functions for specialize.
+
+-}
+
 module Language.SequentCore.SpecConstr (
   plugin
 ) where
@@ -252,40 +318,9 @@ specialize env (ScUsage calls used) (x, c)
     -- Return the new binding along with all specialized bindings
     return $ (x', c) : map specToBinding specs
   where
-    -- Create the specializations for the binding @let x = c@.
-    mkSpecs :: CoreM [Spec]
-    mkSpecs
-      -- Find all calls made to this function
-      | Just cs <- calls `lookupVarEnv` x
-      = do
-        -- Make a pattern for each call that we want to specialize for
-        pats <- mapM callToPat (filter shouldSpec cs)
-        -- Make a specialized function for each unique call pattern
-        mapM specCall (nubBy samePat pats)
-      | otherwise
-      = return [] -- No calls made to this function
-
-    {- 
-     - The Paper gives 6 criteria for specialization, some of which must hold
-     - or we wouldn't be here:
-     -
-     - H1 x is bound to a lambda
-     - H2 c isn't too big
-     - H3 The binding is recursive and the call is in its RHS (check)
-     - H4 The call is saturated (check; see usageFromCut)
-     - H5 At least one of the arguments is a constructor application
-     - H6 That argument is case-analysed somewhere in the RHS
-     -
-     - Note that we're actually allowing mutual recursion, because we might
-     - be here because there was a call here from some other function in the
-     - same binding group. (This is refinement R4 in The Paper.)
-     -
-     - We can check H1 and H2 once for this variable x, so we do so in skip.
-     - H5 and H6 are checked for each call by shouldSpec.
-     -}
-
-    -- | Decide whether to skip this binding altogether (i.e. check criteria
-    -- H1 and H2).
+    -- | Decide whether to skip this binding altogether. This checks whether
+    -- the binding satisfies criteria H1 and H2 (see implementation notes at
+    -- top).
     skip :: Bool
     skip | null binders
          = True -- H1 fails
@@ -299,6 +334,19 @@ specialize env (ScUsage calls used) (x, c)
     binders :: [Var] -- ^ Binders for the bound function. Empty if not a function.
     body :: SeqCoreCommand -- ^ Body of the bound function after all lambdas.
     (binders, body) = collectLambdas c
+
+    -- Create the specializations for the binding @let x = c@.
+    mkSpecs :: CoreM [Spec]
+    mkSpecs
+      -- Find all calls made to this function
+      | Just cs <- calls `lookupVarEnv` x
+      = do
+        -- Make a pattern for each call that we want to specialize for
+        pats <- mapM callToPat (filter shouldSpec cs)
+        -- Make a specialized function for each unique call pattern
+        mapM specCall (nubBy samePat pats)
+      | otherwise
+      = return [] -- No calls made to this function
 
     -- | Decide whether to specialize for a particular call (i.e. check
     -- criteria H5 and H6).
@@ -374,8 +422,11 @@ specialize env (ScUsage calls used) (x, c)
           
 infix 4 `samePat`
 
+-- Decide whether two call patterns are identical up to alpha-renaming.
 samePat :: CallPat -> CallPat -> Bool
 xs1 :-> cs1 `samePat` xs2 :-> cs2 =
+  -- We compare the lists cs1 and cs2 in an environment in which the variables
+  -- xs1 in cs1 are identified with the variables xs2 in cs2. (See Ops.)
   aeqIn env cs1 cs2
   where
     env = rnBndrs2 (mkRnEnv2 emptyInScopeSet) xs1 xs2

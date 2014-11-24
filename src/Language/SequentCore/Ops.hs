@@ -50,8 +50,7 @@ isLambda _
 -- other words, true if it is @\<Ctor | [$ a1, $ a2, $ ..., $ an, ...]>@ for
 -- some constructor @Ctor@ with arity @n@.
 isSaturatedCtorApp :: Command b -> Bool
-isSaturatedCtorApp c@(Command { cmdLet = [], cmdValue = Var x
-                              , cmdCont = App _ : _ })
+isSaturatedCtorApp c@(Command { cmdLet = [], cmdValue = Var x })
   | Just _ <- isDataConId_maybe x
   , Just _ <- saturatedCall c
   = True
