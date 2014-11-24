@@ -1,13 +1,19 @@
-module Language.SequentCore.Dump (
-  -- | An example GHC optimizer plugin using Sequent Core. Simply translates the
-  -- given Core code to Sequent Core, dumps it to the screen, then translates
-  -- back. This allows inspection of the Sequent Core code for a module and also
-  -- tests the translation functions.
-  --
-  -- Note that translating to Sequent Core and back should give an /equivalent/
-  -- program, but it may vary slightly. The effects should be benign, such as a
-  -- @let@ floating around in an expression (but never across a lambda).
+-- |
+-- Module      : Language.SequentCore.Dump
+-- Description : Example plugin
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
+--
+-- An example GHC optimizer plugin using Sequent Core. Simply translates the
+-- given Core code to Sequent Core, dumps it to the screen, then translates
+-- back. This allows inspection of the Sequent Core code for a module and also
+-- tests the translation functions.
+--
+-- Note that translating to Sequent Core and back should give an /equivalent/
+-- program, but it may vary slightly. The effects should be benign, such as a
+-- @let@ floating around in an expression (but never across a lambda).
 
+module Language.SequentCore.Dump (
   plugin
 ) where
 

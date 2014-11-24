@@ -1,38 +1,48 @@
-{-# LANGUAGE
-    FlexibleInstances, PatternGuards, ScopedTypeVariables,
-    ParallelListComp #-}
+-- |
+-- Module      : Language.SequentCore.SpecConstr
+-- Description : SpecConstr reimplementation
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
+--
+-- A simple reimplementation of the SpecConstr pass using Sequent Core.
+--
+-- Based on
+-- <http://research.microsoft.com/en-us/um/people/simonpj/papers/spec-constr Call-pattern specialization for Haskell programs>,
+-- Simon Peyton Jones, submitted to ICFP 2007. 
 
-module Language.SequentCore.SpecConstr (plugin) where
+module Language.SequentCore.SpecConstr (
+  plugin
+) where
 
 import Language.SequentCore.Ops
 import Language.SequentCore.Plugin
 import Language.SequentCore.Pretty ()
 import Language.SequentCore.Syntax
 
+import CoreMonad  ( CoreM
+                  , Plugin(installCoreToDos), defaultPlugin
+                  , errorMsg
+                  , reinitializeGlobals
+                  , CoreToDo(CoreDoSpecConstr, CoreDoPasses, CoreDoPluginPass) )
 import CoreUnfold ( couldBeSmallEnoughToInline )
 import CoreSyn    ( CoreRule )
+import DynFlags   ( DynFlags(specConstrThreshold), getDynFlags )
 import FastString ( fsLit, mkFastString )
-import GhcPlugins ( Plugin(installCoreToDos), defaultPlugin, CoreM()
-                  , putMsg, errorMsg
-                  , reinitializeGlobals
-                  , CoreToDo(CoreDoSpecConstr, CoreDoPasses, CoreDoPluginPass)
-                  , DynFlags, getDynFlags, specConstrThreshold
-                  )
 import Id         ( Id, mkSysLocalM, idName, idInlineActivation )
 import Name       ( nameOccName, occNameString )
 import Outputable
 import Rules      ( mkRule, addIdSpecialisations )
-import Type       ( Type )
-import UniqSupply
-import Var        ( Var, varType, isTKVar )
+import Var        ( Var, varType )
 import VarEnv
 import VarSet
 
-import Control.Applicative ((<$>), (<|>))
+import Control.Applicative  ( (<$>), (<|>) )
 import Control.Monad
-import Data.List (nubBy)
+import Data.List            ( nubBy )
 import Data.Monoid
 
+-- | Plugin data. The initialization code replaces the built-in SpecConstr pass
+-- in the Core-to-Core pipeline.
 plugin :: Plugin
 plugin = defaultPlugin {
   installCoreToDos = \_ todos -> do
@@ -61,9 +71,6 @@ plugin = defaultPlugin {
     = Nothing
 
   specConstrPass = CoreDoPluginPass "SeqSpecConstr" (sequentPass specModule)
-
-class SpecConstr a where
-  spec :: MonadUnique m => ScEnv -> a -> m (ScUsage, a)
 
 data ScEnv
   = SCE { sc_size       :: Maybe Int
@@ -98,7 +105,7 @@ type ArgUsage = VarSet
 specModule :: [SeqCoreBind] -> CoreM [SeqCoreBind]
 specModule binds = do
   env <- initScEnv <$> getDynFlags
-  snd <$> spec env binds
+  map snd <$> mapM (specInBind env) binds
 
 initScEnv :: DynFlags -> ScEnv
 initScEnv dflags = SCE { sc_size = specConstrThreshold dflags
@@ -114,54 +121,65 @@ instance Monoid ScUsage where
   ScUsage calls1 used1 `mappend` ScUsage calls2 used2
     = ScUsage (plusVarEnv_C (++) calls1 calls2) (used1 `unionVarSet` used2)
 
-instance SpecConstr SeqCoreValue where
-  spec env (Lam x c)
-    = do
-      (usage, c') <- spec env' c
-      return (usage, Lam x c')
-    where
-      env' = env { sc_how_bound = extendVarEnv hb x SpecArg }
-      hb   = sc_how_bound env 
-  spec _ v
-    = return (emptyScUsage, v)
+specInValue :: ScEnv -> SeqCoreValue -> CoreM (ScUsage, SeqCoreValue)
+specInValue env (Lam x c)
+  = do
+    (usage, c') <- specInCommand env' c
+    return (usage, Lam x c')
+  where
+    env' = env { sc_how_bound = extendVarEnv hb x SpecArg }
+    hb   = sc_how_bound env 
+specInValue _ v
+  = return (emptyScUsage, v)
 
-instance SpecConstr SeqCoreFrame where
-  spec env (App c)
-    = do
-      (usage, c') <- spec env c
-      return (usage, App c')
-  spec env (Case x t as)
-    = do
-      (usage, as') <- spec env as
-      return (usage, Case x t as')
-  spec _ f
-    = return (emptyScUsage, f)
+specInFrame :: ScEnv -> SeqCoreFrame -> CoreM (ScUsage, SeqCoreFrame)
+specInFrame env (App c)
+  = do
+    (usage, c') <- specInCommand env c
+    return (usage, App c')
+specInFrame env (Case x t as)
+  = do
+    (usages, as') <- unzip <$> mapM (specInAlt env) as
+    return (mconcat usages, Case x t as')
+specInFrame _ f
+  = return (emptyScUsage, f)
 
-instance SpecConstr SeqCoreCommand where
-  spec env (Command { cmdLet = bs, cmdValue = v, cmdCont = fs })
-    = specBinds env bs [] []
-    where
-      specBinds :: MonadUnique m
-                => ScEnv -> [SeqCoreBind] -> [SeqCoreBind] -> [ScUsage]
-                         -> m (ScUsage, SeqCoreCommand)
-      specBinds env [] bs' usages
-        = do
-          (usage', v', fs') <- specCut env
-          return (mconcat (usage' : usages), Command 
-            { cmdLet = reverse bs', cmdValue = v', cmdCont = fs' })
-      specBinds env (b : bs) bs' usages
-        = do
-          (usage', env', b') <- specBind env b
-          specBinds env' bs (b' : bs') (usage' : usages)
-      
-      specCut :: MonadUnique m
-              => ScEnv -> m (ScUsage, SeqCoreValue, SeqCoreCont)
-      specCut env
-        = do
-          let u = usageFromCut env v fs
-          (u_v, v') <- spec env v
-          (u_fs, fs') <- spec env fs
-          return (u `mappend` u_v `mappend` u_fs, v', fs')
+specInAlt :: ScEnv -> SeqCoreAlt -> CoreM (ScUsage, SeqCoreAlt)
+specInAlt env (Alt ac xs c)
+  = do
+    (usage, c') <- specInCommand env c
+    return (usage, Alt ac xs c')
+
+specInBind :: ScEnv -> SeqCoreBind -> CoreM (ScUsage, SeqCoreBind)
+specInBind env b
+  = do
+    (u, _, b') <- specBind env b
+    return (u, b')
+
+specInCommand :: ScEnv -> SeqCoreCommand -> CoreM (ScUsage, SeqCoreCommand)
+specInCommand env (Command { cmdLet = bs, cmdValue = v, cmdCont = fs })
+  = specBinds env bs [] []
+  where
+    specBinds :: ScEnv -> [SeqCoreBind] -> [SeqCoreBind] -> [ScUsage]
+                       -> CoreM (ScUsage, SeqCoreCommand)
+    specBinds env [] bs' usages
+      = do
+        (usage', v', fs') <- specInCut env v fs
+        return (mconcat (usage' : usages), Command 
+          { cmdLet = reverse bs', cmdValue = v', cmdCont = fs' })
+    specBinds env (b : bs) bs' usages
+      = do
+        (usage', env', b') <- specBind env b
+        specBinds env' bs (b' : bs') (usage' : usages)
+    
+specInCut :: ScEnv -> SeqCoreValue -> SeqCoreCont
+        -> CoreM (ScUsage, SeqCoreValue, SeqCoreCont)
+specInCut env v fs
+  = do
+    let u = usageFromCut env v fs
+    (u_v, v') <- specInValue env v
+    (us_fs, fs') <- unzip <$> mapM (specInFrame env) fs
+    return (u `mappend` u_v `mappend` mconcat us_fs, v', fs')
 
 usageFromCut :: ScEnv -> SeqCoreValue -> SeqCoreCont -> ScUsage
 usageFromCut env (Var x) (Case {} : _)
@@ -169,26 +187,19 @@ usageFromCut env (Var x) (Case {} : _)
   = ScUsage emptyVarEnv (unitVarSet x)
 usageFromCut env v@(Var f) fs
   | Just SpecFun <- sc_how_bound env `lookupVarEnv` f
-  , Just (args, _) <- saturatedCall v fs
+  , Just (_, args, _) <- saturatedCall (Command [] v fs)
   = ScUsage (unitVarEnv f [args]) emptyVarSet
 usageFromCut _ _ _
   = emptyScUsage
 
-instance SpecConstr a => SpecConstr [a] where
-  spec env as
-    = do
-      (us, as') <- unzip `liftM` mapM (spec env) as
-      return (mconcat us, as')
-
-specBind :: MonadUnique m
-         => ScEnv -> SeqCoreBind -> m (ScUsage, ScEnv, SeqCoreBind)
+specBind :: ScEnv -> SeqCoreBind -> CoreM (ScUsage, ScEnv, SeqCoreBind)
 specBind env (NonRec x c)
   = do
-    (u, c') <- spec env c
+    (u, c') <- specInCommand env c
     return (u, env, NonRec x c')
 specBind env (Rec bs)
   = do
-    (usages, cs') <- unzip `liftM` mapM (spec env' . snd) bs
+    (usages, cs') <- unzip `liftM` mapM (specInCommand env' . snd) bs
     let
       totalUsages = mconcat usages
       bs'         = zip (map fst bs) cs'
@@ -204,6 +215,8 @@ data CallPat = [Var] :-> [SeqCoreCommand]
 instance Outputable CallPat where
   ppr (xs :-> args) = ppr xs <+> text ":->" <+> ppr args
 
+-- | A generated specialization---the call pattern that gave rise to it, the
+-- identifier of the specialized function, and the function's definition.
 data Spec = Spec {
   spec_pat :: CallPat,
   spec_id :: Id,
@@ -217,27 +230,40 @@ instance Outputable Spec where
       , text "id" <+> (ppr $ spec_id spec)
       , text "defn" <+> (ppr $ spec_defn spec)
       ]
-            
-specialize :: forall m. MonadUnique m
-           => ScEnv -> ScUsage -> (Var, SeqCoreCommand)
-           -> m [(Var, SeqCoreCommand)]
+
+specToBinding :: Spec -> (Var, SeqCoreCommand)
+specToBinding (Spec { spec_id = x, spec_defn = c }) = (x, c)
+
+-- | The kernel of the SpecConstr pass. Takes the environment, data about how
+-- variables are used, and a let binding (part of a recursive block), and
+-- returns a new list of bindings---the original one (with specialization rules
+-- added) and also all specialized versions.
+specialize :: ScEnv -> ScUsage -> (Var, SeqCoreCommand)
+                    -> CoreM [(Var, SeqCoreCommand)]
 specialize env (ScUsage calls used) (x, c)
   | skip
   = return [(x, c)]
   | otherwise
   = do
+    -- Create the specializations
     specs <- mkSpecs
+    -- Add specization rules to the function's identifier
     let x' = addRulesForSpecs specs
-    return $ (x', c) : [ (spec_id s, spec_defn s) | s <- specs ]
+    -- Return the new binding along with all specialized bindings
+    return $ (x', c) : map specToBinding specs
   where
-    mkSpecs :: m [Spec]
+    -- Create the specializations for the binding @let x = c@.
+    mkSpecs :: CoreM [Spec]
     mkSpecs
+      -- Find all calls made to this function
       | Just cs <- calls `lookupVarEnv` x
       = do
+        -- Make a pattern for each call that we want to specialize for
         pats <- mapM callToPat (filter shouldSpec cs)
+        -- Make a specialized function for each unique call pattern
         mapM specCall (nubBy samePat pats)
       | otherwise
-      = return [] -- var not in env somehow??
+      = return [] -- No calls made to this function
 
     {- 
      - The Paper gives 6 criteria for specialization, some of which must hold
@@ -258,20 +284,24 @@ specialize env (ScUsage calls used) (x, c)
      - H5 and H6 are checked for each call by shouldSpec.
      -}
 
+    -- | Decide whether to skip this binding altogether (i.e. check criteria
+    -- H1 and H2).
     skip :: Bool
-    skip | not $ isLambda c
-         = True
+    skip | null binders
+         = True -- H1 fails
          | Just sz <- sc_size env
          , not $ couldBeSmallEnoughToInline (sc_dflags env) sz
-             (commandToCoreExpr c)
-         = True
+             (commandToCoreExpr body)
+         = True -- H2 fails
          | otherwise
          = False
 
-    binders :: [Var]
-    body :: SeqCoreCommand
+    binders :: [Var] -- ^ Binders for the bound function. Empty if not a function.
+    body :: SeqCoreCommand -- ^ Body of the bound function after all lambdas.
     (binders, body) = collectLambdas c
 
+    -- | Decide whether to specialize for a particular call (i.e. check
+    -- criteria H5 and H6).
     shouldSpec :: Call -> Bool
     shouldSpec args
       = or $ zipWith qualifyingArg binders args
@@ -279,45 +309,56 @@ specialize env (ScUsage calls used) (x, c)
         qualifyingArg x' arg
           = isSaturatedCtorApp arg && x' `elemVarSet` used
 
-    specCall :: CallPat -> m Spec
+    -- | Create a specialization for a call pattern.
+    specCall :: CallPat -> CoreM Spec
     specCall pat@(vars :-> vals)
       = do
         let c' = lambdas vars $
-                  addLets [ NonRec b v | b <- binders | v <- vals ] body
-        f <- mkSysLocalM (fsLit "scsc") (commandType c')
-        return $ Spec pat f c'
+                  addLets (zipWith NonRec binders vals) body
+        x' <- mkSysLocalM (fsLit "scsc") (commandType c')
+        return $ Spec { spec_pat = pat, spec_id = x', spec_defn = c' }
 
-    callToPat :: Call -> m CallPat
+    -- | Extract a call pattern, given the arguments in a call.
+    callToPat :: Call -> CoreM CallPat
     callToPat args
       = do
         (varss, rhss) <- unzip `liftM` zipWithM argToSubpat binders args
         return $ concat varss :-> rhss
 
-    argToSubpat :: Var -> SeqCoreCommand -> m ([Var], SeqCoreCommand)
-
-    argToSubpat var c
-      | Just (ctor, args, fs) <- saturatedCtorApp c
+    -- | Given an argument to the call, abstract over it to produce part of a
+    -- call pattern. This produces some number of pattern variables and one
+    -- argument.
+    argToSubpat :: Var -> SeqCoreCommand -> CoreM ([Var], SeqCoreCommand)
+    argToSubpat var arg
+      -- This is a saturated constructor application, so abstract over its
+      -- arguments to produce the subpattern
+      | Just (ctor, args, _) <- saturatedCtorApp arg
       = do
         -- Abstract over *term* arguments only
         let (tyArgs, tmArgs) = span isNontermArg args
         tmVars <- mapM (mkSysLocalM (fsLit "scsca") . commandType) tmArgs
         let cont = map App (tyArgs ++ map varCommand tmVars)
-            cmd = Command { cmdValue = ctor
+            cmd = Command { cmdValue = Var ctor
                           , cmdCont = cont
                           , cmdLet = [] }
         return (tmVars, cmd)
+      -- Just abstract over the whole argument; it's either a variable or
+      -- something like a function application, so specializing for it doesn't
+      -- make sense
       | otherwise
       = do
         p <- mkSysLocalM (fsLit "scsca") (varType var)
         return ([p], varCommand p)
 
+    -- | Produce a new version of the bound variable @x@, with a rule attached
+    -- for each specialization.
     addRulesForSpecs :: [Spec] -> Var
     addRulesForSpecs specs
-      = addIdSpecialisations x (zipWith specAsRule specs [1..])
+      = addIdSpecialisations x (zipWith ruleForSpec specs [1..])
 
-    specAsRule :: Spec -> Int -> CoreRule
-    specAsRule (Spec { spec_pat = patVars :-> patArgs
-                     , spec_id = x', spec_defn = c' }) n
+    -- | Create the rewrite rule that activates the given specialization.
+    ruleForSpec :: Spec -> Int -> CoreRule
+    ruleForSpec (Spec { spec_pat = patVars :-> patArgs, spec_id = x' }) n
       = mkRule auto local name act fn bndrs args rhs
       where
         auto  = True
@@ -331,17 +372,10 @@ specialize env (ScUsage calls used) (x, c)
         rhs   = commandToCoreExpr $
                   Command [] (Var x') (map (App . varCommand) patVars)
           
+infix 4 `samePat`
+
 samePat :: CallPat -> CallPat -> Bool
-samePat (xs1 :-> cs1) (xs2 :-> cs2) = False -- TODO
-
-instance SpecConstr SeqCoreAlt where
-  spec env (Alt ac xs c)
-    = do
-      (usage, c') <- spec env c
-      return (usage, Alt ac xs c')
-
-instance SpecConstr SeqCoreBind where
-  spec env b
-    = do
-      (u, _, b') <- specBind env b
-      return (u, b')
+xs1 :-> cs1 `samePat` xs2 :-> cs2 =
+  aeqIn env cs1 cs2
+  where
+    env = rnBndrs2 (mkRnEnv2 emptyInScopeSet) xs1 xs2

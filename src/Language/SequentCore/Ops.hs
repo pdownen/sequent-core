@@ -1,11 +1,18 @@
-{-# LANGUAGE PatternGuards, ParallelListComp #-}
+{-# LANGUAGE ParallelListComp #-}
+-- |
+-- Module      : Language.SequentCore.Ops
+-- Description : Useful operations on Sequent Core syntax
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
 
 module Language.SequentCore.Ops (
+  -- * Computations
   collectLambdas, isLambda, isSaturatedCtorApp,
   isTypeArg, isNontermArg, isTypeValue, isNontermValue,
   saturatedCall, saturatedCtorApp,
   valueArity, commandType,
-  (=~), HasId(..)
+  -- * Alpha-equivalence
+  (=~=), AlphaEq(..), AlphaEnv, HasId(..)
 ) where
 
 import Language.SequentCore.Syntax
@@ -16,13 +23,14 @@ import Coercion (coercionType, Coercion)
 import CoreUtils (exprType)
 import Type (Type)
 import Var (Id, Var, idInfo, isId)
+import VarEnv
+
+import Data.Maybe
 
 import qualified Type
 
-import Data.Map (Map)
-
-import qualified Data.Map.Strict as Map
-
+-- | Divide a command into a sequence of lambdas and a body. If @c@ is not a
+-- lambda, then @collectLambdas c == ([], c)@.
 collectLambdas :: Command b -> ([b], Command b)
 collectLambdas (Command { cmdLet = [], cmdCont = [], cmdValue = Lam x c })
   = (x : xs, c')
@@ -30,67 +38,88 @@ collectLambdas (Command { cmdLet = [], cmdCont = [], cmdValue = Lam x c })
 collectLambdas c
   = ([], c)
 
+-- | True if the given command is a simple lambda, with no let bindings and no
+-- continuation.
 isLambda :: Command b -> Bool
 isLambda (Command { cmdLet = [], cmdCont = [], cmdValue = Lam _ _ })
   = True
 isLambda _
   = False
 
+-- | True if the given command is a saturated application of a constructor. In
+-- other words, true if it is @\<Ctor | [$ a1, $ a2, $ ..., $ an, ...]>@ for
+-- some constructor @Ctor@ with arity @n@.
 isSaturatedCtorApp :: Command b -> Bool
-isSaturatedCtorApp (Command { cmdLet = [], cmdValue = v@(Var x)
-                            , cmdCont = fs@(App _ : _) })
+isSaturatedCtorApp c@(Command { cmdLet = [], cmdValue = Var x
+                              , cmdCont = App _ : _ })
   | Just _ <- isDataConId_maybe x
-  , Just _ <- saturatedCall v fs
+  , Just _ <- saturatedCall c
   = True
 isSaturatedCtorApp _
   = False
 
+-- | True if the given command simply returns a type as a value. This may only
+-- be true of a command appearing as an argument (that is, inside an 'App'
+-- frame).
 isTypeArg :: Command b -> Bool
 isTypeArg (Command { cmdValue = Type _, cmdCont = [] }) = True
 isTypeArg _ = False
 
+-- | True if the given command simply returns a value that is either a type or
+-- a coercion. This may only be true of a command appearing as an argument (that
+-- is, inside an 'App' frame).
 isNontermArg :: Command b -> Bool
 isNontermArg (Command { cmdValue = v, cmdCont = [] })
   = isNontermValue v
 isNontermArg _ = False
 
+-- | True if the given value is a type. See 'Type'.
 isTypeValue :: Value b -> Bool
 isTypeValue (Type _) = True
 isTypeValue _ = False
 
+-- | True if the given value is a type or coercion.
 isNontermValue :: Value b -> Bool
 isNontermValue (Type _) = True
 isNontermValue (Coercion _) = True
 isNontermValue _ = False
 
--- TODO Make types of functions consistent
-saturatedCall :: Value b -> Cont b -> Maybe ([Command b], Cont b)
-saturatedCall v fs
+-- | If a command represents a saturated call to some function, splits it into
+-- the function, the arguments, and the remaining continuation after the
+-- arguments.
+saturatedCall :: Command b -> Maybe (Value b, [Command b], Cont b)
+saturatedCall (Command { cmdValue = v, cmdCont = fs })
   | 0 < arity, arity <= length args
-  = Just ans
+  = Just (v, args, others)
   | otherwise
   = Nothing
   where
     arity = valueArity v
 
-    (args, _) = ans
-    ans = go fs []
-    go (App c : fs') acc = go fs' (c : acc)
-    go fs' acc = (reverse acc, fs')
+    (args, others) = go fs
+    go (App a : fs') = (a : as', fs'') where (as', fs'') = go fs'
+    go fs' = ([], fs')
 
 -- TODO We should consider making a saturated constructor invocation a kind of
 -- Value. It would make case-of-known-case a shallow pattern-match, for
 -- instance.
-saturatedCtorApp :: Command b -> Maybe (Value b, [Command b], Cont b)
-saturatedCtorApp (Command { cmdValue = v@(Var fn), cmdCont = fs })
-  | Just (args, fs') <- saturatedCall v fs
-  , Just _ <- isDataConId_maybe fn
-  = Just (v, args, fs')
-saturatedCtorApp _ = Nothing
 
+-- | If a command represents a saturated application of a constructor, splits it
+-- into the constructor's identifier, the arguments, and the remaining
+-- continuation after the constructor.
+saturatedCtorApp :: Command b -> Maybe (Var, [Command b], Cont b)
+saturatedCtorApp c
+  = do
+    (Var fn, args, fs') <- saturatedCall c
+    isDataConId_maybe fn
+    return (fn, args, fs')
+
+-- | Compute the type of a command.
 commandType :: SeqCoreCommand -> Type
-commandType = exprType . commandToCoreExpr
+commandType = exprType . commandToCoreExpr -- Cheaty, but effective
 
+-- | Compute (a conservative estimate of) the arity of a value. If the value is
+-- a variable, this may be a lower bound.
 valueArity :: Value b -> Int
 valueArity (Var x)
   | isId x = arityInfo (idInfo x)
@@ -99,95 +128,119 @@ valueArity (Lam _ c)
   where (xs, _) = collectLambdas c
 valueArity _ = 0
 
+-- | A class of types that contain an identifier. Useful so that we can compare,
+-- say, elements of @Command b@ for any @b@ that wraps an identifier with
+-- additional information.
 class HasId a where
+  -- | The identifier contained by the type @a@.
   identifier :: a -> Id
 
 instance HasId Var where
   identifier x = x
 
-type AlphaEnv = Map Id Id
+-- | The type of the environment of an alpha-equivalence comparison. Only needed
+-- by user code if two terms need to be compared under some assumed
+-- correspondences between free variables. See GHC's 'VarEnv' module for
+-- operations.
+type AlphaEnv = RnEnv2
 
+infix 4 =~=, `aeq`
+
+-- | The class of types that can be compared up to alpha-equivalence.
 class AlphaEq a where
-  alphaIn :: AlphaEnv -> a -> a -> Bool
+  -- | True if the two given terms are the same, up to renaming of bound
+  -- variables.
+  aeq :: a -> a -> Bool
+  -- | True if the two given terms are the same, up to renaming of bound
+  -- variables and the specified equivalences between free variables.
+  aeqIn :: AlphaEnv -> a -> a -> Bool
 
-(=~) :: AlphaEq a => a -> a -> Bool
-(=~) = alphaIn Map.empty
+  aeq = aeqIn emptyAlphaEnv
+
+-- | An empty context for alpha-equivalence comparisons.
+emptyAlphaEnv :: AlphaEnv
+emptyAlphaEnv = mkRnEnv2 emptyInScopeSet
+
+
+-- | True if the two given terms are the same, up to renaming of bound
+-- variables.
+(=~=) :: AlphaEq a => a -> a -> Bool
+(=~=) = aeq
 
 instance HasId b => AlphaEq (Value b) where
-  alphaIn _ (Lit l1) (Lit l2)
+  aeqIn _ (Lit l1) (Lit l2)
     = l1 == l2
-  alphaIn env (Lam b1 c1) (Lam b2 c2)
-    = alphaIn (Map.insert (identifier b1) (identifier b2) env) c1 c2
-  alphaIn env (Type t1) (Type t2)
-    = alphaIn env t1 t2
-  alphaIn env (Coercion co1) (Coercion co2)
-    = alphaIn env co1 co2
-  alphaIn env (Var x1) (Var x2)
-    | Just x' <- Map.lookup x1 env = x' == x2
-    | otherwise = x1 == x2 -- free variable; must be equal
-  alphaIn _ _ _
+  aeqIn env (Lam b1 c1) (Lam b2 c2)
+    = aeqIn (rnBndr2 env (identifier b1) (identifier b2)) c1 c2
+  aeqIn env (Type t1) (Type t2)
+    = aeqIn env t1 t2
+  aeqIn env (Coercion co1) (Coercion co2)
+    = aeqIn env co1 co2
+  aeqIn env (Var x1) (Var x2)
+    = env `rnOccL` x1 == env `rnOccR` x2
+  aeqIn _ _ _
     = False
 
 instance HasId b => AlphaEq (Frame b) where
-  alphaIn env (App c1) (App c2)
-    = alphaIn env c1 c2
-  alphaIn env (Case x1 t1 as1) (Case x2 t2 as2)
-    = alphaIn env' t1 t2 && alphaIn env' as1 as2
-      where env' = Map.insert (identifier x1) (identifier x2) env
-  alphaIn env (Cast co1) (Cast co2)
-    = alphaIn env co1 co2
-  alphaIn _ (Tick ti1) (Tick ti2)
+  aeqIn env (App c1) (App c2)
+    = aeqIn env c1 c2
+  aeqIn env (Case x1 t1 as1) (Case x2 t2 as2)
+    = aeqIn env' t1 t2 && aeqIn env' as1 as2
+      where env' = rnBndr2 env (identifier x1) (identifier x2)
+  aeqIn env (Cast co1) (Cast co2)
+    = aeqIn env co1 co2
+  aeqIn _ (Tick ti1) (Tick ti2)
     = ti1 == ti2
-  alphaIn _ _ _
+  aeqIn _ _ _
     = False
 
 instance HasId b => AlphaEq (Command b) where
-  alphaIn env 
+  aeqIn env 
     (Command { cmdLet = bs1, cmdValue = v1, cmdCont = c1 })
     (Command { cmdLet = bs2, cmdValue = v2, cmdCont = c2 })
-    | Just env' <- alphaBindsIn env bs1 bs2
-    = alphaIn env' v1 v2 && alphaIn env' c1 c2
+    | Just env' <- aeqBindsIn env bs1 bs2
+    = aeqIn env' v1 v2 && aeqIn env' c1 c2
     | otherwise
     = False
 
-alphaBindsIn :: HasId b => AlphaEnv -> [Bind b] -> [Bind b] -> Maybe AlphaEnv
-alphaBindsIn env [] []
+-- | If the given lists of bindings are alpha-equivalent, returns an augmented
+-- environment tracking the correspondences between the bound variables.
+aeqBindsIn :: HasId b => AlphaEnv -> [Bind b] -> [Bind b] -> Maybe AlphaEnv
+aeqBindsIn env [] []
   = Just env
-alphaBindsIn env (b1:bs1) (b2:bs2)
-  = alphaBindIn env b1 b2 >>= \env' -> alphaBindsIn env' bs1 bs2
-alphaBindsIn _ _ _
+aeqBindsIn env (b1:bs1) (b2:bs2)
+  = aeqBindIn env b1 b2 >>= \env' -> aeqBindsIn env' bs1 bs2
+aeqBindsIn _ _ _
   = Nothing
 
-alphaBindIn :: HasId b => AlphaEnv -> Bind b -> Bind b -> Maybe AlphaEnv
-alphaBindIn env (NonRec x1 c1) (NonRec x2 c2)
-  = if alphaIn env' c1 c2 then Just env' else Nothing
-  where env' = Map.insert (identifier x1) (identifier x2) env
-alphaBindIn env (Rec bs1) (Rec bs2)
+-- | If the given bindings are alpha-equivalent, returns an augmented environment
+-- tracking the correspondences between the bound variables.
+aeqBindIn :: HasId b => AlphaEnv -> Bind b -> Bind b -> Maybe AlphaEnv
+aeqBindIn env (NonRec x1 c1) (NonRec x2 c2)
+  = if aeqIn env' c1 c2 then Just env' else Nothing
+  where env' = rnBndr2 env (identifier x1) (identifier x2)
+aeqBindIn env (Rec bs1) (Rec bs2)
   = if and $ zipWith alpha bs1 bs2 then Just env' else Nothing
   where
     alpha :: HasId b => (b, Command b) -> (b, Command b) -> Bool
     alpha (_, c1) (_, c2)
-      = alphaIn env' c1 c2
+      = aeqIn env' c1 c2
     env'
-      = Map.fromList [ (identifier x1, identifier x2) | (x1, _) <- bs1
-                                                      | (x2, _) <- bs2 ]
-          `Map.union` env
-alphaBindIn _ _ _
+      = rnBndrs2 env (map (identifier . fst) bs1) (map (identifier . fst) bs2)
+aeqBindIn _ _ _
   = Nothing
 
 instance HasId b => AlphaEq (Alt b) where
-  alphaIn env (Alt a1 xs1 c1) (Alt a2 xs2 c2)
-    = a1 == a2 && alphaIn env' c1 c2
+  aeqIn env (Alt a1 xs1 c1) (Alt a2 xs2 c2)
+    = a1 == a2 && aeqIn env' c1 c2
     where
-      env' = Map.fromList (zip is1 is2) `Map.union` env
-      is1  = map identifier xs1
-      is2  = map identifier xs2
+      env' = rnBndrs2 env (map identifier xs1) (map identifier xs2)
 
 instance AlphaEq Type where
-  alphaIn env t1 t2
+  aeqIn env t1 t2
     | Just x1 <- Type.getTyVar_maybe t1
     , Just x2 <- Type.getTyVar_maybe t2
-    = x1 == x2
+    = env `rnOccL` x1 == env `rnOccR` x2
     | Just (f1, a1) <- Type.splitAppTy_maybe t1
     , Just (f2, a2) <- Type.splitAppTy_maybe t2
     = f1 `alpha` f2 && a1 `alpha` a2
@@ -205,16 +258,18 @@ instance AlphaEq Type where
     = c1 == c2 && as1 `alpha` as2
     | Just (x1, t1') <- Type.splitForAllTy_maybe t1
     , Just (x2, t2') <- Type.splitForAllTy_maybe t2
-    = alphaIn (Map.insert x1 x2 env) t1' t2'
+    = aeqIn (rnBndr2 env x1 x2) t1' t2'
     | otherwise
     = False
     where
-      alpha a1 a2 = alphaIn env a1 a2
+      alpha a1 a2 = aeqIn env a1 a2
 
 instance AlphaEq Coercion where
   -- Consider coercions equal if their types are equal (proof irrelevance)
-  alphaIn env co1 co2 = alphaIn env (coercionType co1) (coercionType co2)
+  aeqIn env co1 co2 = aeqIn env (coercionType co1) (coercionType co2)
     
-
 instance AlphaEq a => AlphaEq [a] where
-  alphaIn env xs ys = and $ zipWith (alphaIn env) xs ys
+  aeqIn env xs ys = and $ zipWith (aeqIn env) xs ys
+
+instance HasId b => AlphaEq (Bind b) where
+  aeqIn env b1 b2 = isJust $ aeqBindIn env b1 b2

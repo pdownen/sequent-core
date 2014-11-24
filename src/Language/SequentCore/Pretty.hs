@@ -1,7 +1,13 @@
+-- |
+-- Module      : Language.SequentCore.Pretty
+-- Description : Pretty printing of Sequent Core terms
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
+--
+-- Instances and functions for pretty-printing Sequent Core terms using GHC's
+-- built-in pretty printer.
+  
 module Language.SequentCore.Pretty (
-  -- | Instances and functions for pretty-printing Sequent Core terms using
-  -- GHC's built-in pretty printer.
-
   ppr_binds_top
 ) where
 

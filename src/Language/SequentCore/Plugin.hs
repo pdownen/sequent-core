@@ -1,7 +1,13 @@
-module Language.SequentCore.Plugin (
-  -- | Tools for writing a GHC plugin using the Sequent Core language in place
-  -- of GHC Core.
+-- |
+-- Module      : Language.SequentCore.Plugin
+-- Description : GHC plugin library
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
+--
+-- Tools for writing a GHC plugin using the Sequent Core language in place of
+-- GHC Core.
 
+module Language.SequentCore.Plugin (
   sequentPass
 ) where
 
@@ -23,4 +29,4 @@ sequentPass :: ([SeqCoreBind] -> CoreM [SeqCoreBind])
             -- 'deShadowBinds').
             -> (ModGuts -> CoreM ModGuts)
 sequentPass process =
-  bindsOnlyPass (fmap toCoreBinds . process . fromCoreBinds . deShadowBinds)
+  bindsOnlyPass (fmap bindsToCore . process . fromCoreBinds . deShadowBinds)
