@@ -251,6 +251,11 @@ usageFromCut :: ScEnv -> SeqCoreValue -> SeqCoreCont -> ScUsage
 usageFromCut env (Var x) (Case {} : _)
   | Just SpecArg <- sc_how_bound env `lookupVarEnv` x
   = ScUsage emptyVarEnv (unitVarSet x)
+-- Implementation note: The Sequent Core form simplifies this function by making
+-- the head of an application immediately available, so that a function like
+-- collectArgs isn't necessary to find out what the head is. In this case, that
+-- means we can avoid doing any search whatsoever if the head isn't a variable
+-- that we know to be bound to a candidate for specialization.
 usageFromCut env v@(Var f) fs
   | Just SpecFun <- sc_how_bound env `lookupVarEnv` f
   , Just (_, args, _) <- saturatedCall (Command [] v fs)

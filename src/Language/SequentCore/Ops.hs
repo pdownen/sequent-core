@@ -47,7 +47,7 @@ isLambda _
   = False
 
 -- | True if the given command is a saturated application of a constructor. In
--- other words, true if it is @\<Ctor | [$ a1, $ a2, $ ..., $ an, ...]>@ for
+-- other words, true if it is @\<Ctor | $ a_1; $ a_2; $ ...; $ a_n; ...>@ for
 -- some constructor @Ctor@ with arity @n@.
 isSaturatedCtorApp :: Command b -> Bool
 isSaturatedCtorApp c@(Command { cmdLet = [], cmdValue = Var x })
