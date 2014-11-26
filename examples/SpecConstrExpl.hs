@@ -1,28 +1,56 @@
 module Main where
 
-import Prelude hiding (last, drop)
+import qualified Data.Map as Map
 
-{-last :: [a] -> a
-last [] = error "last"
-last [x] = x
-last (x : xs) = last xs-}
+type Id = String
 
-{-drop :: Int -> [a] -> [a]
-drop 0 xs = xs
-drop _ [] = []
-drop n (x : xs) = drop (n-1) xs-}
+data Prop
+  = Var Id
+  | Prop `And` Prop
+  | Prop `Or` Prop
+  | If Prop Prop
+  | Not Prop
 
-{-
-maybeFac :: Maybe Int -> Maybe Int
-maybeFac Nothing = Nothing
-maybeFac (Just 0) = Just 1
-maybeFac (Just n) | Just n' <- maybeFac (Just (n-1)) = Just (n * n')
-                  | otherwise = Nothing
--}
+infixl 6 `Or`
+infixl 7 `And`
 
-facOrNeg :: Either Int Int -> Int
-facOrNeg (Left 0) = 1
-facOrNeg (Left n) = n * facOrNeg (Left (n-1))
-facOrNeg (Right n) = -n
+type Env = Map.Map Id Bool
 
-main = putStrLn "stuff"
+satisfy, falsify :: Prop -> Env -> (Env -> Bool) -> Bool
+
+satisfy (Var x) env k
+  = case Map.lookup x env of
+      Just True -> k env
+      Just False -> False
+      Nothing -> k (Map.insert x True env)
+satisfy (p `And` q) env k
+  = satisfy p env $ \env' -> satisfy q env' k
+satisfy (p `Or` q) env k
+  = satisfy p env k || satisfy q env k
+satisfy (Not p) env k
+  = falsify p env k
+satisfy (If p q) env k
+  = satisfy (Not p `Or` q) env k
+
+falsify (Var x) env k
+  = case Map.lookup x env of
+      Just True -> False
+      Just False -> k env
+      Nothing -> k (Map.insert x False env)
+falsify (p `And` q) env k
+  = falsify p env k || falsify q env k
+falsify (p `Or` q) env k
+  = falsify p env $ \env' -> falsify q env' k
+falsify (Not p) env k
+  = satisfy p env k
+falsify (If p q) env k
+  = falsify (Not p `Or` q) env k
+
+satisfiable, falsifiable, valid :: Prop -> Bool
+
+satisfiable p = satisfy p Map.empty (const True)
+falsifiable p = falsify p Map.empty (const True)
+valid = not . falsifiable
+
+main = print [f p | f <- [satisfiable, falsifiable, valid]]
+  where p = (Var "a" `Or` Var "b") `And` Not (Var "a")

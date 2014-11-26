@@ -43,7 +43,7 @@ executable DumpExample
 executable SpecConstrExpl
   hs-source-dirs:      examples
   Main-is:             SpecConstrExpl.hs
-  build-depends:       base >= 4 && < 5, sequent-core
+  build-depends:       base >= 4 && < 5, sequent-core, containers
   default-language:    Haskell2010
   ghc-options:         -fplugin=Language.SequentCore.SpecConstr
                        -fspec-constr
