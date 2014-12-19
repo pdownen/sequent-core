@@ -12,7 +12,7 @@ module Language.SequentCore.Syntax (
   SeqCoreValue, SeqCoreFrame, SeqCoreCont, SeqCoreCommand, SeqCoreBind,
     SeqCoreAlt,
   -- * Constructors
-  valueCommand, varCommand, lambdas, addLets,
+  valueCommand, varCommand, lambdas, addLets, extendCont,
   -- * Translation
   -- $txn
   fromCoreExpr, fromCoreBind, fromCoreBinds,
@@ -41,8 +41,8 @@ data Value b    = Lit Literal       -- ^ A primitive literal value.
 
 -- | A stack frame. A continuation is simply a list of these. Each represents
 -- the outer part of a Haskell expression, with a "hole" where a value can be
--- placed. Computation in the sequent calculus is expressed as the interation of
--- a value with a continuation.
+-- placed. Computation in the sequent calculus is expressed as the interaction
+-- of a value with a continuation.
 data Frame b    = App  {- expr -} (Command b)    -- ^ Apply the value to an
                                                  -- argument, which may be a
                                                  -- computation.
@@ -110,6 +110,11 @@ lambdas xs body = foldr (\x c -> valueCommand (Lam x c)) body xs
 -- | Adds the given bindings outside those in the given command.
 addLets :: [Bind b] -> Command b -> Command b
 addLets bs c = c { cmdLet = bs ++ cmdLet c }
+
+-- | Adds the given continuation frames to the end of those in the given
+-- command.
+extendCont :: Cont b -> Command b -> Command b
+extendCont fs c = c { cmdCont = fs ++ cmdCont c }
 
 --------------------------------------------------------------------------------
 -- Translation

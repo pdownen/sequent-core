@@ -8,8 +8,10 @@
 module Language.SequentCore.Ops (
   -- * Computations
   collectLambdas, isLambda, isSaturatedCtorApp,
-  isTypeArg, isNontermArg, isTypeValue, isNontermValue,
-  saturatedCall, saturatedCtorApp,
+  isTypeArg, isCoArg, isErasedArg, isRuntimeArg,
+  isTypeValue, isCoValue, isErasedValue, isRuntimeValue,
+  isTrivial, isTrivialValue, isTrivialCont, isTrivialFrame,
+  saturatedCall, saturatedCtorApp, asValueCommand,
   valueArity, commandType,
   -- * Alpha-equivalence
   (=~=), AlphaEq(..), AlphaEnv, HasId(..)
@@ -17,12 +19,14 @@ module Language.SequentCore.Ops (
 
 import Language.SequentCore.Syntax
 
-import Id (isDataConId_maybe)
-import IdInfo (arityInfo)
-import Coercion (coercionType, Coercion)
-import CoreUtils (exprType)
-import Type (Type)
-import Var (Id, Var, idInfo, isId)
+import Id         ( isDataConId_maybe )
+import IdInfo     ( arityInfo )
+import Coercion   ( coercionType, Coercion )
+import CoreSyn    ( isRuntimeVar )
+import CoreUtils  ( exprType )
+import Literal    ( litIsTrivial )
+import Type       ( Type )
+import Var        ( Id, Var, idInfo, isId )
 import VarEnv
 
 import Data.Maybe
@@ -37,6 +41,16 @@ collectLambdas (Command { cmdLet = [], cmdCont = [], cmdValue = Lam x c })
   where (xs, c') = collectLambdas c
 collectLambdas c
   = ([], c)
+
+-- | Divide a continuation into a sequence of arguments and an outer
+-- continuation. If @k@ is not an application continuation, then
+-- @collectArgs k == ([], k)@.
+collectArgs :: Cont b -> ([Command b], Cont b)
+collectArgs (App c : fs)
+  = (c : cs, fs')
+  where (cs, fs') = collectArgs fs
+collectArgs fs
+  = ([], fs)
 
 -- | True if the given command is a simple lambda, with no let bindings and no
 -- continuation.
@@ -59,29 +73,68 @@ isSaturatedCtorApp _
 
 -- | True if the given command simply returns a type as a value. This may only
 -- be true of a command appearing as an argument (that is, inside an 'App'
--- frame).
+-- frame) or as the body of a @let@.
 isTypeArg :: Command b -> Bool
-isTypeArg (Command { cmdValue = Type _, cmdCont = [] }) = True
+isTypeArg (Command { cmdValue = Type _, cmdCont = [], cmdLet = [] }) = True
 isTypeArg _ = False
+
+-- | True if the given command simply returns a coercion as a value. This may
+-- only be true of a command appearing as an argument (that is, inside an 'App'
+-- frame) or as the body of a @let@.
+isCoArg :: Command b -> Bool
+isCoArg (Command { cmdValue = Type _, cmdCont = [], cmdLet = [] }) = True
+isCoArg _ = False
 
 -- | True if the given command simply returns a value that is either a type or
 -- a coercion. This may only be true of a command appearing as an argument (that
--- is, inside an 'App' frame).
-isNontermArg :: Command b -> Bool
-isNontermArg (Command { cmdValue = v, cmdCont = [] })
-  = isNontermValue v
-isNontermArg _ = False
+-- is, inside an 'App' frame) or as the body of a @let@.
+isErasedArg :: Command b -> Bool
+isErasedArg (Command { cmdValue = v, cmdCont = [] })
+  = isErasedValue v
+isErasedArg _ = False
+
+-- | True if the given command appears at runtime. Types and coercions are
+-- erased.
+isRuntimeArg :: Command b -> Bool
+isRuntimeArg c = not (isErasedArg c)
 
 -- | True if the given value is a type. See 'Type'.
 isTypeValue :: Value b -> Bool
 isTypeValue (Type _) = True
 isTypeValue _ = False
 
+isCoValue :: Value b -> Bool
+isCoValue (Coercion _) = True
+isCoValue _ = False
+
 -- | True if the given value is a type or coercion.
-isNontermValue :: Value b -> Bool
-isNontermValue (Type _) = True
-isNontermValue (Coercion _) = True
-isNontermValue _ = False
+isErasedValue :: Value b -> Bool
+isErasedValue (Type _) = True
+isErasedValue (Coercion _) = True
+isErasedValue _ = False
+
+-- | True if the given value appears at runtime.
+isRuntimeValue :: Value b -> Bool
+isRuntimeValue v = not (isErasedValue v)
+
+isTrivial :: HasId b => Command b -> Bool
+isTrivial c
+  = null (cmdLet c) &&
+      isTrivialCont (cmdCont c) &&
+      isTrivialValue (cmdValue c)
+
+isTrivialValue :: HasId b => Value b -> Bool
+isTrivialValue (Lit l)    = litIsTrivial l
+isTrivialValue (Lam x c)  = not (isRuntimeVar (identifier x)) && isTrivial c
+isTrivialValue _          = True
+
+isTrivialCont :: Cont b -> Bool
+isTrivialCont = all isTrivialFrame
+
+isTrivialFrame :: Frame b -> Bool
+isTrivialFrame (Cast _)   = True
+isTrivialFrame (App c)    = isErasedArg c
+isTrivialFrame _          = False
 
 -- | If a command represents a saturated call to some function, splits it into
 -- the function, the arguments, and the remaining continuation after the
@@ -110,7 +163,7 @@ saturatedCtorApp :: Command b -> Maybe (Var, [Command b], Cont b)
 saturatedCtorApp c
   = do
     (Var fn, args, fs') <- saturatedCall c
-    isDataConId_maybe fn
+    _ <- isDataConId_maybe fn
     return (fn, args, fs')
 
 -- | Compute the type of a command.
@@ -126,6 +179,12 @@ valueArity (Lam _ c)
   = 1 + length xs
   where (xs, _) = collectLambdas c
 valueArity _ = 0
+
+asValueCommand :: Command b -> Maybe (Value b)
+asValueCommand (Command { cmdLet = [], cmdValue = v, cmdCont = [] })
+  = Just v
+asValueCommand _
+  = Nothing
 
 -- | A class of types that contain an identifier. Useful so that we can compare,
 -- say, elements of @Command b@ for any @b@ that wraps an identifier with

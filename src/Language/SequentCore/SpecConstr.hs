@@ -388,7 +388,7 @@ specialize env (ScUsage calls used) (x, c)
       | Just (ctor, args, _) <- saturatedCtorApp arg
       = do
         -- Abstract over *term* arguments only
-        let (tyArgs, tmArgs) = span isNontermArg args
+        let (tyArgs, tmArgs) = span isErasedArg args
         tmVars <- mapM (mkSysLocalM (fsLit "scsca") . commandType) tmArgs
         let cont = map App (tyArgs ++ map varCommand tmVars)
             cmd = Command { cmdValue = Var ctor
