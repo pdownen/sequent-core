@@ -3,7 +3,6 @@
 module Language.SequentCore.Simpl (plugin) where
 
 import Language.SequentCore.Ops
-import Language.SequentCore.Plugin
 import Language.SequentCore.Pretty
 import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Simpl.Monad
@@ -16,11 +15,14 @@ import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      isZeroSimplCount )
 import CoreSyn     ( isRuntimeVar, isCheapUnfolding )
 import CoreUnfold  ( smallEnoughToInline )
-import DynFlags    ( DynFlags, getDynFlags, gopt, GeneralFlag(..) )
+import DynFlags    ( gopt, GeneralFlag(..) )
 import Id
+import HscTypes    ( ModGuts(..) )
+import OccurAnal   ( occurAnalysePgm )
 import Outputable
 import Var
 import VarEnv
+import VarSet
 
 import Control.Applicative ( (<$>), (<*>) )
 import Control.Exception   ( assert )
@@ -43,33 +45,48 @@ plugin = defaultPlugin {
     = []
 
   newPass max mode
-    = CoreDoPluginPass "SeqSimpl" (sequentPass $ runSimplifier max mode)
+    = CoreDoPluginPass "SeqSimpl" (runSimplifier max mode)
 
-runSimplifier :: Int -> SimplifierMode -> [InBind] -> CoreM [OutBind]
-runSimplifier iters mode binds
-  = go 0 binds
+runSimplifier :: Int -> SimplifierMode -> ModGuts -> CoreM ModGuts
+runSimplifier iters mode guts
+  = go 1 guts
   where
-    go n binds
-      | n == iters
+    go n guts
+      | n > iters
       = do
         errorMsg  $  text "Ran out of gas after"
                  <+> int iters
                  <+> text "iterations."
-        return binds
+        return guts
       | otherwise
       = do
         let globalEnv = SimplGlobalEnv { sg_mode = mode }
+            mod       = mg_module guts
+            coreBinds = mg_binds guts
+            occBinds  = runOccurAnal mod coreBinds
+            binds     = fromCoreBinds occBinds
         putMsg  $ text "BEFORE" <+> int n
                $$ text "--------" $$ ppr_binds_top binds
-        ((_, binds'), count) <- runSimplM globalEnv $
-          simplBinds initialEnv TopLevel binds
+        (binds', count) <- runSimplM globalEnv $ simplModule binds
         putMsg  $ text "AFTER" <+> int n
                $$ text "-------" $$ ppr_binds_top binds'
+        let coreBinds' = bindsToCore binds'
+            guts'      = guts { mg_binds = coreBinds' }
         if isZeroSimplCount count
           then do
-            putMsg $ text "Done after" <+> int (n+1) <+> text "iterations"
-            return binds'
-          else go (n+1) binds'
+            putMsg $ text "Done after" <+> int n <+> text "iterations"
+            return guts'
+          else go (n+1) guts'
+    runOccurAnal mod core
+      = let isRuleActive = const False
+            rules        = []
+            vects        = []
+            vectVars     = emptyVarSet
+        in occurAnalysePgm mod isRuleActive rules vects vectVars core
+
+simplModule :: [InBind] -> SimplM [OutBind]
+simplModule binds
+  = snd <$> simplBinds initialEnv TopLevel binds
 
 simplCommand :: SimplEnv -> InCommand -> SimplM OutCommand
 simplCommand env (Command { cmdLet = binds, cmdValue = val, cmdCont = cont })
@@ -90,6 +107,10 @@ simplBinds env level (b : bs)
 
 simplBind :: SimplEnv -> TopLevelFlag -> InBind
           -> SimplM (SimplEnv, Maybe OutBind)
+--simplBind env level bind
+--  | pprTrace "simplBind" (text "Binding" <+> parens (ppr level) <> colon <+>
+--                          ppr bind) False
+--  = undefined
 simplBind env level (NonRec x c)
   = do
     (env', x'c') <- simplNonRec env level x c
@@ -173,7 +194,7 @@ simplRec env level xcs
 -- * Case-reduction
 -- * Optimize the continuation wrt casts 
 simplCut :: SimplEnv -> InValue -> SimplEnv -> InCont -> SimplM OutCommand
-simplCut env_v val@(Lit _) env_k cont
+simplCut _env_v val@(Lit _) env_k cont
   = simplCont env_k val cont
 simplCut env_v (Type ty) _env_k cont
   = assert (null cont) $
@@ -183,7 +204,7 @@ simplCut env (Coercion co) _env_k cont
   = assert (null cont) $
     let co' = substCo env co
     in return $ valueCommand (Coercion co')
-simplCut env_v val@(Var x) env_k cont
+simplCut env_v (Var x) env_k cont
   = case substId env_v x of
       DoneId x'
         -> simplCont env_k (Var x') cont
@@ -199,41 +220,44 @@ simplCut env_v (Lam x c) env_k cont
 
 simplCont :: SimplEnv -> OutValue -> InCont -> SimplM OutCommand
 simplCont env val cont
-  = simplCont' env val cont []
-
-simplCont' env val (App arg : cont) acc
-  = do
-    arg' <- simplCommand env arg
-    simplCont' env val cont (App arg' : acc)
-simplCont' env val (f@(Cast _) : cont) acc
-  -- TODO Simplify coercions
-  = simplCont' env val cont (f : acc)
-simplCont' env val (Case x ty alts : cont) acc
-  -- TODO A whole lot - cases are important
-  = let (env', x') = enterScope env x
-        ty' = substTy env' ty
-    in go env' x' ty' alts []
+  = go env val cont []
   where
-    go env x ty [] alt_acc
-      = simplCont' env val cont (Case x ty (reverse alt_acc) : acc)
-    go env x ty (Alt con xs c : alts) alt_acc
+    go env val (App arg : cont) acc
       = do
-        let (env', xs') = enterScopes env xs
-        c' <- simplCommand env' c
-        go env x ty alts (Alt con xs' c' : alt_acc)
-simplCont' env val (f@(Tick _) : cont) acc
-  = simplCont' env val cont (f : acc)
-simplCont' env val [] acc
-  | Just (env', cont) <- restoreEnv env
-  = simplCont' env' val cont acc
-  | otherwise
-  = return $ Command { cmdLet = [], cmdValue = val, cmdCont = reverse acc }
+        arg' <- simplCommand env arg
+        go env val cont (App arg' : acc)
+    go env val (f@(Cast _) : cont) acc
+      -- TODO Simplify coercions
+      = go env val cont (f : acc)
+    go env val (Case x ty alts : cont) acc
+      -- TODO A whole lot - cases are important
+      = let (env', x') = enterScope env x
+            ty' = substTy env' ty
+        in doCase env' x' ty' alts []
+      where
+        doCase env x ty [] alt_acc
+          = go env val cont (Case x ty (reverse alt_acc) : acc)
+        doCase env x ty (Alt con xs c : alts) alt_acc
+          = do
+            let (env', xs') = enterScopes env xs
+            c' <- simplCommand env' c
+            doCase env x ty alts (Alt con xs' c' : alt_acc)
+    go env val (f@(Tick _) : cont) acc
+      = go env val cont (f : acc)
+    go env val [] acc
+      | Just (env', cont) <- restoreEnv env
+      = go env' val cont acc
+      | otherwise
+      = return $ Command { cmdLet = [], cmdValue = val, cmdCont = reverse acc }
   
 -- Based on preInlineUnconditionally in SimplUtils; see comments there
 preInlineUnconditionally :: SimplEnv -> TopLevelFlag -> InVar -> InCommand
                          -> SimplM Bool
-preInlineUnconditionally env level x rhs
-  = go <$> getMode <*> getDynFlags
+preInlineUnconditionally _env level x rhs
+  = do
+    ans <- go <$> getMode <*> getDynFlags
+    pprTrace "preInlineUnconditionally" (ppr x <> colon <+> text (show ans)) $
+      return ans
   where
     go mode dflags
       | not active                              = False
@@ -264,7 +288,7 @@ preInlineUnconditionally env level x rhs
 -- Based on postInlineUnconditionally in SimplUtils; see comments there
 postInlineUnconditionally :: SimplEnv -> TopLevelFlag -> OutVar -> OutCommand
                           -> SimplM Bool
-postInlineUnconditionally env level x c
+postInlineUnconditionally _env level x c
   = go <$> getMode <*> getDynFlags
   where
     go mode dflags

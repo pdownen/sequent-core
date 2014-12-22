@@ -11,7 +11,7 @@ module Language.SequentCore.Ops (
   isTypeArg, isCoArg, isErasedArg, isRuntimeArg,
   isTypeValue, isCoValue, isErasedValue, isRuntimeValue,
   isTrivial, isTrivialValue, isTrivialCont, isTrivialFrame,
-  saturatedCall, saturatedCtorApp, asValueCommand,
+  saturatedCall, saturatedCtorApp, asValueCommand, collectArgs,
   valueArity, commandType,
   -- * Alpha-equivalence
   (=~=), AlphaEq(..), AlphaEnv, HasId(..)
