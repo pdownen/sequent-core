@@ -2,17 +2,17 @@
 
 module Language.SequentCore.Simpl (plugin) where
 
-import Language.SequentCore.Ops
 import Language.SequentCore.Pretty
 import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Simpl.Monad
 import Language.SequentCore.Syntax
+import Language.SequentCore.Translate
 
 import BasicTypes
 import Coercion    ( isCoVar )
 import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      CoreM, defaultPlugin, reinitializeGlobals, putMsg, errorMsg,
-                     isZeroSimplCount )
+                     isZeroSimplCount, pprSimplCount )
 import CoreSyn     ( isRuntimeVar, isCheapUnfolding )
 import CoreUnfold  ( smallEnoughToInline )
 import DynFlags    ( gopt, GeneralFlag(..) )
@@ -217,6 +217,11 @@ simplCut env_v (Lam x c) env_k cont
     let (env_v', x') = enterScope env_v x
     c' <- simplCommand env_v' c
     simplCont env_k (Lam x' c') cont
+-- TODO Case reduction goes here
+simplCut env_v (Cons ctor as) env_k cont
+  = do
+    as' <- mapM (simplCommand env_v) as
+    simplCont env_k (Cons ctor as') cont
 
 simplCont :: SimplEnv -> OutValue -> InCont -> SimplM OutCommand
 simplCont env val cont
@@ -256,8 +261,8 @@ preInlineUnconditionally :: SimplEnv -> TopLevelFlag -> InVar -> InCommand
 preInlineUnconditionally _env level x rhs
   = do
     ans <- go <$> getMode <*> getDynFlags
-    pprTrace "preInlineUnconditionally" (ppr x <> colon <+> text (show ans)) $
-      return ans
+    --liftCoreM $ putMsg $ "preInline" <+> ppr x <> colon <+> text (show ans))
+    return ans
   where
     go mode dflags
       | not active                              = False
@@ -289,7 +294,10 @@ preInlineUnconditionally _env level x rhs
 postInlineUnconditionally :: SimplEnv -> TopLevelFlag -> OutVar -> OutCommand
                           -> SimplM Bool
 postInlineUnconditionally _env level x c
-  = go <$> getMode <*> getDynFlags
+  = do
+    ans <- go <$> getMode <*> getDynFlags
+    -- liftCoreM $ putMsg $ "postInline" <+> ppr x <> colon <+> text (show ans)
+    return ans
   where
     go mode dflags
       | not active                  = False

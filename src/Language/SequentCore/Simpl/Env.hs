@@ -12,7 +12,6 @@ module Language.SequentCore.Simpl.Env (
   suspendAndZapEnv, suspendAndSetEnv, restoreEnv
 ) where
 
-import Language.SequentCore.Ops
 import Language.SequentCore.Syntax
 
 import BasicTypes ( TopLevelFlag(..) )

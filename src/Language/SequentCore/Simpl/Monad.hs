@@ -17,7 +17,11 @@ data SimplGlobalEnv
   = SimplGlobalEnv { sg_mode :: SimplifierMode }
 
 runSimplM :: SimplGlobalEnv -> SimplM a -> CoreM (a, SimplCount)
-runSimplM genv m = unSimplM m genv
+runSimplM genv m
+  = do
+    ans <- unSimplM m genv
+    addSimplCount (snd ans)
+    return ans
 
 instance Monad SimplM where
   {-# INLINE return #-}
@@ -59,12 +63,17 @@ getMode = SimplM $ \genv -> withZeroCount $ return (sg_mode genv)
 
 tick, freeTick :: Tick -> SimplM ()
 tick t
-  = liftCoreM $ putMsg (text "I has a tick:" <+> ppr t) >> getDynFlags >>= \dflags ->
-      addSimplCount (doSimplTick dflags t (zeroSimplCount dflags))
+  = SimplM $ \_ -> do
+      -- putMsg (text "I has a tick:" <+> ppr t)
+      dflags <- getDynFlags
+      let count = doSimplTick dflags t (zeroSimplCount dflags)
+      return ((), count)
 
-freeTick t 
-  = liftCoreM $ getDynFlags >>= \dflags ->
-      addSimplCount (doFreeSimplTick t (zeroSimplCount dflags))
+freeTick t
+  = SimplM $ \_ -> do
+      dflags <- getDynFlags
+      let count = doFreeSimplTick t (zeroSimplCount dflags)
+      return ((), count)
 
 withZeroCount :: CoreM a -> CoreM (a, SimplCount)
 withZeroCount m = do

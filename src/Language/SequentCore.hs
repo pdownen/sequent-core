@@ -5,13 +5,14 @@
 -- Stability   : experimental
 
 module Language.SequentCore (
-  module Language.SequentCore.Ops,
   module Language.SequentCore.Syntax,
+
+  module Language.SequentCore.Pretty,
   module Language.SequentCore.Plugin,
-  module Language.SequentCore.Pretty
+  module Language.SequentCore.Translate
 ) where
 
-import Language.SequentCore.Ops
-import Language.SequentCore.Syntax
-import Language.SequentCore.Pretty
 import Language.SequentCore.Plugin
+import Language.SequentCore.Pretty
+import Language.SequentCore.Syntax
+import Language.SequentCore.Translate

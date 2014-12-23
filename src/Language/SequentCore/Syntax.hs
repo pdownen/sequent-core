@@ -12,17 +12,33 @@ module Language.SequentCore.Syntax (
   SeqCoreValue, SeqCoreFrame, SeqCoreCont, SeqCoreCommand, SeqCoreBind,
     SeqCoreAlt,
   -- * Constructors
-  valueCommand, varCommand, lambdas, addLets, extendCont,
-  -- * Translation
-  -- $txn
-  fromCoreExpr, fromCoreBind, fromCoreBinds,
-  commandToCoreExpr, valueToCoreExpr, frameToCoreExpr,
-  bindToCore, bindsToCore, altToCore
+  mkCommand, valueCommand, varCommand, lambdas, addLets, extendCont,
+  -- * Deconstructors
+  collectLambdas, collectArgs, isLambda,
+  isTypeArg, isCoArg, isErasedArg, isRuntimeArg,
+  isTypeValue, isCoValue, isErasedValue, isRuntimeValue,
+  isTrivial, isTrivialValue, isTrivialCont, isTrivialFrame,
+  commandAsSaturatedCall, asSaturatedCall, asValueCommand,
+  -- * Calculations
+  valueArity, commandType,
+  -- * Alpha-equivalence
+  (=~=), AlphaEq(..), AlphaEnv, HasId(..)
 ) where
 
-import GhcPlugins (Id, Literal, Type, Coercion, AltCon, Tickish, Var)
+import {-# SOURCE #-} Language.SequentCore.Translate ( commandToCoreExpr )
 
-import qualified GhcPlugins as GHC
+import Coercion  ( Coercion, coercionType )
+import CoreSyn   ( AltCon, Tickish, isRuntimeVar )
+import CoreUtils ( exprType )
+import DataCon   ( DataCon )
+import Id        ( Id, isDataConWorkId_maybe, idArity )
+import Literal   ( Literal, litIsTrivial )
+import Type      ( Type )
+import qualified Type
+import Var       ( Var, isId )
+import VarEnv
+
+import Data.Maybe
 
 --------------------------------------------------------------------------------
 -- AST Types
@@ -31,13 +47,16 @@ import qualified GhcPlugins as GHC
 -- | An atomic value. These include literals, lambdas, and variables, as well as
 -- types and coercions (see GHC's 'GHC.Expr' for the reasoning).
 data Value b    = Lit Literal       -- ^ A primitive literal value.
+                | Var Id            -- ^ A term variable.
                 | Lam b (Command b) -- ^ A function. The body is a computation,
                                     -- that is, a 'Command'.
+                | Cons DataCon [Command b]
+                                    -- ^ A value formed by a saturated
+                                    -- constructor application.
                 | Type Type         -- ^ A type. Used to pass a type as an
                                     -- argument to a type-level lambda.
                 | Coercion Coercion -- ^ A coercion. Used to pass evidence
-                                    -- to the @cast@ operation.
-                | Var Id            -- ^ A term variable.
+                                    -- for the @cast@ operation to a lambda.
 
 -- | A stack frame. A continuation is simply a list of these. Each represents
 -- the outer part of a Haskell expression, with a "hole" where a value can be
@@ -69,8 +88,8 @@ data Command b  = Command { -- | Bindings surrounding the computation.
                           , cmdCont  :: Cont b
                           }
 
--- | A binding. Similar to the 'GHC.Bind' datatype from GHC. Can be either a
--- single non-recursive binding or a mutually recursive block.
+-- | A binding. Similar to the @Bind@ datatype from GHC. Can be either a single
+-- non-recursive binding or a mutually recursive block.
 data Bind b     = NonRec b (Command b) -- ^ A single non-recursive binding.
                 | Rec [(b, Command b)] -- ^ A block of mutually recursive bindings.
 
@@ -95,6 +114,14 @@ type SeqCoreAlt     = Alt     Var
 -- Constructors
 --------------------------------------------------------------------------------
 
+mkCommand :: [Bind b] -> Value b -> Cont b -> Command b
+mkCommand binds val@(Var f) cont
+  | Just ctor <- isDataConWorkId_maybe f
+  , Just (args, cont') <- asSaturatedCall val cont
+  = mkCommand binds (Cons ctor args) cont'
+mkCommand binds val cont
+  = Command { cmdLet = binds, cmdValue = val, cmdCont = cont }
+
 -- | Constructs a command that simply returns a value.
 valueCommand :: Value b -> Command b
 valueCommand v = Command { cmdLet = [], cmdValue = v, cmdCont = [] }
@@ -117,94 +144,291 @@ extendCont :: Cont b -> Command b -> Command b
 extendCont fs c = c { cmdCont = fs ++ cmdCont c }
 
 --------------------------------------------------------------------------------
--- Translation
+-- Deconstructors
 --------------------------------------------------------------------------------
 
--- $txn
--- The translations to and from Sequent Core are /not/ guaranteed to be perfect
--- inverses. However, any differences between @e@ and @commandToCoreExpr
--- (fromCoreExpr e)@ should be operationally insignificant, such as a @let@
--- floating out from a function being applied. A more precise characterization
--- of the indended invariants of these functions would entail some sort of
--- /bisimulation/, but it should suffice to know that the translations are
--- "faithful enough."
+-- | Divide a command into a sequence of lambdas and a body. If @c@ is not a
+-- lambda, then @collectLambdas c == ([], c)@.
+collectLambdas :: Command b -> ([b], Command b)
+collectLambdas (Command { cmdLet = [], cmdCont = [], cmdValue = Lam x c })
+  = (x : xs, c')
+  where (xs, c') = collectLambdas c
+collectLambdas c
+  = ([], c)
 
--- | Translates a Core expression into Sequent Core.
-fromCoreExpr :: GHC.Expr b -> Command b
-fromCoreExpr = go [] []
+-- | Divide a continuation into a sequence of arguments and an outer
+-- continuation. If @k@ is not an application continuation, then
+-- @collectArgs k == ([], k)@.
+collectArgs :: Cont b -> ([Command b], Cont b)
+collectArgs (App c : fs)
+  = (c : cs, fs')
+  where (cs, fs') = collectArgs fs
+collectArgs fs
+  = ([], fs)
+
+-- | True if the given command is a simple lambda, with no let bindings and no
+-- continuation.
+isLambda :: Command b -> Bool
+isLambda (Command { cmdLet = [], cmdCont = [], cmdValue = Lam _ _ })
+  = True
+isLambda _
+  = False
+
+-- | True if the given command simply returns a type as a value. This may only
+-- be true of a command appearing as an argument (that is, inside an 'App'
+-- frame) or as the body of a @let@.
+isTypeArg :: Command b -> Bool
+isTypeArg (Command { cmdValue = Type _, cmdCont = [], cmdLet = [] }) = True
+isTypeArg _ = False
+
+-- | True if the given command simply returns a coercion as a value. This may
+-- only be true of a command appearing as an argument (that is, inside an 'App'
+-- frame) or as the body of a @let@.
+isCoArg :: Command b -> Bool
+isCoArg (Command { cmdValue = Type _, cmdCont = [], cmdLet = [] }) = True
+isCoArg _ = False
+
+-- | True if the given command simply returns a value that is either a type or
+-- a coercion. This may only be true of a command appearing as an argument (that
+-- is, inside an 'App' frame) or as the body of a @let@.
+isErasedArg :: Command b -> Bool
+isErasedArg (Command { cmdValue = v, cmdCont = [] })
+  = isErasedValue v
+isErasedArg _ = False
+
+-- | True if the given command appears at runtime. Types and coercions are
+-- erased.
+isRuntimeArg :: Command b -> Bool
+isRuntimeArg c = not (isErasedArg c)
+
+-- | True if the given value is a type. See 'Type'.
+isTypeValue :: Value b -> Bool
+isTypeValue (Type _) = True
+isTypeValue _ = False
+
+isCoValue :: Value b -> Bool
+isCoValue (Coercion _) = True
+isCoValue _ = False
+
+-- | True if the given value is a type or coercion.
+isErasedValue :: Value b -> Bool
+isErasedValue (Type _) = True
+isErasedValue (Coercion _) = True
+isErasedValue _ = False
+
+-- | True if the given value appears at runtime.
+isRuntimeValue :: Value b -> Bool
+isRuntimeValue v = not (isErasedValue v)
+
+isTrivial :: HasId b => Command b -> Bool
+isTrivial c
+  = null (cmdLet c) &&
+      isTrivialCont (cmdCont c) &&
+      isTrivialValue (cmdValue c)
+
+isTrivialValue :: HasId b => Value b -> Bool
+isTrivialValue (Lit l)    = litIsTrivial l
+isTrivialValue (Lam x c)  = not (isRuntimeVar (identifier x)) && isTrivial c
+isTrivialValue _          = True
+
+isTrivialCont :: Cont b -> Bool
+isTrivialCont = all isTrivialFrame
+
+isTrivialFrame :: Frame b -> Bool
+isTrivialFrame (Cast _)   = True
+isTrivialFrame (App c)    = isErasedArg c
+isTrivialFrame _          = False
+
+-- | If a command represents a saturated call to some function, splits it into
+-- the function, the arguments, and the remaining continuation after the
+-- arguments.
+commandAsSaturatedCall :: Command b -> Maybe (Value b, [Command b], Cont b)
+commandAsSaturatedCall c
+  = do
+    let val = cmdValue c
+    (args, cont) <- asSaturatedCall val (cmdCont c)
+    return $ (val, args, cont)
+
+asSaturatedCall :: Value b -> Cont b -> Maybe ([Command b], Cont b)
+asSaturatedCall val cont
+  | 0 < arity, arity <= length args
+  = Just (args, others)
+  | otherwise
+  = Nothing
   where
-  val binds frames v =
-    Command { cmdLet = binds, cmdCont = frames, cmdValue = v }
+    arity = valueArity val
+    (args, others) = collectArgs cont
 
-  go binds frames expr =
-    case expr of
-      GHC.Var x         -> val binds frames (Var x)
-      GHC.Lit l         -> val binds frames (Lit l)
-      GHC.App e1 e2     -> go binds (App (fromCoreExpr e2) : frames) e1
-      GHC.Lam x e       -> val binds frames (Lam x (fromCoreExpr e))
-      GHC.Let bs e      -> go (fromCoreBind bs : binds) frames e
-      GHC.Case e x t as -> go binds (Case x t (map fromCoreAlt as) : frames) e
-      GHC.Cast e co     -> go binds (Cast co : frames) e
-      GHC.Tick ti e     -> go binds (Tick ti : frames) e
-      GHC.Type t        -> val binds frames (Type t)
-      GHC.Coercion co   -> val binds frames (Coercion co)
+asValueCommand :: Command b -> Maybe (Value b)
+asValueCommand (Command { cmdLet = [], cmdValue = v, cmdCont = [] })
+  = Just v
+asValueCommand _
+  = Nothing
 
--- | Translates a Core case alternative into Sequent Core.
-fromCoreAlt :: GHC.Alt b -> Alt b
-fromCoreAlt (ac, bs, e) = Alt ac bs (fromCoreExpr e)
+--------------------------------------------------------------------------------
+-- Calculations
+--------------------------------------------------------------------------------
 
--- | Translates a Core binding into Sequent Core.
-fromCoreBind :: GHC.Bind b -> Bind b
-fromCoreBind bind =
-  case bind of
-    GHC.NonRec b e -> NonRec b (fromCoreExpr e)
-    GHC.Rec bs     -> Rec [ (b, fromCoreExpr e) | (b,e) <- bs ]
+-- | Compute the type of a command.
+commandType :: SeqCoreCommand -> Type
+commandType = exprType . commandToCoreExpr -- Cheaty, but effective
 
--- | Translates a list of Core bindings into Sequent Core.
-fromCoreBinds :: [GHC.Bind b] -> [Bind b]
-fromCoreBinds = map fromCoreBind
+-- | Compute (a conservative estimate of) the arity of a value. If the value is
+-- a variable, this may be a lower bound.
+valueArity :: Value b -> Int
+valueArity (Var x)
+  | isId x = idArity x
+valueArity (Lam _ c)
+  = 1 + length xs
+  where (xs, _) = collectLambdas c
+valueArity _ = 0
 
--- | Translates a command into Core.
-commandToCoreExpr :: Command b -> GHC.Expr b
-commandToCoreExpr cmd = foldl addLet baseExpr (cmdLet cmd)
+--------------------------------------------------------------------------------
+-- Alpha-Equivalence
+--------------------------------------------------------------------------------
+
+-- | A class of types that contain an identifier. Useful so that we can compare,
+-- say, elements of @Command b@ for any @b@ that wraps an identifier with
+-- additional information.
+class HasId a where
+  -- | The identifier contained by the type @a@.
+  identifier :: a -> Id
+
+instance HasId Var where
+  identifier x = x
+
+-- | The type of the environment of an alpha-equivalence comparison. Only needed
+-- by user code if two terms need to be compared under some assumed
+-- correspondences between free variables. See GHC's 'VarEnv' module for
+-- operations.
+type AlphaEnv = RnEnv2
+
+infix 4 =~=, `aeq`
+
+-- | The class of types that can be compared up to alpha-equivalence.
+class AlphaEq a where
+  -- | True if the two given terms are the same, up to renaming of bound
+  -- variables.
+  aeq :: a -> a -> Bool
+  -- | True if the two given terms are the same, up to renaming of bound
+  -- variables and the specified equivalences between free variables.
+  aeqIn :: AlphaEnv -> a -> a -> Bool
+
+  aeq = aeqIn emptyAlphaEnv
+
+-- | An empty context for alpha-equivalence comparisons.
+emptyAlphaEnv :: AlphaEnv
+emptyAlphaEnv = mkRnEnv2 emptyInScopeSet
+
+
+-- | True if the two given terms are the same, up to renaming of bound
+-- variables.
+(=~=) :: AlphaEq a => a -> a -> Bool
+(=~=) = aeq
+
+instance HasId b => AlphaEq (Value b) where
+  aeqIn _ (Lit l1) (Lit l2)
+    = l1 == l2
+  aeqIn env (Lam b1 c1) (Lam b2 c2)
+    = aeqIn (rnBndr2 env (identifier b1) (identifier b2)) c1 c2
+  aeqIn env (Type t1) (Type t2)
+    = aeqIn env t1 t2
+  aeqIn env (Coercion co1) (Coercion co2)
+    = aeqIn env co1 co2
+  aeqIn env (Var x1) (Var x2)
+    = env `rnOccL` x1 == env `rnOccR` x2
+  aeqIn _ _ _
+    = False
+
+instance HasId b => AlphaEq (Frame b) where
+  aeqIn env (App c1) (App c2)
+    = aeqIn env c1 c2
+  aeqIn env (Case x1 t1 as1) (Case x2 t2 as2)
+    = aeqIn env' t1 t2 && aeqIn env' as1 as2
+      where env' = rnBndr2 env (identifier x1) (identifier x2)
+  aeqIn env (Cast co1) (Cast co2)
+    = aeqIn env co1 co2
+  aeqIn _ (Tick ti1) (Tick ti2)
+    = ti1 == ti2
+  aeqIn _ _ _
+    = False
+
+instance HasId b => AlphaEq (Command b) where
+  aeqIn env 
+    (Command { cmdLet = bs1, cmdValue = v1, cmdCont = c1 })
+    (Command { cmdLet = bs2, cmdValue = v2, cmdCont = c2 })
+    | Just env' <- aeqBindsIn env bs1 bs2
+    = aeqIn env' v1 v2 && aeqIn env' c1 c2
+    | otherwise
+    = False
+
+-- | If the given lists of bindings are alpha-equivalent, returns an augmented
+-- environment tracking the correspondences between the bound variables.
+aeqBindsIn :: HasId b => AlphaEnv -> [Bind b] -> [Bind b] -> Maybe AlphaEnv
+aeqBindsIn env [] []
+  = Just env
+aeqBindsIn env (b1:bs1) (b2:bs2)
+  = aeqBindIn env b1 b2 >>= \env' -> aeqBindsIn env' bs1 bs2
+aeqBindsIn _ _ _
+  = Nothing
+
+-- | If the given bindings are alpha-equivalent, returns an augmented environment
+-- tracking the correspondences between the bound variables.
+aeqBindIn :: HasId b => AlphaEnv -> Bind b -> Bind b -> Maybe AlphaEnv
+aeqBindIn env (NonRec x1 c1) (NonRec x2 c2)
+  = if aeqIn env' c1 c2 then Just env' else Nothing
+  where env' = rnBndr2 env (identifier x1) (identifier x2)
+aeqBindIn env (Rec bs1) (Rec bs2)
+  = if and $ zipWith alpha bs1 bs2 then Just env' else Nothing
   where
-  addLet e b  = GHC.Let (bindToCore b) e
-  baseExpr    = foldl (flip frameToCoreExpr)
-                      (valueToCoreExpr (cmdValue cmd))
-                      (cmdCont cmd)
+    alpha :: HasId b => (b, Command b) -> (b, Command b) -> Bool
+    alpha (_, c1) (_, c2)
+      = aeqIn env' c1 c2
+    env'
+      = rnBndrs2 env (map (identifier . fst) bs1) (map (identifier . fst) bs2)
+aeqBindIn _ _ _
+  = Nothing
 
--- | Translates a value into Core.
-valueToCoreExpr :: Value b -> GHC.Expr b
-valueToCoreExpr val =
-  case val of
-    Lit l       -> GHC.Lit l
-    Lam b c     -> GHC.Lam b (commandToCoreExpr c)
-    Type t      -> GHC.Type t
-    Coercion co -> GHC.Coercion co
-    Var x       -> GHC.Var x
+instance HasId b => AlphaEq (Alt b) where
+  aeqIn env (Alt a1 xs1 c1) (Alt a2 xs2 c2)
+    = a1 == a2 && aeqIn env' c1 c2
+    where
+      env' = rnBndrs2 env (map identifier xs1) (map identifier xs2)
 
--- | Translates a frame into a function that will wrap a Core expression with a
--- fragment of context (an argument to apply to, a case expression to run,
--- etc.).
-frameToCoreExpr :: Frame b -> (GHC.Expr b -> GHC.Expr b)
-frameToCoreExpr frame e =
-  case frame of
-    App  {- expr -} e2      -> GHC.App e (commandToCoreExpr e2)
-    Case {- expr -} b t as  -> GHC.Case e b t (map altToCore as)
-    Cast {- expr -} co      -> GHC.Cast e co
-    Tick ti {- expr -}      -> GHC.Tick ti e
+instance AlphaEq Type where
+  aeqIn env t1 t2
+    | Just x1 <- Type.getTyVar_maybe t1
+    , Just x2 <- Type.getTyVar_maybe t2
+    = env `rnOccL` x1 == env `rnOccR` x2
+    | Just (f1, a1) <- Type.splitAppTy_maybe t1
+    , Just (f2, a2) <- Type.splitAppTy_maybe t2
+    = f1 `alpha` f2 && a1 `alpha` a2
+    | Just n1 <- Type.isNumLitTy t1
+    , Just n2 <- Type.isNumLitTy t2
+    = n1 == n2
+    | Just s1 <- Type.isStrLitTy t1
+    , Just s2 <- Type.isStrLitTy t2
+    = s1 == s2
+    | Just (a1, r1) <- Type.splitFunTy_maybe t1
+    , Just (a2, r2) <- Type.splitFunTy_maybe t2
+    = a1 `alpha` a2 && r1 `alpha` r2
+    | Just (c1, as1) <- Type.splitTyConApp_maybe t1
+    , Just (c2, as2) <- Type.splitTyConApp_maybe t2
+    = c1 == c2 && as1 `alpha` as2
+    | Just (x1, t1') <- Type.splitForAllTy_maybe t1
+    , Just (x2, t2') <- Type.splitForAllTy_maybe t2
+    = aeqIn (rnBndr2 env x1 x2) t1' t2'
+    | otherwise
+    = False
+    where
+      alpha a1 a2 = aeqIn env a1 a2
 
--- | Translates a binding into Core.
-bindToCore :: Bind b -> GHC.Bind b
-bindToCore bind =
-  case bind of
-    NonRec b c -> GHC.NonRec b (commandToCoreExpr c)
-    Rec bs     -> GHC.Rec [ (b,commandToCoreExpr c) | (b,c) <- bs ]
+instance AlphaEq Coercion where
+  -- Consider coercions equal if their types are equal (proof irrelevance)
+  aeqIn env co1 co2 = aeqIn env (coercionType co1) (coercionType co2)
+    
+instance AlphaEq a => AlphaEq [a] where
+  aeqIn env xs ys = and $ zipWith (aeqIn env) xs ys
 
--- | Translates a list of bindings into Core.
-bindsToCore :: [Bind b] -> [GHC.Bind b]
-bindsToCore = map bindToCore
-
--- | Translates a case alternative into Core.
-altToCore :: Alt b -> GHC.Alt b
-altToCore (Alt ac bs c) = (ac, bs, commandToCoreExpr c)
+instance HasId b => AlphaEq (Bind b) where
+  aeqIn env b1 b2 = isJust $ aeqBindIn env b1 b2
