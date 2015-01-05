@@ -8,7 +8,7 @@
 
 module Language.SequentCore.Syntax (
   -- * AST Types
-  Value(..), Frame(..), Cont, Command(..), Bind(..), Alt(..),
+  Value(..), Frame(..), Cont, Command(..), Bind(..), Alt(..), AltCon(..),
   SeqCoreValue, SeqCoreFrame, SeqCoreCont, SeqCoreCommand, SeqCoreBind,
     SeqCoreAlt,
   -- * Constructors
@@ -28,7 +28,7 @@ module Language.SequentCore.Syntax (
 import {-# SOURCE #-} Language.SequentCore.Translate ( commandToCoreExpr )
 
 import Coercion  ( Coercion, coercionType )
-import CoreSyn   ( AltCon, Tickish, isRuntimeVar )
+import CoreSyn   ( AltCon(..), Tickish, isRuntimeVar )
 import CoreUtils ( exprType )
 import DataCon   ( DataCon )
 import Id        ( Id, isDataConWorkId_maybe, idArity )
@@ -117,8 +117,15 @@ type SeqCoreAlt     = Alt     Var
 mkCommand :: [Bind b] -> Value b -> Cont b -> Command b
 mkCommand binds val@(Var f) cont
   | Just ctor <- isDataConWorkId_maybe f
-  , Just (args, cont') <- asSaturatedCall val cont
+  , Just (args, cont') <- ctorCall ctor
   = mkCommand binds (Cons ctor args) cont'
+  where
+    ctorCall ctor
+      | 0 <- idArity f
+      = Just ([], cont)
+      | otherwise
+      = asSaturatedCall val cont
+
 mkCommand binds val cont
   = Command { cmdLet = binds, cmdValue = val, cmdCont = cont }
 
@@ -140,8 +147,8 @@ addLets bs c = c { cmdLet = bs ++ cmdLet c }
 
 -- | Adds the given continuation frames to the end of those in the given
 -- command.
-extendCont :: Cont b -> Command b -> Command b
-extendCont fs c = c { cmdCont = fs ++ cmdCont c }
+extendCont :: Command b -> Cont b -> Command b
+extendCont c fs = c { cmdCont = cmdCont c ++ fs }
 
 --------------------------------------------------------------------------------
 -- Deconstructors

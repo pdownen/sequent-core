@@ -1,5 +1,5 @@
 module Language.SequentCore.Simpl.Env (
-  SimplEnv(..), SimplIdSubst, SubstAns(..), IdDefEnv, Definition(..),
+  SimplEnv(..), StaticEnv, SimplIdSubst, SubstAns(..), IdDefEnv, Definition(..),
 
   InCommand, InValue, InFrame, InCont, InAlt, InBind,
   InId, InVar, InTyVar, InCoVar,
@@ -7,17 +7,17 @@ module Language.SequentCore.Simpl.Env (
   OutId, OutVar, OutTyVar, OutCoVar,
   
   initialEnv, mkSuspension, enterScope, enterScopes, uniqAway,
-  substId, substTy, substCo, extendIdSubst,
-  zapSubstEnvs, setSubstEnvs,
-  suspendAndZapEnv, suspendAndSetEnv, restoreEnv
+  substId, substTy, substTyStatic, substCo, substCoStatic, extendIdSubst,
+  zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
+  suspendAndZapEnv, suspendAndSetEnv, zapCont, restoreEnv
 ) where
 
+import Language.SequentCore.Pretty ()
 import Language.SequentCore.Syntax
 
 import BasicTypes ( TopLevelFlag(..) )
 import Coercion   ( Coercion, CvSubstEnv, CvSubst, mkCvSubst )
 import qualified Coercion
-import CoreSyn    ( AltCon(..) )
 import Id
 import Outputable
 import Type       ( Type, TvSubstEnv, TvSubst, mkTvSubst, tyVarsOfType )
@@ -28,6 +28,8 @@ import VarSet
 
 import Data.Maybe
 
+infixl 1 `setStaticPart`
+
 data SimplEnv
   = SimplEnv    { se_idSubst :: SimplIdSubst    -- InId    |--> SubstAns (in/out)
                 , se_tvSubst :: TvSubstEnv      -- InTyVar |--> OutType
@@ -36,14 +38,16 @@ data SimplEnv
                 , se_inScope :: InScopeSet      -- OutVar  |--> OutVar
                 , se_defs    :: IdDefEnv }      -- OutId   |--> Definition (out)
 
+newtype StaticEnv = StaticEnv SimplEnv -- Ignore se_inScope and se_defs
+
 type SimplIdSubst = IdEnv SubstAns -- InId |--> SubstAns
 data SubstAns
   = DoneComm OutCommand
   | DoneId OutId
-  | SuspComm SimplIdSubst TvSubstEnv CvSubstEnv InCommand
+  | SuspComm StaticEnv InCommand
 
 data SuspCont
-  = SuspCont SimplIdSubst TvSubstEnv CvSubstEnv (Maybe SuspCont) InCont
+  = SuspCont StaticEnv InCont
 
 -- The original simplifier uses the IdDetails stored in a Var to store unfolding
 -- info. We store similar data externally instead. (This is based on the Secrets
@@ -83,9 +87,8 @@ initialEnv = SimplEnv { se_idSubst = emptyVarEnv
                       , se_inScope = emptyInScopeSet
                       , se_defs    = emptyVarEnv }
 
-mkSuspension :: SimplEnv -> InCommand -> SubstAns
-mkSuspension env c
-  = SuspComm (se_idSubst env) (se_tvSubst env) (se_cvSubst env) c
+mkSuspension :: StaticEnv -> InCommand -> SubstAns
+mkSuspension = SuspComm
 
 enterScope :: SimplEnv -> InVar -> (SimplEnv, OutVar)
 enterScope env x
@@ -133,6 +136,9 @@ getTvSubst env = mkTvSubst (se_inScope env) (se_tvSubst env)
 substTy :: SimplEnv -> Type -> Type
 substTy env t = Type.substTy (getTvSubst env) t
 
+substTyStatic :: StaticEnv -> Type -> Type
+substTyStatic (StaticEnv env) = substTy env
+
 substIdType :: SimplEnv -> Var -> Var
 substIdType env x
   | isEmptyVarEnv tvs || isEmptyVarSet (tyVarsOfType ty)
@@ -148,6 +154,9 @@ getCvSubst env = mkCvSubstFromSubstEnv (se_inScope env) (se_cvSubst env)
 
 substCo :: SimplEnv -> Coercion -> Coercion
 substCo env co = Coercion.substCo (getCvSubst env) co
+
+substCoStatic :: StaticEnv -> Coercion -> Coercion
+substCoStatic (StaticEnv env) = substCo env
 
 cvSubstPairs :: InScopeSet -> CvSubstEnv -> [(Var, Coercion)]
 cvSubstPairs ins cvs
@@ -167,34 +176,74 @@ zapSubstEnvs :: SimplEnv -> SimplEnv
 zapSubstEnvs env
   = env { se_idSubst = emptyVarEnv
         , se_tvSubst = emptyVarEnv
-        , se_cvSubst = emptyVarEnv }
+        , se_cvSubst = emptyVarEnv
+        , se_cont    = Nothing }
 
-setSubstEnvs :: SimplEnv -> SimplIdSubst -> TvSubstEnv -> CvSubstEnv -> SimplEnv
-setSubstEnvs env ids tvs cvs
-  = env { se_idSubst = ids
-        , se_tvSubst = tvs
-        , se_cvSubst = cvs }
-
-suspendAndZapEnv :: SimplEnv -> InCont -> SimplEnv
-suspendAndZapEnv env
-  = suspendAndSetEnv env emptyVarEnv emptyVarEnv emptyVarEnv
-
-suspendAndSetEnv :: SimplEnv -> SimplIdSubst -> TvSubstEnv -> CvSubstEnv
-                 -> InCont -> SimplEnv
-suspendAndSetEnv env ids tvs cvs cont
+setSubstEnvs :: SimplEnv -> SimplIdSubst -> TvSubstEnv -> CvSubstEnv
+             -> Maybe SuspCont -> SimplEnv
+setSubstEnvs env ids tvs cvs k
   = env { se_idSubst = ids
         , se_tvSubst = tvs
         , se_cvSubst = cvs
-        , se_cont    = Just (SuspCont (se_idSubst env)
-                                      (se_tvSubst env)
-                                      (se_cvSubst env)
-                                      (se_cont env)
-                                      cont) }
+        , se_cont    = k }
+
+suspendAndZapEnv :: SimplEnv -> InCont -> SimplEnv
+suspendAndZapEnv env cont
+  = suspendAndSetEnv env (StaticEnv initialEnv) cont
+
+suspendAndSetEnv :: SimplEnv -> StaticEnv -> InCont -> SimplEnv
+suspendAndSetEnv env (StaticEnv stat) cont
+  = env { se_idSubst = se_idSubst stat
+        , se_tvSubst = se_tvSubst stat
+        , se_cvSubst = se_cvSubst stat
+        , se_cont    = Just (SuspCont (StaticEnv env) cont) }
+
+zapCont :: SimplEnv -> SimplEnv
+zapCont env = env { se_cont = Nothing }
+
+staticPart :: SimplEnv -> StaticEnv
+staticPart = StaticEnv
+
+setStaticPart :: SimplEnv -> StaticEnv -> SimplEnv
+setStaticPart dest (StaticEnv src)
+  = dest { se_idSubst = se_idSubst src
+         , se_tvSubst = se_tvSubst src
+         , se_cvSubst = se_cvSubst src
+         , se_cont    = se_cont    src }
 
 restoreEnv :: SimplEnv -> Maybe (SimplEnv, InCont)
 restoreEnv env
-  = se_cont env >>= \(SuspCont ids tvs cvs susp cont) ->
-      return (env { se_idSubst = ids
-                  , se_tvSubst = tvs
-                  , se_cvSubst = cvs
-                  , se_cont    = susp }, cont)
+  = se_cont env >>= \(SuspCont env' cont) ->
+      return (env `setStaticPart` env', cont)
+
+instance Outputable SimplEnv where
+  ppr (SimplEnv ids tvs cvs cont in_scope _defs)
+    =  text "<InScope =" <+> braces (fsep (map ppr (varEnvElts (getInScopeVars in_scope))))
+--    $$ text " Defs      =" <+> ppr defs
+    $$ text " IdSubst   =" <+> ppr ids
+    $$ text " TvSubst   =" <+> ppr tvs
+    $$ text " CvSubst   =" <+> ppr cvs
+    $$ text " Cont      =" <+> ppr cont
+     <> char '>'
+
+instance Outputable StaticEnv where
+  ppr (StaticEnv (SimplEnv ids tvs cvs cont _in_scope _defs))
+    =  text "<IdSubst   =" <+> ppr ids
+    $$ text " TvSubst   =" <+> ppr tvs
+    $$ text " CvSubst   =" <+> ppr cvs
+    $$ text " Cont      =" <+> ppr cont
+     <> char '>'
+
+instance Outputable SubstAns where
+  ppr (DoneComm c) = brackets (text "Command:" <+> ppr c)
+  ppr (DoneId x) = brackets (text "Id:" <+> ppr x)
+  ppr (SuspComm env c)
+    = brackets $ hang (text "Suspended:") 2 (sep [ppr env, ppr c])
+
+instance Outputable SuspCont where
+  ppr (SuspCont env cont)
+    = {-ppr env $$-} ppr cont
+
+instance Outputable Definition where
+  ppr (BoundTo c level) = brackets (ppr level) <+> ppr c
+  ppr (NotAmong alts) = text "NotAmong" <+> ppr alts

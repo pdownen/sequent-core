@@ -26,16 +26,17 @@ fromCoreExpr = go [] []
   where
   go binds frames expr =
     case expr of
-      Core.Var x         -> mkCommand binds (Var x) frames 
-      Core.Lit l         -> mkCommand binds (Lit l) frames
+      Core.Var x         -> done $ Var x
+      Core.Lit l         -> done $ Lit l
       Core.App e1 e2     -> go binds (App (fromCoreExpr e2) : frames) e1
-      Core.Lam x e       -> mkCommand binds (Lam x (fromCoreExpr e)) frames
+      Core.Lam x e       -> done $ Lam x (fromCoreExpr e)
       Core.Let bs e      -> go (fromCoreBind bs : binds) frames e
       Core.Case e x t as -> go binds (Case x t (map fromCoreAlt as) : frames) e
       Core.Cast e co     -> go binds (Cast co : frames) e
       Core.Tick ti e     -> go binds (Tick ti : frames) e
-      Core.Type t        -> mkCommand binds (Type t) frames
-      Core.Coercion co   -> mkCommand binds (Coercion co) frames
+      Core.Type t        -> done $ Type t
+      Core.Coercion co   -> done $ Coercion co
+    where done value = mkCommand (reverse binds) value frames
 
 -- | Translates a Core case alternative into Sequent Core.
 fromCoreAlt :: Core.Alt b -> Alt b
@@ -54,9 +55,9 @@ fromCoreBinds = map fromCoreBind
 
 -- | Translates a command into Core.
 commandToCoreExpr :: SeqCoreCommand -> Core.CoreExpr
-commandToCoreExpr cmd = foldl addLet baseExpr (cmdLet cmd)
+commandToCoreExpr cmd = foldr addLet baseExpr (cmdLet cmd)
   where
-  addLet e b  = mkCoreLet (bindToCore b) e
+  addLet b e  = mkCoreLet (bindToCore b) e
   baseExpr    = foldl (flip frameToCoreExpr)
                       (valueToCoreExpr (cmdValue cmd))
                       (cmdCont cmd)

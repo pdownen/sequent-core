@@ -64,7 +64,7 @@ getMode = SimplM $ \genv -> withZeroCount $ return (sg_mode genv)
 tick, freeTick :: Tick -> SimplM ()
 tick t
   = SimplM $ \_ -> do
-      -- putMsg (text "I has a tick:" <+> ppr t)
+      -- putMsg (text "TICK:" <+> ppr t)
       dflags <- getDynFlags
       let count = doSimplTick dflags t (zeroSimplCount dflags)
       return ((), count)

@@ -8,9 +8,11 @@ f :: Int -> (Thing, Thing, Thing)
 f x = let y f = Red f
           z = Blue
       in
-      let z = Orange 'Z'
-          x = y 7
-      in (x, x, z)
+      if True then
+        let z = Orange 'Z'
+            x = y 7
+        in (x, x, z)
+      else (y 2, z, z)
 
 main = case f 10 of
   (f, g, h) -> print (h, g, f)

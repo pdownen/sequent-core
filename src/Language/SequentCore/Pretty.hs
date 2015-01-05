@@ -126,3 +126,6 @@ instance OutputableBndr b => Outputable (Command b) where
 
 instance OutputableBndr b => Outputable (Frame b) where
   ppr = ppr_frame
+
+instance OutputableBndr b => Outputable (Alt b) where
+  ppr = pprCoreAlt
