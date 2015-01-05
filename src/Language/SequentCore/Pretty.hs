@@ -1,3 +1,5 @@
+{-# OPTIONS_GHC -fno-warn-orphans #-}
+
 -- |
 -- Module      : Language.SequentCore.Pretty
 -- Description : Pretty printing of Sequent Core terms
@@ -52,14 +54,14 @@ ppr_comm add_par comm
           binds -> hang (text "let") 2 (ppr_binds binds) $$ text "in"
     maybe_add_par = if null (cmdLet comm) then noParens else add_par
     cut val []
-      = pprCoreValue val
+      = ppr_value add_par val
     cut val frames
       = cat [text "<" <> pprCoreValue val, vcat $ ppr_block "|" ";" ">" $ map ppr_frame frames]
 
 ppr_value :: OutputableBndr b => (SDoc -> SDoc) -> Value b -> SDoc
 ppr_value _ (Var name) = ppr name
 ppr_value add_par (Type ty) = add_par $ char '@' <+> ppr ty
-ppr_value add_par (Coercion _) = add_par $ text "CO ..."
+ppr_value _ (Coercion _) = text "CO ..."
 ppr_value add_par (Lit lit) = GHC.pprLiteral add_par lit
 ppr_value add_par value@(Lam _ _)
   = let
@@ -68,6 +70,9 @@ ppr_value add_par value@(Lam _ _)
       add_par $
       hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs) <+> arrow)
           2 (pprCoreComm body)
+ppr_value add_par (Cons ctor args)
+  = add_par $
+    hang (ppr ctor) 2 (sep (map (ppr_comm parens) args))
 
 collectBinders :: Value b -> ([b], Maybe (Command b))
 collectBinders (Lam b comm)
@@ -82,7 +87,7 @@ collectBinders _
 
 ppr_frame :: OutputableBndr b => Frame b -> SDoc
 ppr_frame (App comm)
-  = char '$' <+> pprParendComm comm
+  = char '$' <+> ppr_comm noParens comm
 ppr_frame (Case var _ alts)
   = hang (text "case of" <+> pprBndr CaseBind var) 2 $
       vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)
@@ -101,12 +106,10 @@ ppr_case_pat con args
   where
     ppr_bndr = pprBndr CaseBind
 
-pprParendComm, pprCoreComm :: OutputableBndr b => Command b -> SDoc
-pprParendComm comm = ppr_comm parens comm
+pprCoreComm :: OutputableBndr b => Command b -> SDoc
 pprCoreComm comm = ppr_comm noParens comm
 
-pprParendValue, pprCoreValue :: OutputableBndr b => Value b -> SDoc
-pprParendValue val = ppr_value parens val
+pprCoreValue :: OutputableBndr b => Value b -> SDoc
 pprCoreValue val = ppr_value noParens val
 
 noParens :: SDoc -> SDoc
@@ -123,3 +126,6 @@ instance OutputableBndr b => Outputable (Command b) where
 
 instance OutputableBndr b => Outputable (Frame b) where
   ppr = ppr_frame
+
+instance OutputableBndr b => Outputable (Alt b) where
+  ppr = pprCoreAlt

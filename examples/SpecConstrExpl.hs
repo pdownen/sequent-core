@@ -1,3 +1,5 @@
+{-# OPTIONS_GHC -dcore-lint #-}
+
 module Main where
 
 import qualified Data.Map as Map

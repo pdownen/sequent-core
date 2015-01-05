@@ -24,16 +24,19 @@ library
   hs-source-dirs:      src
   exposed-modules:     Language.SequentCore
                        Language.SequentCore.Dump
-                       Language.SequentCore.Ops
                        Language.SequentCore.Plugin
                        Language.SequentCore.Pretty
+                       Language.SequentCore.Simpl
+                       Language.SequentCore.Simpl.Env
+                       Language.SequentCore.Simpl.Monad
                        Language.SequentCore.SpecConstr
                        Language.SequentCore.Syntax
-  build-depends:       base >= 4 && < 5, ghc>=7.6, containers
+                       Language.SequentCore.Translate
+  build-depends:       base >= 4 && < 5, ghc>=7.6, containers, transformers
   default-language:    Haskell2010
-  ghc-options:         -Wall
+  ghc-options:         -Wall -fno-warn-name-shadowing
 
-executable DumpExample
+executable DumpExpl
   hs-source-dirs:      examples
   Main-is:             Example.hs
   build-depends:       base >= 4 && < 5, sequent-core
@@ -47,6 +50,13 @@ executable SpecConstrExpl
   default-language:    Haskell2010
   ghc-options:         -fplugin=Language.SequentCore.SpecConstr
                        -fspec-constr
+
+executable SimplExpl
+  hs-source-dirs:      examples
+  Main-is:             Compl.hs
+  build-depends:       base >= 4 && < 5, sequent-core
+  default-language:    Haskell2010
+  ghc-options:         -fplugin=Language.SequentCore.Simpl
 
 source-repository head
   type:                git

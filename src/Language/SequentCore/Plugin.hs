@@ -12,8 +12,9 @@ module Language.SequentCore.Plugin (
 ) where
 
 import Language.SequentCore.Syntax
+import Language.SequentCore.Translate
 
-import GhcPlugins (ModGuts, CoreM
+import GhcPlugins ( ModGuts, CoreM
                   , bindsOnlyPass
                   , deShadowBinds
                   )

@@ -80,10 +80,10 @@ module Language.SequentCore.SpecConstr (
   plugin
 ) where
 
-import Language.SequentCore.Ops
 import Language.SequentCore.Plugin
 import Language.SequentCore.Pretty ()
 import Language.SequentCore.Syntax
+import Language.SequentCore.Translate
 
 import CoreMonad  ( CoreM
                   , Plugin(installCoreToDos), defaultPlugin
@@ -258,7 +258,7 @@ usageFromCut env (Var x) (Case {} : _)
 -- that we know to be bound to a candidate for specialization.
 usageFromCut env v@(Var f) fs
   | Just SpecFun <- sc_how_bound env `lookupVarEnv` f
-  , Just (_, args, _) <- saturatedCall (Command [] v fs)
+  , Just (args, _) <- asSaturatedCall v fs
   = ScUsage (unitVarEnv f [args]) emptyVarSet
 usageFromCut _ _ _
   = emptyScUsage
@@ -359,8 +359,11 @@ specialize env (ScUsage calls used) (x, c)
     shouldSpec args
       = or $ zipWith qualifyingArg binders args
       where
-        qualifyingArg x' arg
-          = isSaturatedCtorApp arg && x' `elemVarSet` used
+        qualifyingArg x' c
+          | Just (Cons {}) <- asValueCommand c
+          = x' `elemVarSet` used
+          | otherwise
+          = False
 
     -- | Create a specialization for a call pattern.
     specCall :: CallPat -> CoreM Spec
@@ -385,15 +388,12 @@ specialize env (ScUsage calls used) (x, c)
     argToSubpat var arg
       -- This is a saturated constructor application, so abstract over its
       -- arguments to produce the subpattern
-      | Just (ctor, args, _) <- saturatedCtorApp arg
+      | Just (Cons ctor args) <- asValueCommand arg
       = do
         -- Abstract over *term* arguments only
-        let (tyArgs, tmArgs) = span isNontermArg args
+        let (tyArgs, tmArgs) = span isErasedArg args
         tmVars <- mapM (mkSysLocalM (fsLit "scsca") . commandType) tmArgs
-        let cont = map App (tyArgs ++ map varCommand tmVars)
-            cmd = Command { cmdValue = Var ctor
-                          , cmdCont = cont
-                          , cmdLet = [] }
+        let cmd = valueCommand (Cons ctor $ tyArgs ++ map varCommand tmVars)
         return (tmVars, cmd)
       -- Just abstract over the whole argument; it's either a variable or
       -- something like a function application, so specializing for it doesn't
