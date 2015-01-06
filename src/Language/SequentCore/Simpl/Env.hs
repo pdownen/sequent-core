@@ -9,7 +9,7 @@ module Language.SequentCore.Simpl.Env (
   initialEnv, mkSuspension, enterScope, enterScopes, uniqAway,
   substId, substTy, substTyStatic, substCo, substCoStatic, extendIdSubst,
   zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
-  suspendAndZapEnv, suspendAndSetEnv, zapCont, restoreEnv
+  suspendAndZapEnv, suspendAndSetEnv, zapCont, bindCont, restoreEnv
 ) where
 
 import Language.SequentCore.Pretty ()
@@ -197,6 +197,10 @@ suspendAndSetEnv env (StaticEnv stat) cont
         , se_tvSubst = se_tvSubst stat
         , se_cvSubst = se_cvSubst stat
         , se_cont    = Just (SuspCont (StaticEnv env) cont) }
+
+bindCont :: SimplEnv -> StaticEnv -> InCont -> SimplEnv
+bindCont env stat cont
+  = env { se_cont = Just (SuspCont stat cont) }
 
 zapCont :: SimplEnv -> SimplEnv
 zapCont env = env { se_cont = Nothing }

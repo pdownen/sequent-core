@@ -5,7 +5,8 @@ module Main (main, f) where
 data Thing = Blue | Red Int | Orange Char deriving Show
 
 f :: Int -> (Thing, Thing, Thing)
-f x = let y f = Red f
+f x = let y f | odd f = Red f
+              | otherwise = Orange 'Q'
           z = Blue
       in
       if True then

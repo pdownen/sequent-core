@@ -14,7 +14,7 @@ import Coercion    ( isCoVar )
 import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      CoreM, defaultPlugin, reinitializeGlobals, errorMsg,
                      isZeroSimplCount
-                     {-, putMsg, pprSimplCount-}
+                     --,putMsg, pprSimplCount
                    )
 import CoreSyn     ( isRuntimeVar, isCheapUnfolding )
 import CoreUnfold  ( smallEnoughToInline )
@@ -123,16 +123,14 @@ simplBind :: SimplEnv -> StaticEnv -> InBind -> TopLevelFlag
 --                          ppr bind) False
 --  = undefined
 simplBind env_x env_c (NonRec x c) level
-  = do
-    (env', x'c') <- simplNonRec env_x x env_c c level
-    return (env', uncurry NonRec <$> x'c')
+  = simplNonRec env_x x env_c c level
 simplBind env_x env_c (Rec xcs) level
   = do
     (env', xcs') <- simplRec env_x env_c xcs level
     return (env', if null xcs' then Nothing else Just $ Rec xcs')
 
 simplNonRec :: SimplEnv -> InVar -> StaticEnv -> InCommand -> TopLevelFlag
-            -> SimplM (SimplEnv, Maybe (OutVar, OutCommand))
+            -> SimplM (SimplEnv, Maybe OutBind)
 simplNonRec env_x x env_c c level
   | isTyVar x
   , Type ty <- assert (isTypeArg c) $ cmdValue c
@@ -156,7 +154,8 @@ simplNonRec env_x x env_c c level
       else do
         let (env', x') = enterScope env_x x
         c' <- simplStandaloneCommand (env' `setStaticPart` env_c) c
-        completeBind env' x x' c' level
+        (env'', maybeNewPair) <- completeBind env' x x' c' level
+        return (env'', uncurry NonRec <$> maybeNewPair)
 
 completeBind :: SimplEnv -> InVar -> OutVar -> OutCommand -> TopLevelFlag
              -> SimplM (SimplEnv, Maybe (OutVar, OutCommand))
@@ -200,9 +199,8 @@ simplRec env_x env_c xcs level
 
     (env0_x, xs') = enterScopes env_x (map fst xcs)
 
--- TODO Lots of things this function should do:
--- * Beta-reduction
--- * Optimize the continuation wrt casts 
+-- TODO Deal with casts, i.e. implement the congruence rules from the
+-- System FC paper
 simplCut :: SimplEnv -> InValue -> StaticEnv -> InCont -> SimplM OutCommand
 {-
 simplCut env_v v env_k cont
@@ -228,6 +226,14 @@ simplCut env_v (Var x) env_k cont
       SuspComm stat c
         -> simplCommand (suspendAndSetEnv env'_k stat cont) c
     where env'_k = env_v `setStaticPart` env_k
+simplCut env_v (Lam x c) env_k (App arg : cont)
+  = do
+    tick (BetaReduction x)
+    (env_v', newBind) <- simplNonRec env_v x env_k arg NotTopLevel
+    -- Effectively, here we bind the covariable in the lambda to the current
+    -- continuation before proceeding
+    c' <- simplCommand (bindCont env_v' env_k cont) c
+    return $ addLets (maybeToList newBind) c'
 simplCut env_v (Lam x c) env_k cont
   = do
     let (env_v', x') = enterScope env_v x
@@ -242,7 +248,7 @@ simplCut env_v val env_k (Case x _ alts : cont)
     (env', binds) <- go (env_v `setStaticPart` env_k)
                          ((x, valueCommand val) : pairs) []
     comm <- simplCommand env' (body `extendCont` cont)
-    return $ addLets (map (uncurry NonRec) binds) comm
+    return $ addLets binds comm
   where
     go env [] acc
       = return (env, reverse (catMaybes acc))

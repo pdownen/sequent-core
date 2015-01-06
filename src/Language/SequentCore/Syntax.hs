@@ -143,6 +143,7 @@ lambdas xs body = foldr (\x c -> valueCommand (Lam x c)) body xs
 
 -- | Adds the given bindings outside those in the given command.
 addLets :: [Bind b] -> Command b -> Command b
+addLets [] c = c -- avoid unnecessary allocation
 addLets bs c = c { cmdLet = bs ++ cmdLet c }
 
 -- | Adds the given continuation frames to the end of those in the given
