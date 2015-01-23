@@ -1,10 +1,10 @@
 -- | 
 -- Module      : Language.SequentCore.Syntax
--- Description : Sequent Core syntax and translations
+-- Description : Sequent Core syntax
 -- Maintainer  : maurerl@cs.uoregon.edu
 -- Stability   : experimental
 --
--- The AST for Sequent Core, with translations to and from GHC Core.
+-- The AST for Sequent Core, with basic operations.
 
 module Language.SequentCore.Syntax (
   -- * AST Types
@@ -47,7 +47,8 @@ import Data.Maybe
 -- | An atomic value. These include literals, lambdas, and variables, as well as
 -- types and coercions (see GHC's 'GHC.Expr' for the reasoning).
 data Value b    = Lit Literal       -- ^ A primitive literal value.
-                | Var Id            -- ^ A term variable.
+                | Var Id            -- ^ A term variable. Must /not/ be a
+                                    -- nullary constructor; use 'Cons' for this.
                 | Lam b (Command b) -- ^ A function. The body is a computation,
                                     -- that is, a 'Command'.
                 | Cons DataCon [Command b]
@@ -80,6 +81,12 @@ type Cont b     = [Frame b]
 -- | A general computation. A command brings together a list of bindings, some
 -- value, and a /continuation/ saying what to do with that value. The value and
 -- continuation comprise a /cut/ in the sequent calculus.
+--
+-- __Invariant__: If 'cmdValue' is a variable representing a constructor, then
+-- 'cmdCont' must /not/ begin with as many 'App' frames as the constructor's
+-- arity. In other words, the command must not represent a saturated application
+-- of a constructor. Such an application should be represented by a 'Cons' value
+-- instead. When in doubt, use 'mkCommand' to enforce this invariant.
 data Command b  = Command { -- | Bindings surrounding the computation.
                             cmdLet   :: [Bind b]
                             -- | The value provided to the continuation.
@@ -114,13 +121,17 @@ type SeqCoreAlt     = Alt     Var
 -- Constructors
 --------------------------------------------------------------------------------
 
+-- | Constructs a command, given @let@ bindings, a value, and a continuation.
+--
+-- This smart constructor enforces the invariant that a saturated constructor
+-- invocation is represented as a 'Cons' value rather than using 'App' frames.
 mkCommand :: [Bind b] -> Value b -> Cont b -> Command b
 mkCommand binds val@(Var f) cont
   | Just ctor <- isDataConWorkId_maybe f
-  , Just (args, cont') <- ctorCall ctor
+  , Just (args, cont') <- ctorCall
   = mkCommand binds (Cons ctor args) cont'
   where
-    ctorCall ctor
+    ctorCall
       | 0 <- idArity f
       = Just ([], cont)
       | otherwise
@@ -214,6 +225,7 @@ isTypeValue :: Value b -> Bool
 isTypeValue (Type _) = True
 isTypeValue _ = False
 
+-- | True if the given value is a coercion. See 'Coercion'.
 isCoValue :: Value b -> Bool
 isCoValue (Coercion _) = True
 isCoValue _ = False
@@ -228,20 +240,34 @@ isErasedValue _ = False
 isRuntimeValue :: Value b -> Bool
 isRuntimeValue v = not (isErasedValue v)
 
+-- | True if the given command represents no actual run-time computation or
+-- allocation. For this to hold, it must have no @let@ bindings, and its value
+-- and its continuation must both be trivial. Equivalent to
+-- 'CoreUtils.exprIsTrivial' in GHC.
 isTrivial :: HasId b => Command b -> Bool
 isTrivial c
   = null (cmdLet c) &&
       isTrivialCont (cmdCont c) &&
       isTrivialValue (cmdValue c)
 
+-- | True if the given value represents no actual run-time computation. Some
+-- literals are not trivial, and a lambda whose argument is not erased or whose
+-- body is non-trivial is also non-trivial.
 isTrivialValue :: HasId b => Value b -> Bool
 isTrivialValue (Lit l)    = litIsTrivial l
 isTrivialValue (Lam x c)  = not (isRuntimeVar (identifier x)) && isTrivial c
 isTrivialValue _          = True
 
+-- | True if the given continuation represents no actual run-time computation.
+-- This holds if all of its frames are trivial (perhaps because it is the empty
+-- continuation).
 isTrivialCont :: Cont b -> Bool
 isTrivialCont = all isTrivialFrame
 
+-- | True if the given continuation represents no actual run-time computation.
+-- This is true of casts and of applications of erased arguments (types and
+-- coercions). Ticks are not considered trivial, since this would cause them to
+-- be inlined.
 isTrivialFrame :: Frame b -> Bool
 isTrivialFrame (Cast _)   = True
 isTrivialFrame (App c)    = isErasedArg c
@@ -257,6 +283,9 @@ commandAsSaturatedCall c
     (args, cont) <- asSaturatedCall val (cmdCont c)
     return $ (val, args, cont)
 
+-- | If the given value is a function, and the given continuation would provide
+-- enough arguments to saturate it, returns the arguments and the remainder of
+-- the continuation.
 asSaturatedCall :: Value b -> Cont b -> Maybe ([Command b], Cont b)
 asSaturatedCall val cont
   | 0 < arity, arity <= length args
@@ -267,6 +296,7 @@ asSaturatedCall val cont
     arity = valueArity val
     (args, others) = collectArgs cont
 
+-- | If a command does nothing but provide a value, returns that value.
 asValueCommand :: Command b -> Maybe (Value b)
 asValueCommand (Command { cmdLet = [], cmdValue = v, cmdCont = [] })
   = Just v

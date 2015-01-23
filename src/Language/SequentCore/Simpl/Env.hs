@@ -1,3 +1,5 @@
+{-# OPTIONS_HADDOCK hide #-}
+
 module Language.SequentCore.Simpl.Env (
   SimplEnv(..), StaticEnv, SimplIdSubst, SubstAns(..), IdDefEnv, Definition(..),
 
@@ -245,8 +247,8 @@ instance Outputable SubstAns where
     = brackets $ hang (text "Suspended:") 2 (sep [ppr env, ppr c])
 
 instance Outputable SuspCont where
-  ppr (SuspCont env cont)
-    = {-ppr env $$-} ppr cont
+  ppr (SuspCont _env cont)
+    = ppr cont
 
 instance Outputable Definition where
   ppr (BoundTo c level) = brackets (ppr level) <+> ppr c

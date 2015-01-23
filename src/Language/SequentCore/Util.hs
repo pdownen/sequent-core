@@ -1,3 +1,11 @@
+{-# OPTIONS_HADDOCK hide #-}
+
+-- | 
+-- Module      : Language.SequentCore.Util
+-- Description : Utilities used by the Sequent Core library
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
+
 module Language.SequentCore.Util (
   orElse, consMaybe 
 ) where

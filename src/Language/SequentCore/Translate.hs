@@ -1,3 +1,11 @@
+-- | 
+-- Module      : Language.SequentCore.Translate
+-- Description : Core \<-\> Sequent Core
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
+--
+-- Translation between Sequent Core and native GHC Core.
+
 module Language.SequentCore.Translate (
   -- $txn
   fromCoreExpr, fromCoreBind, fromCoreBinds, fromCoreAlt,

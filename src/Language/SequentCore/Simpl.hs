@@ -1,5 +1,16 @@
 {-# LANGUAGE ParallelListComp #-}
 
+-- | 
+-- Module      : Language.SequentCore.Simpl
+-- Description : Simplifier reimplementation using Sequent Core
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
+--
+-- A proof of concept to demonstrate that the Sequent Core syntax can be used
+-- for basic optimization in the style of GHC's simplifier. In some ways, it is
+-- easier to use Sequent Core for these, as the continuations are expressed
+-- directly in the program syntax rather than needing to be built up on the fly.
+
 module Language.SequentCore.Simpl (plugin) where
 
 import Language.SequentCore.Pretty ({-ppr_binds_top-})
@@ -31,6 +42,8 @@ import Control.Applicative ( (<$>), (<*>) )
 import Control.Exception   ( assert )
 import Data.Maybe
 
+-- | Plugin data. The initializer replaces all instances of the original
+-- simplifier with the new one.
 plugin :: Plugin
 plugin = defaultPlugin {
   installCoreToDos = \_ todos -> do

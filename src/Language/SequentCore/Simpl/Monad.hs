@@ -1,3 +1,5 @@
+{-# OPTIONS_HADDOCK hide #-}
+
 module Language.SequentCore.Simpl.Monad (
   SimplM, SimplGlobalEnv(..), runSimplM, liftCoreM,
   getDynFlags, getMode, tick, freeTick
