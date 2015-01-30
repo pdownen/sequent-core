@@ -1,9 +1,8 @@
 {-# LANGUAGE KindSignatures #-}
 
 module Language.SequentCore.Syntax (
-  Value, Frame, Cont, Command, Bind, Alt,
-  SeqCoreValue, SeqCoreFrame, SeqCoreCont, SeqCoreCommand, SeqCoreBind,
-    SeqCoreAlt,
+  Value, Cont, Command, Bind, Alt,
+  SeqCoreValue, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreAlt,
 
   mkCommand
 ) where
@@ -11,14 +10,12 @@ module Language.SequentCore.Syntax (
 import Var ( Var )
 
 data Value (b :: *)
-data Frame (b :: *)
-type Cont b = [Frame b]
+data Cont (b :: *)
 data Command (b :: *)
 data Bind (b :: *)
 data Alt (b :: *)
 
 type SeqCoreValue   = Value   Var
-type SeqCoreFrame   = Frame   Var
 type SeqCoreCont    = Cont    Var
 type SeqCoreCommand = Command Var
 type SeqCoreBind    = Bind    Var

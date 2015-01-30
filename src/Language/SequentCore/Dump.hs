@@ -26,7 +26,7 @@ import GhcPlugins ( Plugin(installCoreToDos), CommandLineOption
 
 import Language.SequentCore.Syntax
 import Language.SequentCore.Plugin
-import Language.SequentCore.Pretty (ppr_binds_top)
+import Language.SequentCore.Pretty (pprTopLevelBinds)
 
 -- | The plugin. A GHC plugin is a module that exports a value called @plugin@
 -- with the type 'Plugin'.
@@ -48,5 +48,5 @@ install _ todos =
 
 showSequentCore :: [SeqCoreBind] -> CoreM [SeqCoreBind]
 showSequentCore bs = do
-  putMsg (ppr_binds_top bs)
+  putMsg (pprTopLevelBinds bs)
   return bs

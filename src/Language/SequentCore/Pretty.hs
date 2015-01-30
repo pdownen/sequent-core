@@ -10,7 +10,7 @@
 -- built-in pretty printer.
   
 module Language.SequentCore.Pretty (
-  ppr_binds_top
+  pprTopLevelBinds
 ) where
 
 import Language.SequentCore.Syntax
@@ -24,9 +24,12 @@ ppr_bind :: OutputableBndr b => Bind b -> SDoc
 ppr_bind (NonRec val_bdr expr) = ppr_binding (val_bdr, expr)
 ppr_bind (Rec binds)           = hang (text "rec") 2 (vcat $ intersperse space $ ppr_block "{" ";" "}" (map ppr_binding binds))
 
--- | Print the given bindings as a sequence of top-level bindings.
 ppr_binds_top :: OutputableBndr b => [Bind b] -> SDoc
 ppr_binds_top binds = ppr_binds_with "" "" "" binds
+
+-- | Print the given bindings as a sequence of top-level bindings.
+pprTopLevelBinds :: OutputableBndr b => [Bind b] -> SDoc
+pprTopLevelBinds = ppr_binds_top
 
 ppr_block :: String -> String -> String -> [SDoc] -> [SDoc]
 ppr_block open _ close [] = [text open <> text close]
@@ -39,10 +42,10 @@ ppr_binds binds = ppr_binds_with "{" ";" "}" binds
 ppr_binds_with :: OutputableBndr b => String -> String -> String -> [Bind b] -> SDoc
 ppr_binds_with open mid close binds = vcat $ intersperse space $ ppr_block open mid close (map ppr_bind binds)
 
-ppr_binding :: OutputableBndr b => (b, Command b) -> SDoc
+ppr_binding :: OutputableBndr b => (b, Value b) -> SDoc
 ppr_binding (val_bdr, expr)
   = pprBndr LetBind val_bdr $$
-    hang (ppr val_bdr <+> equals) 2 (pprCoreComm expr)
+    hang (ppr val_bdr <+> equals) 2 (pprCoreValue expr)
 
 ppr_comm :: OutputableBndr b => (SDoc -> SDoc) -> Command b -> SDoc
 ppr_comm add_par comm
@@ -53,10 +56,10 @@ ppr_comm add_par comm
           [] -> empty
           binds -> hang (text "let") 2 (ppr_binds binds) $$ text "in"
     maybe_add_par = if null (cmdLet comm) then noParens else add_par
-    cut val []
+    cut val Return
       = ppr_value add_par val
-    cut val frames
-      = cat [text "<" <> pprCoreValue val, vcat $ ppr_block "|" ";" ">" $ map ppr_frame frames]
+    cut val cont
+      = cat [text "<" <> pprCoreValue val, vcat $ ppr_block "|" ";" ">" $ ppr_cont_frames cont]
 
 ppr_value :: OutputableBndr b => (SDoc -> SDoc) -> Value b -> SDoc
 ppr_value _ (Var name) = ppr name
@@ -65,36 +68,32 @@ ppr_value _ (Coercion _) = text "CO ..."
 ppr_value add_par (Lit lit) = GHC.pprLiteral add_par lit
 ppr_value add_par value@(Lam _ _)
   = let
-      (bndrs, Just body) = collectBinders value
+      (bndrs, body) = collectLambdas value
     in
       add_par $
       hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs) <+> arrow)
           2 (pprCoreComm body)
 ppr_value add_par (Cons ctor args)
   = add_par $
-    hang (ppr ctor) 2 (sep (map (ppr_comm parens) args))
+    hang (ppr ctor) 2 (sep (map (ppr_value parens) args))
+ppr_value add_par (Compute comm)
+  = ppr_comm add_par comm
 
-collectBinders :: Value b -> ([b], Maybe (Command b))
-collectBinders (Lam b comm)
-  = go [b] comm
-  where
-    go bs (Command { cmdLet = [], cmdCont = [], cmdValue = Lam b' comm' })
-      = go (b' : bs) comm'
-    go bs comm'
-      = (reverse bs, Just comm')
-collectBinders _
-  = ([], Nothing)
+ppr_cont_frames :: OutputableBndr b => Cont b -> [SDoc]
+ppr_cont_frames (App v k)
+  = char '$' <+> ppr_value noParens v : ppr_cont_frames k
+ppr_cont_frames (Case var _ alts k)
+  = (hang (text "case of" <+> pprBndr CaseBind var) 2 $
+      vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)) : ppr_cont_frames k
+ppr_cont_frames (Cast _ k)
+  = text "cast ..." : ppr_cont_frames k
+ppr_cont_frames (Tick _ k)
+  = text "tick ..." : ppr_cont_frames k
+ppr_cont_frames Return
+  = []
 
-ppr_frame :: OutputableBndr b => Frame b -> SDoc
-ppr_frame (App comm)
-  = char '$' <+> ppr_comm noParens comm
-ppr_frame (Case var _ alts)
-  = hang (text "case of" <+> pprBndr CaseBind var) 2 $
-      vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)
-ppr_frame (Cast _)
-  = text "cast ..."
-ppr_frame (Tick _)
-  = text "tick ..."
+ppr_cont :: OutputableBndr b => Cont b -> SDoc
+ppr_cont k = sep $ punctuate semi (ppr_cont_frames k)
 
 pprCoreAlt :: OutputableBndr b => Alt b -> SDoc
 pprCoreAlt (Alt con args rhs)
@@ -124,8 +123,8 @@ instance OutputableBndr b => Outputable (Value b) where
 instance OutputableBndr b => Outputable (Command b) where
   ppr = ppr_comm noParens
 
-instance OutputableBndr b => Outputable (Frame b) where
-  ppr = ppr_frame
+instance OutputableBndr b => Outputable (Cont b) where
+  ppr = ppr_cont
 
 instance OutputableBndr b => Outputable (Alt b) where
   ppr = pprCoreAlt

@@ -9,7 +9,7 @@
 module Language.SequentCore.Translate (
   -- $txn
   fromCoreExpr, fromCoreBind, fromCoreBinds, fromCoreAlt,
-  commandToCoreExpr, valueToCoreExpr, frameToCoreExpr,
+  commandToCoreExpr, valueToCoreExpr, contToCoreExpr,
   bindToCore, bindsToCore, altToCore
 ) where
 
@@ -30,21 +30,24 @@ import MkCore
 
 -- | Translates a Core expression into Sequent Core.
 fromCoreExpr :: Core.Expr b -> Command b
-fromCoreExpr = go [] []
+fromCoreExpr = go [] Return
   where
-  go binds frames expr =
+  go binds cont expr =
     case expr of
       Core.Var x         -> done $ Var x
       Core.Lit l         -> done $ Lit l
-      Core.App e1 e2     -> go binds (App (fromCoreExpr e2) : frames) e1
+      Core.App e1 e2     -> go binds (App (fromCoreExprAsValue e2) cont) e1
       Core.Lam x e       -> done $ Lam x (fromCoreExpr e)
-      Core.Let bs e      -> go (fromCoreBind bs : binds) frames e
-      Core.Case e x t as -> go binds (Case x t (map fromCoreAlt as) : frames) e
-      Core.Cast e co     -> go binds (Cast co : frames) e
-      Core.Tick ti e     -> go binds (Tick ti : frames) e
+      Core.Let bs e      -> go (fromCoreBind bs : binds) cont e
+      Core.Case e x t as -> go binds (Case x t (map fromCoreAlt as) cont) e
+      Core.Cast e co     -> go binds (Cast co cont) e
+      Core.Tick ti e     -> go binds (Tick ti cont) e
       Core.Type t        -> done $ Type t
       Core.Coercion co   -> done $ Coercion co
-    where done value = mkCommand (reverse binds) value frames
+    where done value = mkCommand (reverse binds) value cont
+
+fromCoreExprAsValue :: Core.Expr b -> Value b
+fromCoreExprAsValue = mkCompute . fromCoreExpr
 
 -- | Translates a Core case alternative into Sequent Core.
 fromCoreAlt :: Core.Alt b -> Alt b
@@ -54,8 +57,8 @@ fromCoreAlt (ac, bs, e) = Alt ac bs (fromCoreExpr e)
 fromCoreBind :: Core.Bind b -> Bind b
 fromCoreBind bind =
   case bind of
-    Core.NonRec b e -> NonRec b (fromCoreExpr e)
-    Core.Rec bs     -> Rec [ (b, fromCoreExpr e) | (b,e) <- bs ]
+    Core.NonRec b e -> NonRec b (fromCoreExprAsValue e)
+    Core.Rec bs     -> Rec [ (b, fromCoreExprAsValue e) | (b,e) <- bs ]
 
 -- | Translates a list of Core bindings into Sequent Core.
 fromCoreBinds :: [Core.Bind b] -> [Bind b]
@@ -66,9 +69,7 @@ commandToCoreExpr :: SeqCoreCommand -> Core.CoreExpr
 commandToCoreExpr cmd = foldr addLet baseExpr (cmdLet cmd)
   where
   addLet b e  = mkCoreLet (bindToCore b) e
-  baseExpr    = foldl (flip frameToCoreExpr)
-                      (valueToCoreExpr (cmdValue cmd))
-                      (cmdCont cmd)
+  baseExpr    = contToCoreExpr (cmdCont cmd) (valueToCoreExpr (cmdValue cmd))
 
 -- | Translates a value into Core.
 valueToCoreExpr :: SeqCoreValue -> Core.CoreExpr
@@ -76,29 +77,31 @@ valueToCoreExpr val =
   case val of
     Lit l       -> Core.Lit l
     Var x       -> Core.Var x
-    Lam b c     -> Core.Lam b (commandToCoreExpr c)
+    Lam b v     -> Core.Lam b (commandToCoreExpr v)
     Cons ct as  -> mkCoreApps (Core.Var (dataConWorkId ct))
-                              (map commandToCoreExpr as) 
+                              (map valueToCoreExpr as) 
     Type t      -> Core.Type t
     Coercion co -> Core.Coercion co
+    Compute c   -> commandToCoreExpr c
 
 -- | Translates a frame into a function that will wrap a Core expression with a
 -- fragment of context (an argument to apply to, a case expression to run,
 -- etc.).
-frameToCoreExpr :: SeqCoreFrame -> (Core.CoreExpr -> Core.CoreExpr)
-frameToCoreExpr frame e =
-  case frame of
-    App  {- expr -} e2      -> mkCoreApp e (commandToCoreExpr e2)
-    Case {- expr -} b t as  -> Core.Case e b t (map altToCore as)
-    Cast {- expr -} co      -> Core.Cast e co
-    Tick ti {- expr -}      -> Core.Tick ti e
+contToCoreExpr :: SeqCoreCont -> (Core.CoreExpr -> Core.CoreExpr)
+contToCoreExpr k e =
+  case k of
+    App  {- expr -} v k'      -> contToCoreExpr k' $ mkCoreApp e (valueToCoreExpr v)
+    Case {- expr -} b t as k' -> contToCoreExpr k' $ Core.Case e b t (map altToCore as)
+    Cast {- expr -} co k'     -> contToCoreExpr k' $ Core.Cast e co
+    Tick ti {- expr -} k'     -> contToCoreExpr k' $ Core.Tick ti e
+    Return                    -> e
 
 -- | Translates a binding into Core.
 bindToCore :: SeqCoreBind -> Core.CoreBind
 bindToCore bind =
   case bind of
-    NonRec b c -> Core.NonRec b (commandToCoreExpr c)
-    Rec bs     -> Core.Rec [ (b,commandToCoreExpr c) | (b,c) <- bs ]
+    NonRec b v -> Core.NonRec b (valueToCoreExpr v)
+    Rec bs     -> Core.Rec [ (b, valueToCoreExpr v) | (b,v) <- bs ]
 
 -- | Translates a list of bindings into Core.
 bindsToCore :: [SeqCoreBind] -> [Core.CoreBind]

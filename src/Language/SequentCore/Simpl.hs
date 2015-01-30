@@ -13,7 +13,7 @@
 
 module Language.SequentCore.Simpl (plugin) where
 
-import Language.SequentCore.Pretty ({-ppr_binds_top-})
+import Language.SequentCore.Pretty ({-pprTopLevelBinds-})
 import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Simpl.Monad
 import Language.SequentCore.Syntax
@@ -82,10 +82,10 @@ runSimplifier iters mode guts
             occBinds  = runOccurAnal mod coreBinds
             binds     = fromCoreBinds occBinds
         -- putMsg  $ text "BEFORE" <+> int n
-        --        $$ text "--------" $$ ppr_binds_top binds
+        --        $$ text "--------" $$ pprTopLevelBinds binds
         (binds', count) <- runSimplM globalEnv $ simplModule binds
         -- putMsg  $ text "AFTER" <+> int n
-        --        $$ text "-------" $$ ppr_binds_top binds'
+        --        $$ text "-------" $$ pprTopLevelBinds binds'
         let coreBinds' = bindsToCore binds'
             guts'      = guts { mg_binds = coreBinds' }
         if isZeroSimplCount count
@@ -111,13 +111,10 @@ simplCommand env (Command { cmdLet = binds, cmdValue = val, cmdCont = cont })
     cmd' <- simplCut env' val (staticPart env') cont
     return $ addLets binds' cmd'
 
--- Simplifies a command that's standing in for a value, in other words a
--- mu-abstraction.
--- TODO Figure out how to explain this without reference to sequent calculus.
--- Otherwise, convince people that keeping mu-abstractions in sequent core
--- would be a win because the need for this would be self-evident.
-simplStandaloneCommand :: SimplEnv -> InCommand -> SimplM OutCommand
-simplStandaloneCommand env c = simplCommand (zapCont env) c
+simplValue :: SimplEnv -> InValue -> SimplM OutValue
+simplValue env v
+  = mkCompute <$> simplCut env' v (staticPart env') Return
+  where env' = zapCont env
 
 simplBinds :: SimplEnv -> [InBind] -> TopLevelFlag
            -> SimplM (SimplEnv, [OutBind])
@@ -142,44 +139,44 @@ simplBind env_x env_c (Rec xcs) level
     (env', xcs') <- simplRec env_x env_c xcs level
     return (env', if null xcs' then Nothing else Just $ Rec xcs')
 
-simplNonRec :: SimplEnv -> InVar -> StaticEnv -> InCommand -> TopLevelFlag
+simplNonRec :: SimplEnv -> InVar -> StaticEnv -> InValue -> TopLevelFlag
             -> SimplM (SimplEnv, Maybe OutBind)
-simplNonRec env_x x env_c c level
+simplNonRec env_x x env_v v level
   | isTyVar x
-  , Type ty <- assert (isTypeArg c) $ cmdValue c
-  = let ty'  = substTyStatic env_c ty
+  , Type ty <- assert (isTypeValue v) $ v
+  = let ty'  = substTyStatic env_v ty
         tvs' = extendVarEnv (se_tvSubst env_x) x ty'
     in return (env_x { se_tvSubst = tvs' }, Nothing)
   | isCoVar x
-  , Coercion co <- assert (isCoArg c) $ cmdValue c
-  = let co'  = substCoStatic env_c co
+  , Coercion co <- assert (isCoValue v) $ v
+  = let co'  = substCoStatic env_v co
         cvs' = extendVarEnv (se_cvSubst env_x) x co'
     in return (env_x { se_cvSubst = cvs' }, Nothing)
   | otherwise
   = do
-    preInline <- preInlineUnconditionally env_x x env_c c level
+    preInline <- preInlineUnconditionally env_x x env_v v level
     if preInline
       then do
         tick (PreInlineUnconditionally x)
-        let rhs = mkSuspension env_c c
+        let rhs = mkSuspension env_v v
             env' = extendIdSubst env_x x rhs
         return (env', Nothing)
       else do
         let (env', x') = enterScope env_x x
-        c' <- simplStandaloneCommand (env' `setStaticPart` env_c) c
-        (env'', maybeNewPair) <- completeBind env' x x' c' level
+        v' <- simplValue (env' `setStaticPart` env_v) v
+        (env'', maybeNewPair) <- completeBind env' x x' v' level
         return (env'', uncurry NonRec <$> maybeNewPair)
 
-completeBind :: SimplEnv -> InVar -> OutVar -> OutCommand -> TopLevelFlag
-             -> SimplM (SimplEnv, Maybe (OutVar, OutCommand))
-completeBind env x x' c level
+completeBind :: SimplEnv -> InVar -> OutVar -> OutValue -> TopLevelFlag
+             -> SimplM (SimplEnv, Maybe (OutVar, OutValue))
+completeBind env x x' v level
   = do
-    postInline <- postInlineUnconditionally env x c level
+    postInline <- postInlineUnconditionally env x v level
     if postInline
       then do
         tick (PostInlineUnconditionally x)
-        -- Nevermind about substituting x' for x; we'll substitute c instead
-        let env' = extendIdSubst env x (DoneComm c)
+        -- Nevermind about substituting x' for x; we'll substitute v instead
+        let env' = extendIdSubst env x (DoneVal v)
         return (env', Nothing)
       else do
         -- TODO Eta-expansion goes here
@@ -187,30 +184,30 @@ completeBind env x x' c level
             defs  = se_defs env
             x''   = x' `setIdInfo` idInfo x
             ins'  = extendInScopeSet ins x''
-            defs' = extendVarEnv defs x'' (BoundTo c level)
-        return (env { se_inScope = ins', se_defs = defs' }, Just (x'', c))
+            defs' = extendVarEnv defs x'' (BoundTo v level)
+        return (env { se_inScope = ins', se_defs = defs' }, Just (x'', v))
 
-simplRec :: SimplEnv -> StaticEnv -> [(InVar, InCommand)] -> TopLevelFlag
-         -> SimplM (SimplEnv, [(OutVar, OutCommand)])
-simplRec env_x env_c xcs level
-  = go env0_x [ (x, x', c) | (x, c) <- xcs | x' <- xs' ] []
+simplRec :: SimplEnv -> StaticEnv -> [(InVar, InValue)] -> TopLevelFlag
+         -> SimplM (SimplEnv, [(OutVar, OutValue)])
+simplRec env_x env_v xvs level
+  = go env0_x [ (x, x', v) | (x, v) <- xvs | x' <- xs' ] []
   where
     go env_x [] acc = return (env_x, reverse acc)
-    go env_x ((x, x', c) : triples) acc
+    go env_x ((x, x', v) : triples) acc
       = do
-        preInline <- preInlineUnconditionally env_x x env_c c level
+        preInline <- preInlineUnconditionally env_x x env_v v level
         if preInline
           then do
             tick (PreInlineUnconditionally x)
-            let rhs = mkSuspension env_c c
+            let rhs = mkSuspension env_v v
                 env' = extendIdSubst env_x x rhs
             go env' triples acc
           else do
-            c' <- simplStandaloneCommand (env_x `setStaticPart` env_c) c
-            (env', bind') <- completeBind env_x x x' c' level
+            v' <- simplValue (env_x `setStaticPart` env_v) v
+            (env', bind') <- completeBind env_x x x' v' level
             go env' triples (bind' `consMaybe` acc)
 
-    (env0_x, xs') = enterScopes env_x (map fst xcs)
+    (env0_x, xs') = enterScopes env_x (map fst xvs)
 
 -- TODO Deal with casts, i.e. implement the congruence rules from the
 -- System FC paper
@@ -223,23 +220,22 @@ simplCut env_v v env_k cont
   = undefined
 -}
 simplCut env_v (Type ty) _env_k cont
-  = assert (null cont) $
+  = assert (isReturnCont cont) $
     let ty' = substTy env_v ty
     in return $ valueCommand (Type ty')
 simplCut env (Coercion co) _env_k cont
-  = assert (null cont) $
+  = assert (isReturnCont cont) $
     let co' = substCo env co
     in return $ valueCommand (Coercion co')
 simplCut env_v (Var x) env_k cont
   = case substId env_v x of
       DoneId x'
-        -> simplCont env'_k (Var x') cont
-      DoneComm c
-        -> simplCommand (suspendAndZapEnv env'_k cont) c
-      SuspComm stat c
-        -> simplCommand (suspendAndSetEnv env'_k stat cont) c
-    where env'_k = env_v `setStaticPart` env_k
-simplCut env_v (Lam x c) env_k (App arg : cont)
+        -> simplCont (env_v `setStaticPart` env_k) (Var x') cont
+      DoneVal v
+        -> simplCut (zapSubstEnvs env_v) v env_k cont
+      SuspVal stat v
+        -> simplCut (env_v `setStaticPart` stat) v env_k cont
+simplCut env_v (Lam x c) env_k (App arg cont)
   = do
     tick (BetaReduction x)
     (env_v', newBind) <- simplNonRec env_v x env_k arg NotTopLevel
@@ -250,35 +246,34 @@ simplCut env_v (Lam x c) env_k (App arg : cont)
 simplCut env_v (Lam x c) env_k cont
   = do
     let (env_v', x') = enterScope env_v x
-    -- Simplify with an empty outer context
-    -- (effectively, we enter a new scope for the covariable)
-    c' <- simplStandaloneCommand env_v' c
+    c' <- simplCommand (zapCont env_v') c
     simplCont (env_v `setStaticPart` env_k) (Lam x' c') cont
-simplCut env_v val env_k (Case x _ alts : cont)
+simplCut env_v val env_k (Case x _ alts cont)
   | Just (pairs, body) <- matchCase env_v val alts
   = do
     tick (KnownBranch x)
-    (env', binds) <- go (env_v `setStaticPart` env_k)
-                         ((x, valueCommand val) : pairs) []
-    comm <- simplCommand env' (body `extendCont` cont)
+    (env', binds) <- go (env_v `setStaticPart` env_k) ((x, val) : pairs) []
+    comm <- simplCommand (env' `pushCont` cont) body
     return $ addLets binds comm
   where
     go env [] acc
-      = return (env, reverse (catMaybes acc))
-    go env ((x, c) : pairs) acc
+      = return (env, reverse acc)
+    go env ((x, v) : pairs) acc
       = do
-        (env', maybe_xc') <- simplNonRec env x (staticPart env_v) c NotTopLevel
-        go env' pairs (maybe_xc' : acc)
+        (env', maybe_xv') <- simplNonRec env x (staticPart env_v) v NotTopLevel
+        go env' pairs (maybe_xv' `consMaybe` acc)
 simplCut env_v val@(Lit _) env_k cont
   = simplCont (env_v `setStaticPart` env_k) val cont
 simplCut env_v (Cons ctor args) env_k cont
   = do
-    args' <- mapM (simplCommand env_v) args
+    args' <- mapM (simplValue env_v) args
     simplCont (env_v `setStaticPart` env_k) (Cons ctor args') cont
+simplCut env_v (Compute c) env_k cont
+  = simplCommand (bindCont env_v env_k cont) c
 
 -- TODO Somehow handle updating Definitions with NotAmong values?
 matchCase :: SimplEnv -> InValue -> [InAlt]
-          -> Maybe ([(InVar, InCommand)], InCommand)
+          -> Maybe ([(InVar, InValue)], InCommand)
 -- TODO First, handle variables with substitutions/unfoldings
 matchCase _env_v (Lit lit) (Alt (LitAlt lit') xs body : _alts)
   | assert (null xs) True
@@ -306,38 +301,38 @@ simplCont env val cont
   = undefined
 -}
 simplCont env val cont
-  = go env val cont []
+  = go env val cont (\k -> k)
   where
-    go env val (App arg : cont) acc
+    go env val (App arg cont) kc
       = do
-        arg' <- simplStandaloneCommand env arg
-        go env val cont (App arg' : acc)
-    go env val (f@(Cast _) : cont) acc
+        arg' <- simplValue env arg
+        go env val cont (kc . App arg')
+    go env val (Cast co cont) kc
       -- TODO Simplify coercions
-      = go env val cont (f : acc)
-    go env val (Case x ty alts : cont) acc
+      = go env val cont (kc . Cast co)
+    go env val (Case x ty alts cont) kc
       -- TODO A whole lot - cases are important
       = let (env', x') = enterScope env x
             ty' = substTy env' ty
         in doCase env' x' ty' alts []
       where
         doCase env x ty [] alt_acc
-          = go env val cont (Case x ty (reverse alt_acc) : acc)
+          = go env val cont (kc . Case x ty (reverse alt_acc))
         doCase env x ty (Alt con xs c : alts) alt_acc
           = do
             let (env', xs') = enterScopes env xs
             c' <- simplCommand env' c
             doCase env x ty alts (Alt con xs' c' : alt_acc)
-    go env val (f@(Tick _) : cont) acc
-      = go env val cont (f : acc)
-    go env val [] acc
+    go env val (Tick ti cont) kc
+      = go env val cont (kc . Tick ti)
+    go env val Return kc
       | Just (env', cont) <- restoreEnv env
-      = go env' val cont acc
+      = go env' val cont kc
       | otherwise
-      = return $ Command { cmdLet = [], cmdValue = val, cmdCont = reverse acc }
+      = return $ Command { cmdLet = [], cmdValue = val, cmdCont = kc Return }
   
 -- Based on preInlineUnconditionally in SimplUtils; see comments there
-preInlineUnconditionally :: SimplEnv -> InVar -> StaticEnv -> InCommand
+preInlineUnconditionally :: SimplEnv -> InVar -> StaticEnv -> InValue
                          -> TopLevelFlag -> SimplM Bool
 -- preInlineUnconditionally _ _ _ _ _ = return False
 preInlineUnconditionally _env_x x _env_rhs rhs level
@@ -363,21 +358,22 @@ preInlineUnconditionally _env_x x _env_rhs rhs level
         enabled = gopt Opt_SimplPreInlining dflags
         try_once inLam intCxt
           | not inLam = isNotTopLevel level || early_phase
-          | otherwise = intCxt && canInlineInLam rhs
+          | otherwise = intCxt && canInlineValInLam rhs
         canInlineInLam c
           | Just v <- asValueCommand c  = canInlineValInLam v
           | otherwise                   = False
         canInlineValInLam (Lit _)       = True
         canInlineValInLam (Lam x c)     = isRuntimeVar x || canInlineInLam c
+        canInlineValInLam (Compute c)   = canInlineInLam c
         canInlineValInLam _             = False
         early_phase = case sm_phase mode of
                         Phase 0 -> False
                         _       -> True
 
 -- Based on postInlineUnconditionally in SimplUtils; see comments there
-postInlineUnconditionally :: SimplEnv -> OutVar -> OutCommand -> TopLevelFlag
+postInlineUnconditionally :: SimplEnv -> OutVar -> OutValue -> TopLevelFlag
                           -> SimplM Bool
-postInlineUnconditionally _env x c level
+postInlineUnconditionally _env x v level
   = do
     ans <- go <$> getMode <*> getDynFlags
     -- liftCoreM $ putMsg $ "postInline" <+> ppr x <> colon <+> text (show ans)
@@ -388,7 +384,7 @@ postInlineUnconditionally _env x c level
       | isWeakLoopBreaker occ_info  = False
       | isExportedId x              = False
       | isTopLevel level            = False
-      | isTrivial c                 = True
+      | isTrivialValue v            = True
       | otherwise
       = case occ_info of
           OneOcc in_lam _one_br int_cxt

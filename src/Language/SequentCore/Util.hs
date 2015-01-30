@@ -1,5 +1,3 @@
-{-# OPTIONS_HADDOCK hide #-}
-
 -- | 
 -- Module      : Language.SequentCore.Util
 -- Description : Utilities used by the Sequent Core library

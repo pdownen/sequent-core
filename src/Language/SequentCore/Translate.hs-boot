@@ -1,6 +1,6 @@
 module Language.SequentCore.Translate (
   fromCoreExpr, fromCoreBind, fromCoreBinds, fromCoreAlt,
-  commandToCoreExpr, valueToCoreExpr, frameToCoreExpr,
+  commandToCoreExpr, valueToCoreExpr, contToCoreExpr,
   bindToCore, bindsToCore, altToCore
 ) where
 
@@ -15,7 +15,7 @@ fromCoreBinds :: [Core.Bind b] -> [Bind b]
 
 commandToCoreExpr :: SeqCoreCommand -> Core.CoreExpr
 valueToCoreExpr   :: SeqCoreValue -> Core.CoreExpr
-frameToCoreExpr   :: SeqCoreFrame -> (Core.CoreExpr -> Core.CoreExpr)
+contToCoreExpr    :: SeqCoreCont -> (Core.CoreExpr -> Core.CoreExpr)
 bindToCore        :: SeqCoreBind -> Core.CoreBind
 bindsToCore       :: [SeqCoreBind] -> [Core.CoreBind]
 altToCore         :: SeqCoreAlt -> Core.CoreAlt

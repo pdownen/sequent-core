@@ -1,15 +1,15 @@
 module Language.SequentCore.Simpl.Env (
   SimplEnv(..), StaticEnv, SimplIdSubst, SubstAns(..), IdDefEnv, Definition(..),
 
-  InCommand, InValue, InFrame, InCont, InAlt, InBind,
+  InCommand, InValue, InCont, InAlt, InBind,
   InId, InVar, InTyVar, InCoVar,
-  OutCommand, OutValue, OutFrame, OutCont, OutAlt, OutBind,
+  OutCommand, OutValue, OutCont, OutAlt, OutBind,
   OutId, OutVar, OutTyVar, OutCoVar,
   
   initialEnv, mkSuspension, enterScope, enterScopes, uniqAway,
   substId, substTy, substTyStatic, substCo, substCoStatic, extendIdSubst,
   zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
-  suspendAndZapEnv, suspendAndSetEnv, zapCont, bindCont, restoreEnv
+  suspendAndZapEnv, suspendAndSetEnv, zapCont, bindCont, pushCont, restoreEnv
 ) where
 
 import Language.SequentCore.Pretty ()
@@ -42,9 +42,9 @@ newtype StaticEnv = StaticEnv SimplEnv -- Ignore se_inScope and se_defs
 
 type SimplIdSubst = IdEnv SubstAns -- InId |--> SubstAns
 data SubstAns
-  = DoneComm OutCommand
+  = DoneVal OutValue
   | DoneId OutId
-  | SuspComm StaticEnv InCommand
+  | SuspVal StaticEnv InValue
 
 data SuspCont
   = SuspCont StaticEnv InCont
@@ -54,12 +54,11 @@ data SuspCont
 -- paper, section 6.3.)
 type IdDefEnv = IdEnv Definition
 data Definition
-  = BoundTo OutCommand TopLevelFlag
+  = BoundTo OutValue TopLevelFlag
   | NotAmong [AltCon]
 
 type InCommand  = SeqCoreCommand
 type InValue    = SeqCoreValue
-type InFrame    = SeqCoreFrame
 type InCont     = SeqCoreCont
 type InAlt      = SeqCoreAlt
 type InBind     = SeqCoreBind
@@ -70,7 +69,6 @@ type InCoVar    = CoVar
 
 type OutCommand = SeqCoreCommand
 type OutValue   = SeqCoreValue
-type OutFrame   = SeqCoreFrame
 type OutCont    = SeqCoreCont
 type OutAlt     = SeqCoreAlt
 type OutBind    = SeqCoreBind
@@ -87,8 +85,8 @@ initialEnv = SimplEnv { se_idSubst = emptyVarEnv
                       , se_inScope = emptyInScopeSet
                       , se_defs    = emptyVarEnv }
 
-mkSuspension :: StaticEnv -> InCommand -> SubstAns
-mkSuspension = SuspComm
+mkSuspension :: StaticEnv -> InValue -> SubstAns
+mkSuspension = SuspVal
 
 enterScope :: SimplEnv -> InVar -> (SimplEnv, OutVar)
 enterScope env x
@@ -115,11 +113,10 @@ substId :: SimplEnv -> InId -> SubstAns
 substId (SimplEnv { se_idSubst = ids, se_inScope = ins }) x
   = case lookupVarEnv ids x of
       -- See comments in GHC's SimplEnv.substId for explanations
-      Nothing             -> DoneId (refine ins x)
-      Just (DoneId x')    -> DoneId (refine ins x')
-      Just (DoneComm c)    | Just (Var x') <- asValueCommand c
-                          -> DoneId (refine ins x')
-      Just ans            -> ans
+      Nothing                 -> DoneId (refine ins x)
+      Just (DoneId x')        -> DoneId (refine ins x')
+      Just (DoneVal (Var x')) -> DoneId (refine ins x')
+      Just ans                -> ans
 
 refine :: InScopeSet -> OutVar -> OutVar
 refine ins x
@@ -202,6 +199,10 @@ bindCont :: SimplEnv -> StaticEnv -> InCont -> SimplEnv
 bindCont env stat cont
   = env { se_cont = Just (SuspCont stat cont) }
 
+pushCont :: SimplEnv -> InCont -> SimplEnv
+pushCont env cont
+  = bindCont env (staticPart env) cont
+
 zapCont :: SimplEnv -> SimplEnv
 zapCont env = env { se_cont = Nothing }
 
@@ -239,10 +240,10 @@ instance Outputable StaticEnv where
      <> char '>'
 
 instance Outputable SubstAns where
-  ppr (DoneComm c) = brackets (text "Command:" <+> ppr c)
+  ppr (DoneVal v) = brackets (text "Value:" <+> ppr v)
   ppr (DoneId x) = brackets (text "Id:" <+> ppr x)
-  ppr (SuspComm env c)
-    = brackets $ hang (text "Suspended:") 2 (sep [ppr env, ppr c])
+  ppr (SuspVal env v)
+    = brackets $ hang (text "Suspended:") 2 (sep [ppr env, ppr v])
 
 instance Outputable SuspCont where
   ppr (SuspCont _env cont)

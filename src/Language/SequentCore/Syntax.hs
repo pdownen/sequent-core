@@ -8,24 +8,23 @@
 
 module Language.SequentCore.Syntax (
   -- * AST Types
-  Value(..), Frame(..), Cont, Command(..), Bind(..), Alt(..), AltCon(..),
-  SeqCoreValue, SeqCoreFrame, SeqCoreCont, SeqCoreCommand, SeqCoreBind,
-    SeqCoreAlt,
+  Value(..), Cont(..), Command(..), Bind(..), Alt(..), AltCon(..),
+  SeqCoreValue, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreAlt,
   -- * Constructors
-  mkCommand, valueCommand, varCommand, lambdas, addLets, extendCont,
+  mkCommand, valueCommand, varCommand, mkCompute, lambdas, addLets,
   -- * Deconstructors
   collectLambdas, collectArgs, isLambda,
-  isTypeArg, isCoArg, isErasedArg, isRuntimeArg,
   isTypeValue, isCoValue, isErasedValue, isRuntimeValue,
-  isTrivial, isTrivialValue, isTrivialCont, isTrivialFrame,
+  isTrivial, isTrivialValue, isTrivialCont, isReturnCont,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
   -- * Calculations
-  valueArity, commandType,
+  valueArity, commandType, valueType,
   -- * Alpha-equivalence
   (=~=), AlphaEq(..), AlphaEnv, HasId(..)
 ) where
 
-import {-# SOURCE #-} Language.SequentCore.Translate ( commandToCoreExpr )
+import {-# SOURCE #-} Language.SequentCore.Translate ( valueToCoreExpr
+                                                     , commandToCoreExpr )
 
 import Coercion  ( Coercion, coercionType )
 import CoreSyn   ( AltCon(..), Tickish, isRuntimeVar )
@@ -39,44 +38,48 @@ import Var       ( Var, isId )
 import VarEnv
 
 import Data.Maybe
+import Data.Monoid
 
 --------------------------------------------------------------------------------
 -- AST Types
 --------------------------------------------------------------------------------
 
--- | An atomic value. These include literals, lambdas, and variables, as well as
--- types and coercions (see GHC's 'GHC.Expr' for the reasoning).
+-- | An expression producing a value. These include literals, lambdas,
+-- and variables, as well as types and coercions (see GHC's 'GHC.Expr' for the
+-- reasoning). They also include computed values, which bind the current
+-- continuation in the body of a command.
 data Value b    = Lit Literal       -- ^ A primitive literal value.
                 | Var Id            -- ^ A term variable. Must /not/ be a
                                     -- nullary constructor; use 'Cons' for this.
-                | Lam b (Command b) -- ^ A function. The body is a computation,
-                                    -- that is, a 'Command'.
-                | Cons DataCon [Command b]
+                | Lam b (Command b) -- ^ A function. Binds both an argument and
+                                    -- a continuation. The body is a command.
+                | Cons DataCon [Value b]
                                     -- ^ A value formed by a saturated
                                     -- constructor application.
+                | Compute (Command b)
+                                    -- ^ A value produced by a computation.
+                                    -- Binds the current continuation.
                 | Type Type         -- ^ A type. Used to pass a type as an
                                     -- argument to a type-level lambda.
                 | Coercion Coercion -- ^ A coercion. Used to pass evidence
                                     -- for the @cast@ operation to a lambda.
 
--- | A stack frame. A continuation is simply a list of these. Each represents
--- the outer part of a Haskell expression, with a "hole" where a value can be
--- placed. Computation in the sequent calculus is expressed as the interaction
--- of a value with a continuation.
-data Frame b    = App  {- expr -} (Command b)    -- ^ Apply the value to an
-                                                 -- argument, which may be a
-                                                 -- computation.
-                | Case {- expr -} b Type [Alt b] -- ^ Perform case analysis on
-                                                 -- the value.
-                | Cast {- expr -} Coercion       -- ^ Cast the value using the
-                                                 -- given proof.
-                | Tick (Tickish Id) {- expr -}   -- ^ Annotate the enclosed
-                                                 -- frame. Used by the profiler.
-
--- | A continuation, expressed as a list of 'Frame's. In terms of the sequent
--- calculus, here @nil@ stands for a free covariable; since Haskell does not
--- allow for control effects, we only allow for one covariable.
-type Cont b     = [Frame b]
+-- | A continuation, representing a strict context of a Haskell expression.
+-- Computation in the sequent calculus is expressed as the interaction of a
+-- value with a continuation.
+data Cont b     = App  {- expr -} (Value b) (Cont b)  -- ^ Apply the value to an
+                                                      -- argument.
+                | Case {- expr -} b Type [Alt b] (Cont b)
+                                                      -- ^ Perform case analysis
+                                                      -- on the value.
+                | Cast {- expr -} Coercion (Cont b)   -- ^ Cast the value using
+                                                      -- the given coercion.
+                | Tick (Tickish Id) {- expr -} (Cont b)
+                                                      -- ^ Annotate the enclosed
+                                                      -- frame. Used by the
+                                                      -- profiler.
+                | Return                              -- ^ Top-level
+                                                      -- continuation.
 
 -- | A general computation. A command brings together a list of bindings, some
 -- value, and a /continuation/ saying what to do with that value. The value and
@@ -97,8 +100,8 @@ data Command b  = Command { -- | Bindings surrounding the computation.
 
 -- | A binding. Similar to the @Bind@ datatype from GHC. Can be either a single
 -- non-recursive binding or a mutually recursive block.
-data Bind b     = NonRec b (Command b) -- ^ A single non-recursive binding.
-                | Rec [(b, Command b)] -- ^ A block of mutually recursive bindings.
+data Bind b     = NonRec b (Value b) -- ^ A single non-recursive binding.
+                | Rec [(b, Value b)] -- ^ A block of mutually recursive bindings.
 
 -- | A case alternative. Given by the head constructor (or literal), a list of
 -- bound variables (empty for a literal), and the body as a 'Command'.
@@ -106,8 +109,6 @@ data Alt b      = Alt AltCon [b] (Command b)
 
 -- | Usual instance of 'Value', with 'Var's for binders
 type SeqCoreValue   = Value   Var
--- | Usual instance of 'Frame', with 'Var's for binders
-type SeqCoreFrame   = Frame   Var
 -- | Usual instance of 'Cont', with 'Var's for binders
 type SeqCoreCont    = Cont    Var
 -- | Usual instance of 'Command', with 'Var's for binders
@@ -137,88 +138,84 @@ mkCommand binds val@(Var f) cont
       | otherwise
       = asSaturatedCall val cont
 
+mkCommand binds (Compute (Command { cmdLet = binds'
+                                  , cmdValue = val'
+                                  , cmdCont = cont' })) cont
+  = mkCommand (binds ++ binds') val' (cont' <> cont)
+
 mkCommand binds val cont
   = Command { cmdLet = binds, cmdValue = val, cmdCont = cont }
 
--- | Constructs a command that simply returns a value.
+-- | Constructs a command that simply returns a value. If the value is a
+-- computation, returns that computation instead.
 valueCommand :: Value b -> Command b
-valueCommand v = Command { cmdLet = [], cmdValue = v, cmdCont = [] }
+valueCommand (Compute c) = c
+valueCommand v = Command { cmdLet = [], cmdValue = v, cmdCont = Return }
 
 -- | Constructs a command that simply returns a variable.
 varCommand :: Id -> Command b
 varCommand x = valueCommand (Var x)
 
+mkCompute :: Command b -> Value b
+-- | Wraps a command in a value using 'Compute'. If the command is a value
+-- command (see 'asValueCommand'), unwraps it instead.
+mkCompute comm
+  | Just val <- asValueCommand comm
+  = val
+  | otherwise
+  = Compute comm
+
 -- | Constructs a number of lambdas surrounding a function body.
-lambdas :: [b] -> Command b -> Command b
-lambdas xs body = foldr (\x c -> valueCommand (Lam x c)) body xs
+lambdas :: [b] -> Command b -> Value b
+lambdas xs body = mkCompute $ foldr (\x c -> valueCommand (Lam x c)) body xs
 
 -- | Adds the given bindings outside those in the given command.
 addLets :: [Bind b] -> Command b -> Command b
 addLets [] c = c -- avoid unnecessary allocation
 addLets bs c = c { cmdLet = bs ++ cmdLet c }
 
--- | Adds the given continuation frames to the end of those in the given
--- command.
-extendCont :: Command b -> Cont b -> Command b
-extendCont c fs = c { cmdCont = cmdCont c ++ fs }
+instance Monoid (Cont b) where
+  mempty = Return
+
+  App v k        `mappend` k' = App v        (k `mappend` k')
+  Case x ty as k `mappend` k' = Case x ty as (k `mappend` k')
+  Cast co k      `mappend` k' = Cast co      (k `mappend` k')
+  Tick ti k      `mappend` k' = Tick ti      (k `mappend` k')
+  Return         `mappend` k' = k'
 
 --------------------------------------------------------------------------------
 -- Deconstructors
 --------------------------------------------------------------------------------
 
--- | Divide a command into a sequence of lambdas and a body. If @c@ is not a
--- lambda, then @collectLambdas c == ([], c)@.
-collectLambdas :: Command b -> ([b], Command b)
-collectLambdas (Command { cmdLet = [], cmdCont = [], cmdValue = Lam x c })
-  = (x : xs, c')
-  where (xs, c') = collectLambdas c
-collectLambdas c
-  = ([], c)
+-- | Divide a value into a sequence of lambdas and a body. If @c@ is not a
+-- lambda, then @collectLambdas v == ([], valueCommand v)@.
+collectLambdas :: Value b -> ([b], Command b)
+collectLambdas (Lam x c)
+  | Just v <- asValueCommand c
+  = let (xs, c') = collectLambdas v 
+    in (x : xs, c')
+  | otherwise
+  = ([x], c)
+collectLambdas v
+  = ([], valueCommand v)
 
 -- | Divide a continuation into a sequence of arguments and an outer
 -- continuation. If @k@ is not an application continuation, then
 -- @collectArgs k == ([], k)@.
-collectArgs :: Cont b -> ([Command b], Cont b)
-collectArgs (App c : fs)
-  = (c : cs, fs')
-  where (cs, fs') = collectArgs fs
-collectArgs fs
-  = ([], fs)
+collectArgs :: Cont b -> ([Value b], Cont b)
+collectArgs (App v k)
+  = (v : vs, k')
+  where (vs, k') = collectArgs k
+collectArgs k
+  = ([], k)
 
 -- | True if the given command is a simple lambda, with no let bindings and no
 -- continuation.
 isLambda :: Command b -> Bool
-isLambda (Command { cmdLet = [], cmdCont = [], cmdValue = Lam _ _ })
+isLambda (Command { cmdLet = [], cmdCont = Return, cmdValue = Lam _ _ })
   = True
 isLambda _
   = False
-
--- | True if the given command simply returns a type as a value. This may only
--- be true of a command appearing as an argument (that is, inside an 'App'
--- frame) or as the body of a @let@.
-isTypeArg :: Command b -> Bool
-isTypeArg (Command { cmdValue = Type _, cmdCont = [], cmdLet = [] }) = True
-isTypeArg _ = False
-
--- | True if the given command simply returns a coercion as a value. This may
--- only be true of a command appearing as an argument (that is, inside an 'App'
--- frame) or as the body of a @let@.
-isCoArg :: Command b -> Bool
-isCoArg (Command { cmdValue = Type _, cmdCont = [], cmdLet = [] }) = True
-isCoArg _ = False
-
--- | True if the given command simply returns a value that is either a type or
--- a coercion. This may only be true of a command appearing as an argument (that
--- is, inside an 'App' frame) or as the body of a @let@.
-isErasedArg :: Command b -> Bool
-isErasedArg (Command { cmdValue = v, cmdCont = [] })
-  = isErasedValue v
-isErasedArg _ = False
-
--- | True if the given command appears at runtime. Types and coercions are
--- erased.
-isRuntimeArg :: Command b -> Bool
-isRuntimeArg c = not (isErasedArg c)
 
 -- | True if the given value is a type. See 'Type'.
 isTypeValue :: Value b -> Bool
@@ -236,7 +233,8 @@ isErasedValue (Type _) = True
 isErasedValue (Coercion _) = True
 isErasedValue _ = False
 
--- | True if the given value appears at runtime.
+-- | True if the given value appears at runtime, i.e. is neither a type nor a
+-- coercion.
 isRuntimeValue :: Value b -> Bool
 isRuntimeValue v = not (isErasedValue v)
 
@@ -254,29 +252,30 @@ isTrivial c
 -- literals are not trivial, and a lambda whose argument is not erased or whose
 -- body is non-trivial is also non-trivial.
 isTrivialValue :: HasId b => Value b -> Bool
-isTrivialValue (Lit l)    = litIsTrivial l
-isTrivialValue (Lam x c)  = not (isRuntimeVar (identifier x)) && isTrivial c
-isTrivialValue _          = True
-
--- | True if the given continuation represents no actual run-time computation.
--- This holds if all of its frames are trivial (perhaps because it is the empty
--- continuation).
-isTrivialCont :: Cont b -> Bool
-isTrivialCont = all isTrivialFrame
+isTrivialValue (Lit l)     = litIsTrivial l
+isTrivialValue (Lam x c)   = not (isRuntimeVar (identifier x)) && isTrivial c
+isTrivialValue (Compute _) = False
+isTrivialValue _           = True
 
 -- | True if the given continuation represents no actual run-time computation.
 -- This is true of casts and of applications of erased arguments (types and
 -- coercions). Ticks are not considered trivial, since this would cause them to
 -- be inlined.
-isTrivialFrame :: Frame b -> Bool
-isTrivialFrame (Cast _)   = True
-isTrivialFrame (App c)    = isErasedArg c
-isTrivialFrame _          = False
+isTrivialCont :: Cont b -> Bool
+isTrivialCont Return     = True
+isTrivialCont (Cast _ k) = isTrivialCont k
+isTrivialCont (App v k)  = isErasedValue v && isTrivialCont k
+isTrivialCont _          = False
+
+-- | True if the given continuation is the return continuation, 'Return'.
+isReturnCont :: Cont b -> Bool
+isReturnCont Return = True
+isReturnCont _      = False
 
 -- | If a command represents a saturated call to some function, splits it into
 -- the function, the arguments, and the remaining continuation after the
 -- arguments.
-commandAsSaturatedCall :: Command b -> Maybe (Value b, [Command b], Cont b)
+commandAsSaturatedCall :: Command b -> Maybe (Value b, [Value b], Cont b)
 commandAsSaturatedCall c
   = do
     let val = cmdValue c
@@ -286,7 +285,7 @@ commandAsSaturatedCall c
 -- | If the given value is a function, and the given continuation would provide
 -- enough arguments to saturate it, returns the arguments and the remainder of
 -- the continuation.
-asSaturatedCall :: Value b -> Cont b -> Maybe ([Command b], Cont b)
+asSaturatedCall :: Value b -> Cont b -> Maybe ([Value b], Cont b)
 asSaturatedCall val cont
   | 0 < arity, arity <= length args
   = Just (args, others)
@@ -298,7 +297,7 @@ asSaturatedCall val cont
 
 -- | If a command does nothing but provide a value, returns that value.
 asValueCommand :: Command b -> Maybe (Value b)
-asValueCommand (Command { cmdLet = [], cmdValue = v, cmdCont = [] })
+asValueCommand (Command { cmdLet = [], cmdValue = v, cmdCont = Return })
   = Just v
 asValueCommand _
   = Nothing
@@ -311,15 +310,17 @@ asValueCommand _
 commandType :: SeqCoreCommand -> Type
 commandType = exprType . commandToCoreExpr -- Cheaty, but effective
 
+-- | Compute the type of a value.
+valueType :: SeqCoreValue -> Type
+valueType = exprType . valueToCoreExpr
+
 -- | Compute (a conservative estimate of) the arity of a value. If the value is
 -- a variable, this may be a lower bound.
 valueArity :: Value b -> Int
 valueArity (Var x)
   | isId x = idArity x
-valueArity (Lam _ c)
-  = 1 + length xs
-  where (xs, _) = collectLambdas c
-valueArity _ = 0
+valueArity v
+  = let (xs, _) = collectLambdas v in length xs
 
 --------------------------------------------------------------------------------
 -- Alpha-Equivalence
@@ -378,16 +379,18 @@ instance HasId b => AlphaEq (Value b) where
   aeqIn _ _ _
     = False
 
-instance HasId b => AlphaEq (Frame b) where
-  aeqIn env (App c1) (App c2)
-    = aeqIn env c1 c2
-  aeqIn env (Case x1 t1 as1) (Case x2 t2 as2)
-    = aeqIn env' t1 t2 && aeqIn env' as1 as2
+instance HasId b => AlphaEq (Cont b) where
+  aeqIn env (App c1 k1) (App c2 k2)
+    = aeqIn env c1 c2 && aeqIn env k1 k2
+  aeqIn env (Case x1 t1 as1 k1) (Case x2 t2 as2 k2)
+    = aeqIn env' t1 t2 && aeqIn env' as1 as2 && aeqIn env' k1 k2
       where env' = rnBndr2 env (identifier x1) (identifier x2)
-  aeqIn env (Cast co1) (Cast co2)
-    = aeqIn env co1 co2
-  aeqIn _ (Tick ti1) (Tick ti2)
-    = ti1 == ti2
+  aeqIn env (Cast co1 k1) (Cast co2 k2)
+    = aeqIn env co1 co2 && aeqIn env k1 k2
+  aeqIn env (Tick ti1 k1) (Tick ti2 k2)
+    = ti1 == ti2 && aeqIn env k1 k2
+  aeqIn _ Return Return
+    = True
   aeqIn _ _ _
     = False
 
@@ -419,7 +422,7 @@ aeqBindIn env (NonRec x1 c1) (NonRec x2 c2)
 aeqBindIn env (Rec bs1) (Rec bs2)
   = if and $ zipWith alpha bs1 bs2 then Just env' else Nothing
   where
-    alpha :: HasId b => (b, Command b) -> (b, Command b) -> Bool
+    alpha :: HasId b => (b, Value b) -> (b, Value b) -> Bool
     alpha (_, c1) (_, c2)
       = aeqIn env' c1 c2
     env'
