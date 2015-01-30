@@ -1,5 +1,3 @@
-{-# OPTIONS_HADDOCK hide #-}
-
 module Language.SequentCore.Simpl.Env (
   SimplEnv(..), StaticEnv, SimplIdSubst, SubstAns(..), IdDefEnv, Definition(..),
 
