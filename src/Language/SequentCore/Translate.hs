@@ -15,9 +15,20 @@ module Language.SequentCore.Translate (
 
 import Language.SequentCore.Syntax
 
+import qualified CoreFVs as Core
 import qualified CoreSyn as Core
 import DataCon
-import MkCore
+import FastString
+import Id
+import qualified MkCore as Core
+import Type
+import TysWiredIn
+import UniqSupply
+import VarEnv
+
+import Control.Applicative
+import Control.Monad
+import System.IO.Unsafe (unsafePerformIO)
 
 -- $txn
 -- The translations to and from Sequent Core are /not/ guaranteed to be perfect
@@ -64,49 +75,105 @@ fromCoreBind bind =
 fromCoreBinds :: [Core.Bind b] -> [Bind b]
 fromCoreBinds = map fromCoreBind
 
+-- FIXME There *has* to be a better way. But translation is a pure function and
+-- is called from pure code, so no taking a UniqSupply as an argument. ????
+{-# NOINLINE uniqSupply #-}
+uniqSupply :: UniqSupply
+uniqSupply = unsafePerformIO (mkSplitUniqSupply 'Q')
+
+type ToCoreM a = UniqSM a
+
+runToCoreM :: ToCoreM a -> a
+runToCoreM m = initUs_ uniqSupply m
+
+freshVar :: FastString -> Type -> Core.CoreExpr -> ToCoreM Id
+freshVar name ty expr
+  = do
+    x <- mkSysLocalM name ty
+    return $ uniqAway inScope x
+  where
+    inScope = mkInScopeSet $ Core.exprFreeIds expr
+
 -- | Translates a command into Core.
 commandToCoreExpr :: SeqCoreCommand -> Core.CoreExpr
-commandToCoreExpr cmd = foldr addLet baseExpr (cmdLet cmd)
-  where
-  addLet b e  = mkCoreLet (bindToCore b) e
-  baseExpr    = contToCoreExpr (cmdCont cmd) (valueToCoreExpr (cmdValue cmd))
+commandToCoreExpr comm = runToCoreM $ comm2C comm
+
+comm2C :: SeqCoreCommand -> ToCoreM Core.CoreExpr
+comm2C cmd = do
+  baseExpr <- cont2C (cmdCont cmd) <*> val2C (cmdValue cmd)
+  foldM (\m b -> Core.mkCoreLet <$> bind2C b <*> pure m) baseExpr (cmdLet cmd)
 
 -- | Translates a value into Core.
 valueToCoreExpr :: SeqCoreValue -> Core.CoreExpr
-valueToCoreExpr val =
+valueToCoreExpr val = runToCoreM $ val2C val
+
+val2C :: SeqCoreValue -> ToCoreM Core.CoreExpr
+val2C val =
   case val of
-    Lit l       -> Core.Lit l
-    Var x       -> Core.Var x
-    Lam b v     -> Core.Lam b (commandToCoreExpr v)
-    Cons ct as  -> mkCoreApps (Core.Var (dataConWorkId ct))
-                              (map valueToCoreExpr as) 
-    Type t      -> Core.Type t
-    Coercion co -> Core.Coercion co
-    Compute c   -> commandToCoreExpr c
+    Lit l       -> return $ Core.Lit l
+    Var x       -> return $ Core.Var x
+    Lam b c     -> Core.Lam b <$> (comm2C c)
+    Cons ct as  -> Core.mkCoreApps (Core.Var (dataConWorkId ct)) <$>
+                                   (mapM val2C as) 
+    Type t      -> return $ Core.Type t
+    Coercion co -> return $ Core.Coercion co
+    Compute c   -> comm2C c
+    Cont _      -> error "valueToCoreExpr"
 
 -- | Translates a frame into a function that will wrap a Core expression with a
 -- fragment of context (an argument to apply to, a case expression to run,
 -- etc.).
 contToCoreExpr :: SeqCoreCont -> (Core.CoreExpr -> Core.CoreExpr)
-contToCoreExpr k e =
+contToCoreExpr k = runToCoreM $ cont2C k
+
+cont2C :: SeqCoreCont -> ToCoreM (Core.CoreExpr -> Core.CoreExpr)
+cont2C k =
   case k of
-    App  {- expr -} v k'      -> contToCoreExpr k' $ mkCoreApp e (valueToCoreExpr v)
-    Case {- expr -} b t as k' -> contToCoreExpr k' $ Core.Case e b t (map altToCore as)
-    Cast {- expr -} co k'     -> contToCoreExpr k' $ Core.Cast e co
-    Tick ti {- expr -} k'     -> contToCoreExpr k' $ Core.Tick ti e
-    Return                    -> e
+    App  {- expr -} v k       -> do
+      k' <- cont2C k
+      v' <- val2C v
+      return $ \m -> k' (Core.mkCoreApp m v')
+    Case {- expr -} b t as k  -> do
+      k' <- cont2C k
+      as' <- mapM alt2C as
+      return $ \m -> k' (Core.Case m b t as')
+    Cast {- expr -} co k      -> do
+      k' <- cont2C k
+      return $ \m -> k' (Core.Cast m co)
+    Tick ti {- expr -} k      -> do
+      k' <- cont2C k
+      return $ \m -> k' (Core.Tick ti m)
+    Jump x                    -> return $ \m -> Core.mkCoreApp (Core.Var x) m
+    Return                    -> return id
 
 -- | Translates a binding into Core.
 bindToCore :: SeqCoreBind -> Core.CoreBind
-bindToCore bind =
+bindToCore bind = runToCoreM $ bind2C bind
+
+bind2C :: SeqCoreBind -> ToCoreM Core.CoreBind
+bind2C bind =
   case bind of
-    NonRec b v -> Core.NonRec b (valueToCoreExpr v)
-    Rec bs     -> Core.Rec [ (b, valueToCoreExpr v) | (b,v) <- bs ]
+    NonRec b (Cont k) -> do
+      k' <- cont2C k
+      -- We need to put something in the hole just to compute the free variables.
+      -- Note that fakeExpr may be ill-typed (and probably is)!
+      let fakeExpr = k' (Core.Var unitDataConId)
+      x <- setOneShotLambda <$> freshVar (fsLit "karg") (idType b) fakeExpr
+      return $ Core.NonRec b (Core.Lam x (k' (Core.Var x)))
+    NonRec b v        -> Core.NonRec b <$> val2C v
+    Rec bs            -> Core.Rec <$> mapM doPair bs
+      where doPair (b, v) = val2C v >>= \v' -> return (b, v')
 
 -- | Translates a list of bindings into Core.
 bindsToCore :: [SeqCoreBind] -> [Core.CoreBind]
-bindsToCore = map bindToCore
+bindsToCore binds = runToCoreM $ binds2C binds
+
+binds2C :: [SeqCoreBind] -> ToCoreM [Core.CoreBind]
+binds2C = mapM bind2C
 
 -- | Translates a case alternative into Core.
 altToCore :: SeqCoreAlt -> Core.CoreAlt
-altToCore (Alt ac bs c) = (ac, bs, commandToCoreExpr c)
+altToCore alt = runToCoreM $ alt2C alt
+
+alt2C :: SeqCoreAlt -> ToCoreM Core.CoreAlt
+alt2C (Alt ac bs c) = comm2C c >>= \c' -> return (ac, bs, c')

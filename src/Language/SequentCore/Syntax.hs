@@ -63,23 +63,28 @@ data Value b    = Lit Literal       -- ^ A primitive literal value.
                                     -- argument to a type-level lambda.
                 | Coercion Coercion -- ^ A coercion. Used to pass evidence
                                     -- for the @cast@ operation to a lambda.
+                | Cont (Cont b)     -- ^ A continuation. Allowed /only/ as the
+                                    -- body of a non-recursive @let@.
 
 -- | A continuation, representing a strict context of a Haskell expression.
 -- Computation in the sequent calculus is expressed as the interaction of a
 -- value with a continuation.
-data Cont b     = App  {- expr -} (Value b) (Cont b)  -- ^ Apply the value to an
-                                                      -- argument.
+data Cont b     = App  {- expr -} (Value b) (Cont b)
+                  -- ^ Apply the value to an argument.
                 | Case {- expr -} b Type [Alt b] (Cont b)
-                                                      -- ^ Perform case analysis
-                                                      -- on the value.
-                | Cast {- expr -} Coercion (Cont b)   -- ^ Cast the value using
-                                                      -- the given coercion.
+                  -- ^ Perform case analysis on the value.
+                | Cast {- expr -} Coercion (Cont b)
+                  -- ^ Cast the value using the given coercion.
                 | Tick (Tickish Id) {- expr -} (Cont b)
-                                                      -- ^ Annotate the enclosed
-                                                      -- frame. Used by the
-                                                      -- profiler.
-                | Return                              -- ^ Top-level
-                                                      -- continuation.
+                  -- ^ Annotate the enclosed frame. Used by the profiler.
+                | Jump ContId
+                  -- ^ Reference to a bound continuation.
+                | Return
+                  -- ^ Top-level continuation.
+
+-- | The identifier for a covariable, which is like a variable but it binds a
+-- continuation.
+type ContId = Id
 
 -- | A general computation. A command brings together a list of bindings, some
 -- value, and a /continuation/ saying what to do with that value. The value and
@@ -107,6 +112,8 @@ data Bind b     = NonRec b (Value b) -- ^ A single non-recursive binding.
 -- bound variables (empty for a literal), and the body as a 'Command'.
 data Alt b      = Alt AltCon [b] (Command b)
 
+-- | Usual binders for Sequent Core terms
+type SeqCoreBndr    = Var
 -- | Usual instance of 'Value', with 'Var's for binders
 type SeqCoreValue   = Value   Var
 -- | Usual instance of 'Cont', with 'Var's for binders
@@ -181,6 +188,7 @@ instance Monoid (Cont b) where
   Case x ty as k `mappend` k' = Case x ty as (k `mappend` k')
   Cast co k      `mappend` k' = Cast co      (k `mappend` k')
   Tick ti k      `mappend` k' = Tick ti      (k `mappend` k')
+  Jump x         `mappend` _  = Jump x
   Return         `mappend` k' = k'
 
 --------------------------------------------------------------------------------
@@ -255,6 +263,11 @@ isTrivialValue :: HasId b => Value b -> Bool
 isTrivialValue (Lit l)     = litIsTrivial l
 isTrivialValue (Lam x c)   = not (isRuntimeVar (identifier x)) && isTrivial c
 isTrivialValue (Compute _) = False
+isTrivialValue (Cont k)
+  = case k of
+      Return              -> True
+      Jump _              -> True
+      _                   -> False
 isTrivialValue _           = True
 
 -- | True if the given continuation represents no actual run-time computation.
@@ -376,6 +389,10 @@ instance HasId b => AlphaEq (Value b) where
     = aeqIn env co1 co2
   aeqIn env (Var x1) (Var x2)
     = env `rnOccL` x1 == env `rnOccR` x2
+  aeqIn env (Compute c1) (Compute c2)
+    = aeqIn env c1 c2
+  aeqIn env (Cont k1) (Cont k2)
+    = aeqIn env k1 k2
   aeqIn _ _ _
     = False
 
@@ -389,6 +406,8 @@ instance HasId b => AlphaEq (Cont b) where
     = aeqIn env co1 co2 && aeqIn env k1 k2
   aeqIn env (Tick ti1 k1) (Tick ti2 k2)
     = ti1 == ti2 && aeqIn env k1 k2
+  aeqIn env (Jump x1) (Jump x2)
+    = env `rnOccL` x1 == env `rnOccR` x2
   aeqIn _ Return Return
     = True
   aeqIn _ _ _

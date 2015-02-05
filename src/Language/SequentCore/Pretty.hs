@@ -78,6 +78,8 @@ ppr_value add_par (Cons ctor args)
     hang (ppr ctor) 2 (sep (map (ppr_value parens) args))
 ppr_value add_par (Compute comm)
   = ppr_comm add_par comm
+ppr_value add_par (Cont k)
+  = ppr_cont add_par k
 
 ppr_cont_frames :: OutputableBndr b => Cont b -> [SDoc]
 ppr_cont_frames (App v k)
@@ -91,9 +93,11 @@ ppr_cont_frames (Tick _ k)
   = text "tick ..." : ppr_cont_frames k
 ppr_cont_frames Return
   = []
+ppr_cont_frames (Jump x)
+  = [text "jump" <+> ppr x]
 
-ppr_cont :: OutputableBndr b => Cont b -> SDoc
-ppr_cont k = sep $ punctuate semi (ppr_cont_frames k)
+ppr_cont :: OutputableBndr b => (SDoc -> SDoc) -> Cont b -> SDoc
+ppr_cont add_par k = add_par $ sep $ punctuate semi (ppr_cont_frames k)
 
 pprCoreAlt :: OutputableBndr b => Alt b -> SDoc
 pprCoreAlt (Alt con args rhs)
@@ -124,7 +128,7 @@ instance OutputableBndr b => Outputable (Command b) where
   ppr = ppr_comm noParens
 
 instance OutputableBndr b => Outputable (Cont b) where
-  ppr = ppr_cont
+  ppr = ppr_cont noParens
 
 instance OutputableBndr b => Outputable (Alt b) where
   ppr = pprCoreAlt

@@ -227,10 +227,14 @@ simplCut env (Coercion co) _env_k cont
   = assert (isReturnCont cont) $
     let co' = substCo env co
     in return $ valueCommand (Coercion co')
+simplCut env (Cont k) _env_k cont
+  = assert (isReturnCont cont) $ do
+      k' <- simplCont env k
+      return $ valueCommand (Cont k')
 simplCut env_v (Var x) env_k cont
   = case substId env_v x of
       DoneId x'
-        -> simplCont (env_v `setStaticPart` env_k) (Var x') cont
+        -> simplContWith (env_v `setStaticPart` env_k) (Var x') cont
       DoneVal v
         -> simplCut (zapSubstEnvs env_v) v env_k cont
       SuspVal stat v
@@ -247,7 +251,7 @@ simplCut env_v (Lam x c) env_k cont
   = do
     let (env_v', x') = enterScope env_v x
     c' <- simplCommand (zapCont env_v') c
-    simplCont (env_v `setStaticPart` env_k) (Lam x' c') cont
+    simplContWith (env_v `setStaticPart` env_k) (Lam x' c') cont
 simplCut env_v val env_k (Case x _ alts cont)
   | Just (pairs, body) <- matchCase env_v val alts
   = do
@@ -263,11 +267,11 @@ simplCut env_v val env_k (Case x _ alts cont)
         (env', maybe_xv') <- simplNonRec env x (staticPart env_v) v NotTopLevel
         go env' pairs (maybe_xv' `consMaybe` acc)
 simplCut env_v val@(Lit _) env_k cont
-  = simplCont (env_v `setStaticPart` env_k) val cont
+  = simplContWith (env_v `setStaticPart` env_k) val cont
 simplCut env_v (Cons ctor args) env_k cont
   = do
     args' <- mapM (simplValue env_v) args
-    simplCont (env_v `setStaticPart` env_k) (Cons ctor args') cont
+    simplContWith (env_v `setStaticPart` env_k) (Cons ctor args') cont
 simplCut env_v (Compute c) env_k cont
   = simplCommand (bindCont env_v env_k cont) c
 
@@ -292,45 +296,62 @@ matchCase env_v val (_ : alts)
 matchCase _ _ []
   = Nothing
 
-simplCont :: SimplEnv -> OutValue -> InCont -> SimplM OutCommand
+simplCont :: SimplEnv -> InCont -> SimplM OutCont
 {-
-simplCont env val cont
+simplCont env cont
   | pprTrace "simplCont" (
-      ppr env $$ ppr val $$ ppr cont
+      ppr env $$ ppr cont
     ) False
   = undefined
 -}
-simplCont env val cont
-  = go env val cont (\k -> k)
+simplCont env cont
+  = go env cont (\k -> k)
   where
-    go env val (App arg cont) kc
+    go env (App arg cont) kc
       = do
         arg' <- simplValue env arg
-        go env val cont (kc . App arg')
-    go env val (Cast co cont) kc
+        go env cont (kc . App arg')
+    go env (Cast co cont) kc
       -- TODO Simplify coercions
-      = go env val cont (kc . Cast co)
-    go env val (Case x ty alts cont) kc
+      = go env cont (kc . Cast co)
+    go env (Case x ty alts cont) kc
       -- TODO A whole lot - cases are important
       = let (env', x') = enterScope env x
             ty' = substTy env' ty
         in doCase env' x' ty' alts []
       where
         doCase env x ty [] alt_acc
-          = go env val cont (kc . Case x ty (reverse alt_acc))
+          = go env cont (kc . Case x ty (reverse alt_acc))
         doCase env x ty (Alt con xs c : alts) alt_acc
           = do
             let (env', xs') = enterScopes env xs
             c' <- simplCommand env' c
             doCase env x ty alts (Alt con xs' c' : alt_acc)
-    go env val (Tick ti cont) kc
-      = go env val cont (kc . Tick ti)
-    go env val Return kc
+    go env (Tick ti cont) kc
+      = go env cont (kc . Tick ti)
+    go env (Jump x) kc
+      -- TODO Consider call-site inline
+      = case substId env x of
+          DoneId x'
+            -> return $ kc (Jump x')
+          DoneVal (Cont k)
+            -> go (zapSubstEnvs env) k kc
+          SuspVal stat (Cont k)
+            -> go (env `setStaticPart` stat) k kc
+          _
+            -> error "jump to non-continuation"
+    go env Return kc
       | Just (env', cont) <- restoreEnv env
-      = go env' val cont kc
+      = go env' cont kc
       | otherwise
-      = return $ Command { cmdLet = [], cmdValue = val, cmdCont = kc Return }
-  
+      = return $ kc Return
+
+simplContWith :: SimplEnv -> OutValue -> InCont -> SimplM OutCommand
+simplContWith env val cont
+  = do
+    cont' <- simplCont env cont
+    return $ mkCommand [] val cont'
+
 -- Based on preInlineUnconditionally in SimplUtils; see comments there
 preInlineUnconditionally :: SimplEnv -> InVar -> StaticEnv -> InValue
                          -> TopLevelFlag -> SimplM Bool
