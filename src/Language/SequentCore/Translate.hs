@@ -21,6 +21,7 @@ import DataCon
 import FastString
 import Id
 import qualified MkCore as Core
+import Outputable
 import Type
 import TysWiredIn
 import UniqSupply
@@ -40,7 +41,7 @@ import System.IO.Unsafe (unsafePerformIO)
 -- "faithful enough."
 
 -- | Translates a Core expression into Sequent Core.
-fromCoreExpr :: Core.Expr b -> Command b
+fromCoreExpr :: Core.CoreExpr -> SeqCoreCommand
 fromCoreExpr = go [] Return
   where
   go binds cont expr =
@@ -55,31 +56,48 @@ fromCoreExpr = go [] Return
       Core.Tick ti e     -> go binds (Tick ti cont) e
       Core.Type t        -> done $ Type t
       Core.Coercion co   -> done $ Coercion co
-    where done value = mkCommand (reverse binds) value cont
+    where
+      done value = mkCommand (reverse binds) value cont
 
-fromCoreExprAsValue :: Core.Expr b -> Value b
+fromCoreExprAsValue :: Core.CoreExpr -> SeqCoreValue
 fromCoreExprAsValue = mkCompute . fromCoreExpr
 
+fromCoreLamAsCont :: Core.CoreExpr -> SeqCoreCont
+fromCoreLamAsCont (Core.Lam b e)
+  = go e
+    where
+      go (Core.Var x) | x == b    = Return
+                      | otherwise = Jump x
+      go (Core.App e1 e2)         = App (fromCoreExprAsValue e2) (go e1)
+      go (Core.Case e x ty as)    = Case x ty (map fromCoreAlt as) (go e)
+      go (Core.Cast e co)         = Cast co (go e)
+      go (Core.Tick ti e)         = Tick ti (go e)
+      go other                    = pprPanic "fromCoreLamAsCont" (ppr other)
+fromCoreLamAsCont other = pprPanic "fromCoreLamAsCont" (ppr other)
+
 -- | Translates a Core case alternative into Sequent Core.
-fromCoreAlt :: Core.Alt b -> Alt b
+fromCoreAlt :: Core.CoreAlt -> SeqCoreAlt
 fromCoreAlt (ac, bs, e) = Alt ac bs (fromCoreExpr e)
 
 -- | Translates a Core binding into Sequent Core.
-fromCoreBind :: Core.Bind b -> Bind b
+fromCoreBind :: Core.CoreBind -> SeqCoreBind
 fromCoreBind bind =
   case bind of
-    Core.NonRec b e -> NonRec b (fromCoreExprAsValue e)
+    Core.NonRec b e |  isContId b
+                    -> NonRec b (Cont $ fromCoreLamAsCont e)
+                    |  otherwise
+                    -> NonRec b (fromCoreExprAsValue e)
     Core.Rec bs     -> Rec [ (b, fromCoreExprAsValue e) | (b,e) <- bs ]
 
 -- | Translates a list of Core bindings into Sequent Core.
-fromCoreBinds :: [Core.Bind b] -> [Bind b]
+fromCoreBinds :: [Core.CoreBind] -> [SeqCoreBind]
 fromCoreBinds = map fromCoreBind
 
 -- FIXME There *has* to be a better way. But translation is a pure function and
 -- is called from pure code, so no taking a UniqSupply as an argument. ????
 {-# NOINLINE uniqSupply #-}
 uniqSupply :: UniqSupply
-uniqSupply = unsafePerformIO (mkSplitUniqSupply 'Q')
+uniqSupply = unsafePerformIO (mkSplitUniqSupply 'q') -- Must be a unique tag!!
 
 type ToCoreM a = UniqSM a
 
@@ -120,9 +138,9 @@ val2C val =
     Compute c   -> comm2C c
     Cont _      -> error "valueToCoreExpr"
 
--- | Translates a frame into a function that will wrap a Core expression with a
--- fragment of context (an argument to apply to, a case expression to run,
--- etc.).
+-- | Translates a continuation into a function that will wrap a Core expression
+-- with a fragment of context (an argument to apply to, a case expression to
+-- run, etc.).
 contToCoreExpr :: SeqCoreCont -> (Core.CoreExpr -> Core.CoreExpr)
 contToCoreExpr k = runToCoreM $ cont2C k
 
@@ -158,7 +176,9 @@ bind2C bind =
       -- We need to put something in the hole just to compute the free variables.
       -- Note that fakeExpr may be ill-typed (and probably is)!
       let fakeExpr = k' (Core.Var unitDataConId)
-      x <- setOneShotLambda <$> freshVar (fsLit "karg") (idType b) fakeExpr
+          fnTy     = idType b
+          argTy    = snd $ splitFunTy fnTy
+      x <- setOneShotLambda <$> freshVar (fsLit "karg") argTy fakeExpr
       return $ Core.NonRec b (Core.Lam x (k' (Core.Var x)))
     NonRec b v        -> Core.NonRec b <$> val2C v
     Rec bs            -> Core.Rec <$> mapM doPair bs

@@ -17,6 +17,7 @@ import Language.SequentCore.Syntax
 
 import qualified GhcPlugins as GHC
 import Outputable
+import PprCore ()
 
 import Data.List
 
@@ -85,7 +86,7 @@ ppr_cont_frames :: OutputableBndr b => Cont b -> [SDoc]
 ppr_cont_frames (App v k)
   = char '$' <+> ppr_value noParens v : ppr_cont_frames k
 ppr_cont_frames (Case var _ alts k)
-  = (hang (text "case of" <+> pprBndr CaseBind var) 2 $
+  = (hang (text "case as" <+> pprBndr CaseBind var <+> text "of") 2 $
       vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)) : ppr_cont_frames k
 ppr_cont_frames (Cast _ k)
   = text "cast ..." : ppr_cont_frames k
@@ -97,7 +98,12 @@ ppr_cont_frames (Jump x)
   = [text "jump" <+> ppr x]
 
 ppr_cont :: OutputableBndr b => (SDoc -> SDoc) -> Cont b -> SDoc
-ppr_cont add_par k = add_par $ sep $ punctuate semi (ppr_cont_frames k)
+ppr_cont add_par k
+  | null frames
+  = text "pass"
+  | otherwise
+  = add_par $ sep $ punctuate semi (ppr_cont_frames k)
+  where frames = ppr_cont_frames k
 
 pprCoreAlt :: OutputableBndr b => Alt b -> SDoc
 pprCoreAlt (Alt con args rhs)

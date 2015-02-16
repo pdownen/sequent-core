@@ -221,7 +221,7 @@ specInCont env (Tick ti k)
   = do
     (usage, k') <- specInCont env k
     return (usage, Tick ti k')
-specInCont _ k@Return
+specInCont _ k
   = return (emptyScUsage, k)
 
 specInAlt :: ScEnv -> SeqCoreAlt -> CoreM (ScUsage, SeqCoreAlt)

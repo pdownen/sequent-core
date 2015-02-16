@@ -9,36 +9,42 @@
 module Language.SequentCore.Syntax (
   -- * AST Types
   Value(..), Cont(..), Command(..), Bind(..), Alt(..), AltCon(..),
-  SeqCoreValue, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreAlt,
+  SeqCoreValue, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreBndr,
+    SeqCoreAlt,
   -- * Constructors
   mkCommand, valueCommand, varCommand, mkCompute, lambdas, addLets,
   -- * Deconstructors
-  collectLambdas, collectArgs, isLambda,
+  collectLambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs,
+  partitionTypes, isLambda,
   isTypeValue, isCoValue, isErasedValue, isRuntimeValue,
   isTrivial, isTrivialValue, isTrivialCont, isReturnCont,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
   -- * Calculations
-  valueArity, commandType, valueType,
+  valueArity, valueType, contOuterType, commandType,
+  -- * Continuation ids
+  contIdTag, isContId, asContId,
   -- * Alpha-equivalence
   (=~=), AlphaEq(..), AlphaEnv, HasId(..)
 ) where
 
-import {-# SOURCE #-} Language.SequentCore.Translate ( valueToCoreExpr
-                                                     , commandToCoreExpr )
+import {-# SOURCE #-} Language.SequentCore.Pretty ()
 
-import Coercion  ( Coercion, coercionType )
+import Coercion  ( Coercion, coercionType, coercionKind )
 import CoreSyn   ( AltCon(..), Tickish, isRuntimeVar )
-import CoreUtils ( exprType )
-import DataCon   ( DataCon )
-import Id        ( Id, isDataConWorkId_maybe, idArity )
-import Literal   ( Literal, litIsTrivial )
-import Type      ( Type )
+import DataCon   ( DataCon, dataConRepType )
+import Id        ( Id, isDataConWorkId_maybe, idArity, idType
+                 , idUnique, setIdUnique )
+import Literal   ( Literal, litIsTrivial, literalType )
+import Outputable
+import Pair      ( pSnd )
+import Type      ( Type, KindOrType )
 import qualified Type
+import TysPrim
+import Unique    ( newTagUnique, unpkUnique )
 import Var       ( Var, isId )
 import VarEnv
 
 import Data.Maybe
-import Data.Monoid
 
 --------------------------------------------------------------------------------
 -- AST Types
@@ -147,8 +153,8 @@ mkCommand binds val@(Var f) cont
 
 mkCommand binds (Compute (Command { cmdLet = binds'
                                   , cmdValue = val'
-                                  , cmdCont = cont' })) cont
-  = mkCommand (binds ++ binds') val' (cont' <> cont)
+                                  , cmdCont = Return {} })) cont
+  = mkCommand (binds ++ binds') val' cont
 
 mkCommand binds val cont
   = Command { cmdLet = binds, cmdValue = val, cmdCont = cont }
@@ -181,16 +187,6 @@ addLets :: [Bind b] -> Command b -> Command b
 addLets [] c = c -- avoid unnecessary allocation
 addLets bs c = c { cmdLet = bs ++ cmdLet c }
 
-instance Monoid (Cont b) where
-  mempty = Return
-
-  App v k        `mappend` k' = App v        (k `mappend` k')
-  Case x ty as k `mappend` k' = Case x ty as (k `mappend` k')
-  Cast co k      `mappend` k' = Cast co      (k `mappend` k')
-  Tick ti k      `mappend` k' = Tick ti      (k `mappend` k')
-  Jump x         `mappend` _  = Jump x
-  Return         `mappend` k' = k'
-
 --------------------------------------------------------------------------------
 -- Deconstructors
 --------------------------------------------------------------------------------
@@ -217,10 +213,36 @@ collectArgs (App v k)
 collectArgs k
   = ([], k)
 
+-- | Divide a continuation into a sequence of type arguments and an outer
+-- continuation. If @k@ is not an application continuation or only applies
+-- non-type arguments, then @collectTypeArgs k == ([], k)@.
+collectTypeArgs :: Cont b -> ([KindOrType], Cont b)
+collectTypeArgs (App (Type ty) k)
+  = (ty : tys, k')
+  where (tys, k') = collectTypeArgs k
+collectTypeArgs k
+  = ([], k)
+
+-- | Divide a continuation into a sequence of type arguments, then a sequence
+-- of non-type arguments, then an outer continuation. If @k@ is not an
+-- application continuation, then @collectTypeAndOtherArgs k == ([], [], k)@.
+collectTypeAndOtherArgs :: Cont b -> ([KindOrType], [Value b], Cont b)
+collectTypeAndOtherArgs k
+  = let (tys, k') = collectTypeArgs k
+        (vs, k'') = collectArgs k'
+    in (tys, vs, k'')
+
+-- | Divide a list of values into an initial sublist of types and the remaining
+-- values.
+partitionTypes :: [Value b] -> ([KindOrType], [Value b])
+partitionTypes (Type ty : vs) = (ty : tys, vs')
+  where (tys, vs') = partitionTypes vs
+partitionTypes vs = ([], vs)
+
 -- | True if the given command is a simple lambda, with no let bindings and no
 -- continuation.
 isLambda :: Command b -> Bool
-isLambda (Command { cmdLet = [], cmdCont = Return, cmdValue = Lam _ _ })
+isLambda (Command { cmdLet = [], cmdCont = Return {}, cmdValue = Lam {} })
   = True
 isLambda _
   = False
@@ -319,13 +341,36 @@ asValueCommand _
 -- Calculations
 --------------------------------------------------------------------------------
 
--- | Compute the type of a command.
-commandType :: SeqCoreCommand -> Type
-commandType = exprType . commandToCoreExpr -- Cheaty, but effective
-
 -- | Compute the type of a value.
 valueType :: SeqCoreValue -> Type
-valueType = exprType . valueToCoreExpr
+valueType (Lit l)        = literalType l
+valueType (Var x)        = idType x
+valueType (Lam b c)      = idType b `Type.mkFunTy` commandType c
+valueType (Cons con as)  = res_ty
+  where
+    (tys, _) = partitionTypes as
+    (_, res_ty) = Type.splitFunTys (dataConRepType con `Type.applyTys` tys)
+valueType (Compute c)    = commandType c
+-- see exprType in GHC CoreUtils
+valueType other          = pprTrace "valueType" (ppr other) alphaTy
+
+-- | Compute the outer type of a continuation, that is, the type of the value it
+-- eventually yields to the environment. Requires the inner type as an argument.
+contOuterType :: Type -> SeqCoreCont -> Type
+contOuterType ty k@App {}        = contOuterType res_ty k'
+  where
+    (tys, _, k') = collectTypeAndOtherArgs k
+    (_, res_ty)  = Type.splitFunTys (ty `Type.applyTys` tys)
+contOuterType _  (Case _ ty _ k) = contOuterType ty k
+contOuterType _  (Cast co k)     = contOuterType (pSnd $ coercionKind co) k
+contOuterType ty (Tick _ k)      = contOuterType ty k
+contOuterType _  (Jump x)        = snd $ Type.splitFunTy (idType x)
+contOuterType ty Return          = ty
+
+-- | Compute the type that a command yields to its outer context.
+commandType :: SeqCoreCommand -> Type
+commandType Command { cmdValue = v, cmdCont = k }
+  = contOuterType (valueType v) k
 
 -- | Compute (a conservative estimate of) the arity of a value. If the value is
 -- a variable, this may be a lower bound.
@@ -334,6 +379,27 @@ valueArity (Var x)
   | isId x = idArity x
 valueArity v
   = let (xs, _) = collectLambdas v in length xs
+
+--------------------------------------------------------------------------------
+-- Continuation ids
+--------------------------------------------------------------------------------
+
+-- | INTERNAL USE ONLY.
+contIdTag :: Char
+-- TODO Yuck. Find a way around this by any means necessary.
+-- Should be different from any unique tag used anywhere else (!!)
+contIdTag = 'Q'
+
+-- | Find whether an id is a continuation id.
+isContId :: Id -> Bool
+isContId x = tag == contIdTag where (tag, _) = unpkUnique (idUnique x) -- barf
+
+-- | Tag an id as a continuation id. This changes the unique of the id, so the
+-- returned id is always distinct from the argument in comparisons.
+asContId :: Id -> ContId
+asContId x = x `setIdUnique` uniq'
+  where
+    uniq' = newTagUnique (idUnique x) contIdTag
 
 --------------------------------------------------------------------------------
 -- Alpha-Equivalence
@@ -371,7 +437,6 @@ class AlphaEq a where
 -- | An empty context for alpha-equivalence comparisons.
 emptyAlphaEnv :: AlphaEnv
 emptyAlphaEnv = mkRnEnv2 emptyInScopeSet
-
 
 -- | True if the two given terms are the same, up to renaming of bound
 -- variables.

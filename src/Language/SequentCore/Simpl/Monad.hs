@@ -6,6 +6,7 @@ module Language.SequentCore.Simpl.Monad (
 import CoreMonad
 import DynFlags  ( HasDynFlags(..) )
 import Outputable
+import UniqSupply
 
 import Control.Applicative
 import Control.Monad
@@ -57,6 +58,11 @@ instance HasDynFlags SimplM where
 
 instance MonadIO SimplM where
   liftIO = liftCoreM . liftIO
+
+instance MonadUnique SimplM where
+  getUniqueSupplyM = liftCoreM getUniqueSupplyM
+  getUniqueM = liftCoreM getUniqueM
+  getUniquesM = liftCoreM getUniquesM
 
 getMode :: SimplM SimplifierMode
 getMode = SimplM $ \genv -> withZeroCount $ return (sg_mode genv)

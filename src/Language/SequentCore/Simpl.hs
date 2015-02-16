@@ -13,7 +13,7 @@
 
 module Language.SequentCore.Simpl (plugin) where
 
-import Language.SequentCore.Pretty ({-pprTopLevelBinds-})
+import Language.SequentCore.Pretty (pprTopLevelBinds)
 import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Simpl.Monad
 import Language.SequentCore.Syntax
@@ -24,23 +24,28 @@ import BasicTypes
 import Coercion    ( isCoVar )
 import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      CoreM, defaultPlugin, reinitializeGlobals, errorMsg,
-                     isZeroSimplCount
-                     --,putMsg, pprSimplCount
+                     isZeroSimplCount, putMsg
                    )
 import CoreSyn     ( isRuntimeVar, isCheapUnfolding )
 import CoreUnfold  ( smallEnoughToInline )
 import DynFlags    ( gopt, GeneralFlag(..) )
+import FastString
 import Id
 import HscTypes    ( ModGuts(..) )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
+import Type        ( mkFunTy )
 import Var
 import VarEnv
 import VarSet
 
 import Control.Applicative ( (<$>), (<*>) )
 import Control.Exception   ( assert )
+import Control.Monad       ( when )
 import Data.Maybe
+
+tracing :: Bool
+tracing = False
 
 -- | Plugin data. The initializer replaces all instances of the original
 -- simplifier with the new one.
@@ -81,16 +86,19 @@ runSimplifier iters mode guts
             coreBinds = mg_binds guts
             occBinds  = runOccurAnal mod coreBinds
             binds     = fromCoreBinds occBinds
-        -- putMsg  $ text "BEFORE" <+> int n
-        --        $$ text "--------" $$ pprTopLevelBinds binds
+        when tracing $ putMsg  $ text "BEFORE" <+> int n
+                              $$ text "--------" $$ pprTopLevelBinds binds
         (binds', count) <- runSimplM globalEnv $ simplModule binds
-        -- putMsg  $ text "AFTER" <+> int n
-        --        $$ text "-------" $$ pprTopLevelBinds binds'
+        when tracing $ putMsg  $ text "AFTER" <+> int n
+                              $$ text "-------" $$ pprTopLevelBinds binds'
         let coreBinds' = bindsToCore binds'
             guts'      = guts { mg_binds = coreBinds' }
+        when tracing $ putMsg  $ text "CORE AFTER" <+> int n
+                              $$ text "------------" $$ ppr coreBinds'
         if isZeroSimplCount count
           then do
-            -- putMsg $ text "Done after" <+> int n <+> text "iterations"
+            when tracing $ putMsg  $  text "Done after"
+                                  <+> int n <+> text "iterations"
             return guts'
           else go (n+1) guts'
     runOccurAnal mod core
@@ -199,7 +207,7 @@ simplRec env_x env_v xvs level
         if preInline
           then do
             tick (PreInlineUnconditionally x)
-            let rhs = mkSuspension env_v v
+            let rhs  = mkSuspension env_v v
                 env' = extendIdSubst env_x x rhs
             go env' triples acc
           else do
@@ -231,14 +239,6 @@ simplCut env (Cont k) _env_k cont
   = assert (isReturnCont cont) $ do
       k' <- simplCont env k
       return $ valueCommand (Cont k')
-simplCut env_v (Var x) env_k cont
-  = case substId env_v x of
-      DoneId x'
-        -> simplContWith (env_v `setStaticPart` env_k) (Var x') cont
-      DoneVal v
-        -> simplCut (zapSubstEnvs env_v) v env_k cont
-      SuspVal stat v
-        -> simplCut (env_v `setStaticPart` stat) v env_k cont
 simplCut env_v (Lam x c) env_k (App arg cont)
   = do
     tick (BetaReduction x)
@@ -252,6 +252,16 @@ simplCut env_v (Lam x c) env_k cont
     let (env_v', x') = enterScope env_v x
     c' <- simplCommand (zapCont env_v') c
     simplContWith (env_v `setStaticPart` env_k) (Lam x' c') cont
+simplCut env_v val env_k (Case x ty alts cont@Case {})
+  = do
+    tick (CaseOfCase x)
+    let contTy = ty `mkFunTy` contOuterType ty cont
+    contVar <- asContId <$> mkSysLocalM (fsLit "k") contTy
+    (env_k', newBind) <- simplNonRec (env_v `setStaticPart` env_k)
+                                     contVar env_k (Cont cont) NotTopLevel
+    let env_v' = env_k' `setStaticPart` staticPart env_v
+    comm <- simplCut env_v' val (staticPart env_k') (Case x ty alts $ Jump contVar)
+    return $ addLets (maybeToList newBind) comm
 simplCut env_v val env_k (Case x _ alts cont)
   | Just (pairs, body) <- matchCase env_v val alts
   = do
@@ -266,6 +276,14 @@ simplCut env_v val env_k (Case x _ alts cont)
       = do
         (env', maybe_xv') <- simplNonRec env x (staticPart env_v) v NotTopLevel
         go env' pairs (maybe_xv' `consMaybe` acc)
+simplCut env_v (Var x) env_k cont
+  = case substId env_v x of
+      DoneId x'
+        -> simplContWith (env_v `setStaticPart` env_k) (Var x') cont
+      DoneVal v
+        -> simplCut (zapSubstEnvs env_v) v env_k cont
+      SuspVal stat v
+        -> simplCut (env_v `setStaticPart` stat) v env_k cont
 simplCut env_v val@(Lit _) env_k cont
   = simplContWith (env_v `setStaticPart` env_k) val cont
 simplCut env_v (Cons ctor args) env_k cont
@@ -307,6 +325,13 @@ simplCont env cont
 simplCont env cont
   = go env cont (\k -> k)
   where
+    {-
+    go env cont _
+      | pprTrace "simplCont::go" (
+          ppr cont
+        ) False
+      = undefined
+    -}
     go env (App arg cont) kc
       = do
         arg' <- simplValue env arg
@@ -316,12 +341,18 @@ simplCont env cont
       = go env cont (kc . Cast co)
     go env (Case x ty alts cont) kc
       -- TODO A whole lot - cases are important
-      = let (env', x') = enterScope env x
-            ty' = substTy env' ty
-        in doCase env' x' ty' alts []
+      = doCase env'' x' ty' alts []
       where
-        doCase env x ty [] alt_acc
-          = go env cont (kc . Case x ty (reverse alt_acc))
+        (env', cont') | Jump {} <- cont 
+                      = (bindCont env (staticPart env) cont, Return)
+                      | otherwise
+                      = (env, cont)
+        (env'', x')   = enterScope env' x
+        ty'           = substTy env'' ty
+        env_orig      = env
+
+        doCase _env x ty [] alt_acc
+          = go env_orig cont' (kc . Case x ty (reverse alt_acc))
         doCase env x ty (Alt con xs c : alts) alt_acc
           = do
             let (env', xs') = enterScopes env xs
@@ -348,9 +379,7 @@ simplCont env cont
 
 simplContWith :: SimplEnv -> OutValue -> InCont -> SimplM OutCommand
 simplContWith env val cont
-  = do
-    cont' <- simplCont env cont
-    return $ mkCommand [] val cont'
+  = mkCommand [] val <$> simplCont env cont
 
 -- Based on preInlineUnconditionally in SimplUtils; see comments there
 preInlineUnconditionally :: SimplEnv -> InVar -> StaticEnv -> InValue
@@ -409,6 +438,7 @@ postInlineUnconditionally _env x v level
       | otherwise
       = case occ_info of
           OneOcc in_lam _one_br int_cxt
+            -- TODO Actually update unfoldings so that this makes sense
             ->     smallEnoughToInline dflags unfolding
                && (not in_lam ||
                     (isCheapUnfolding unfolding && int_cxt))
