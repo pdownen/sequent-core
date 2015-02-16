@@ -189,22 +189,22 @@ since we aim to translate back and forth faithfully:
 ### Summary
 
 In a sense, our data types do little more than divide the constructors of the
-`Core` datatype into three types, called `Value`, `Frame`, and `Command`. Thus
+`Core` datatype into three types, called `Value`, `Cont`, and `Command`. Thus
 the Sequent Core syntax is closely related to Core, making the translation
 relatively simple. Here are all the constructors of the original `Core` type,
 showing where we put each one:
 
-| Constructor |       |       |         |
-| :---------- | :---- | :---- | :------ |
-| Var         | Value |       |         |
-| Lit         | Value |       |         |
-| App         |       | Frame |         |
-| Let         |       |       | Command |
-| Case        |       | Frame |         |
-| Cast        |       | Frame |         |
-| Tick        |       | Frame |         |
-| Type        | Value |       |         |
-| Coercion    | Value |       |         | |
+| Constructor |       |      |         |
+| :---------- | :---- | :--- | :------ |
+| Var         | Value |      |         |
+| Lit         | Value |      |         |
+| App         |       | Cont |         |
+| Let         |       |      | Command |
+| Case        |       | Cont |         |
+| Cast        |       | Cont |         |
+| Tick        |       | Cont |         |
+| Type        | Value |      |         |
+| Coercion    | Value |      |         | |
 
 An Example
 ----------
