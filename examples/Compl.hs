@@ -1,8 +1,13 @@
 {-# OPTIONS_GHC -O0 -dcore-lint #-}
 
-module Main (main, f) where
+module Main (main, f, odd) where
+
+import Prelude hiding (odd)
 
 data Thing = Blue | Red Int | Orange Char deriving Show
+
+odd :: Int -> Bool
+odd n = n `mod` 2 == 1
 
 f :: Int -> (Thing, Thing, Thing)
 f x = let y f | odd f = Red f

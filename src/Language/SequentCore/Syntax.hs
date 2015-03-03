@@ -8,7 +8,7 @@
 
 module Language.SequentCore.Syntax (
   -- * AST Types
-  Value(..), Cont(..), Command(..), Bind(..), Alt(..), AltCon(..),
+  Value(..), Cont(..), Command(..), Bind(..), Alt(..), AltCon(..), ContId,
   SeqCoreValue, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreBndr,
     SeqCoreAlt,
   -- * Constructors
@@ -21,6 +21,7 @@ module Language.SequentCore.Syntax (
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
   -- * Calculations
   valueArity, valueType, contOuterType, commandType,
+  valueIsBottom, commandIsBottom,
   -- * Continuation ids
   contIdTag, isContId, asContId,
   -- * Alpha-equivalence
@@ -33,11 +34,11 @@ import Coercion  ( Coercion, coercionType, coercionKind )
 import CoreSyn   ( AltCon(..), Tickish, isRuntimeVar )
 import DataCon   ( DataCon, dataConRepType )
 import Id        ( Id, isDataConWorkId_maybe, idArity, idType
-                 , idUnique, setIdUnique )
+                 , idUnique, setIdUnique, isBottomingId )
 import Literal   ( Literal, litIsTrivial, literalType )
 import Outputable
 import Pair      ( pSnd )
-import Type      ( Type, KindOrType )
+import Type      ( Type, KindOrType, isTyVar )
 import qualified Type
 import TysPrim
 import Unique    ( newTagUnique, unpkUnique )
@@ -139,7 +140,7 @@ type SeqCoreAlt     = Alt     Var
 --
 -- This smart constructor enforces the invariant that a saturated constructor
 -- invocation is represented as a 'Cons' value rather than using 'App' frames.
-mkCommand :: [Bind b] -> Value b -> Cont b -> Command b
+mkCommand :: HasId b => [Bind b] -> Value b -> Cont b -> Command b
 mkCommand binds val@(Var f) cont
   | Just ctor <- isDataConWorkId_maybe f
   , Just (args, cont') <- ctorCall
@@ -310,7 +311,8 @@ isReturnCont _      = False
 -- | If a command represents a saturated call to some function, splits it into
 -- the function, the arguments, and the remaining continuation after the
 -- arguments.
-commandAsSaturatedCall :: Command b -> Maybe (Value b, [Value b], Cont b)
+commandAsSaturatedCall :: HasId b =>
+                          Command b -> Maybe (Value b, [Value b], Cont b)
 commandAsSaturatedCall c
   = do
     let val = cmdValue c
@@ -320,7 +322,7 @@ commandAsSaturatedCall c
 -- | If the given value is a function, and the given continuation would provide
 -- enough arguments to saturate it, returns the arguments and the remainder of
 -- the continuation.
-asSaturatedCall :: Value b -> Cont b -> Maybe ([Value b], Cont b)
+asSaturatedCall :: HasId b => Value b -> Cont b -> Maybe ([Value b], Cont b)
 asSaturatedCall val cont
   | 0 < arity, arity <= length args
   = Just (args, others)
@@ -374,11 +376,33 @@ commandType Command { cmdValue = v, cmdCont = k }
 
 -- | Compute (a conservative estimate of) the arity of a value. If the value is
 -- a variable, this may be a lower bound.
-valueArity :: Value b -> Int
+valueArity :: HasId b => Value b -> Int
 valueArity (Var x)
   | isId x = idArity x
-valueArity v
-  = let (xs, _) = collectLambdas v in length xs
+valueArity v@Lam {}
+  = let (xs, _) = collectLambdas v
+    in length (dropWhile (isTyVar . identifier) xs)
+valueArity _
+  = 0
+
+-- | Find whether an expression is definitely bottom.
+valueIsBottom :: Value b -> Bool
+valueIsBottom (Var x)     = isBottomingId x && idArity x == 0
+valueIsBottom (Compute c) = commandIsBottom c
+valueIsBottom _           = False
+
+-- | Find whether a command definitely evaluates to bottom.
+commandIsBottom :: Command b -> Bool
+commandIsBottom (Command { cmdValue = Var x, cmdCont = cont })
+  | isBottomingId x
+  = go 0 cont
+    where
+      go n (App arg cont') | isTypeValue arg = go n cont'
+                           | otherwise       = (go $! (n+1)) cont'
+      go n (Tick _ cont')  = go n cont'
+      go n (Cast _ cont')  = go n cont'
+      go n _               = n >= idArity x
+commandIsBottom _          = False
 
 --------------------------------------------------------------------------------
 -- Continuation ids

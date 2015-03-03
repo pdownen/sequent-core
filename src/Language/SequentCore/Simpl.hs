@@ -28,7 +28,7 @@ import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                    )
 import CoreSyn     ( isRuntimeVar, isCheapUnfolding )
 import CoreUnfold  ( smallEnoughToInline )
-import DynFlags    ( gopt, GeneralFlag(..) )
+import DynFlags    ( gopt, GeneralFlag(..), ufKeenessFactor, ufUseThreshold )
 import FastString
 import Id
 import HscTypes    ( ModGuts(..) )
@@ -110,7 +110,11 @@ runSimplifier iters mode guts
 
 simplModule :: [InBind] -> SimplM [OutBind]
 simplModule binds
-  = snd <$> simplBinds initialEnv binds TopLevel
+  = do
+    dflags <- getDynFlags
+    binds' <- snd <$> simplBinds (initialEnv dflags) binds TopLevel
+    freeTick SimplifierDone
+    return binds'
 
 simplCommand :: SimplEnv -> InCommand -> SimplM OutCommand
 simplCommand env (Command { cmdLet = binds, cmdValue = val, cmdCont = cont })
@@ -188,11 +192,12 @@ completeBind env x x' v level
         return (env', Nothing)
       else do
         -- TODO Eta-expansion goes here
+        dflags <- getDynFlags
         let ins   = se_inScope env
             defs  = se_defs env
             x''   = x' `setIdInfo` idInfo x
             ins'  = extendInScopeSet ins x''
-            defs' = extendVarEnv defs x'' (BoundTo v level)
+            defs' = extendVarEnv defs x'' (mkBoundTo dflags v (idOccInfo x'') level)
         return (env { se_inScope = ins', se_defs = defs' }, Just (x'', v))
 
 simplRec :: SimplEnv -> StaticEnv -> [(InVar, InValue)] -> TopLevelFlag
@@ -279,7 +284,13 @@ simplCut env_v val env_k (Case x _ alts cont)
 simplCut env_v (Var x) env_k cont
   = case substId env_v x of
       DoneId x'
-        -> simplContWith (env_v `setStaticPart` env_k) (Var x') cont
+        -> do
+           val'_maybe <- callSiteInline env_v x cont
+           case val'_maybe of
+             Nothing
+               -> simplContWith (env_v `setStaticPart` env_k) (Var x') cont
+             Just val'
+               -> simplCut (zapSubstEnvs env_v) val' env_k cont
       DoneVal v
         -> simplCut (zapSubstEnvs env_v) v env_k cont
       SuspVal stat v
@@ -302,9 +313,13 @@ matchCase _env_v (Lit lit) (Alt (LitAlt lit') xs body : _alts)
   , lit == lit'
   = Just ([], body)
 matchCase _env_v (Cons ctor args) (Alt (DataAlt ctor') xs body : _alts)
-  | assert (length args == length xs) True
-  , ctor == ctor'
-  = Just (zip xs args, body)
+  | ctor == ctor'
+  , assert (length valArgs == length xs) True
+  = Just (zip xs valArgs, body)
+  where
+    -- TODO Check that this is the Right Thing even in the face of GADTs and
+    -- other shenanigans.
+    valArgs = filter (not . isTypeValue) args
 matchCase env_v val (Alt DEFAULT xs body : alts)
   | assert (null xs) True
   , Nothing <- matchCase env_v val alts
@@ -384,7 +399,6 @@ simplContWith env val cont
 -- Based on preInlineUnconditionally in SimplUtils; see comments there
 preInlineUnconditionally :: SimplEnv -> InVar -> StaticEnv -> InValue
                          -> TopLevelFlag -> SimplM Bool
--- preInlineUnconditionally _ _ _ _ _ = return False
 preInlineUnconditionally _env_x x _env_rhs rhs level
   = do
     ans <- go <$> getMode <*> getDynFlags
@@ -450,3 +464,100 @@ postInlineUnconditionally _env x v level
         active = isActive (sm_phase mode) (idInlineActivation x)
         unfolding = idUnfolding x
 
+-- Heavily based on section 7 of the Secrets paper (JFP version)
+callSiteInline :: SimplEnv -> InVar -> InCont
+               -> SimplM (Maybe InValue)
+callSiteInline env_v x cont
+  = do
+    ans <- go <$> getMode <*> getDynFlags
+    -- liftCoreM $ putMsg $ text "callSiteInline" <+> pprBndr LetBind x <> colon <+> ppr ans
+    return ans
+  where
+    go _mode _dflags
+      | Just (BoundTo rhs occ level guid) <- lookupVarEnv (se_defs env_v) x
+      , shouldInline env_v rhs occ level guid cont
+      = Just rhs
+      | otherwise
+      = Nothing
+
+shouldInline :: SimplEnv -> OutValue -> OccInfo -> TopLevelFlag -> Guidance
+             -> InCont -> Bool
+shouldInline env rhs occ level guid cont
+  = case occ of
+      IAmALoopBreaker weak
+        -> weak -- inline iff it's a "rule-only" loop breaker
+      IAmDead
+        -> pprPanic "shouldInline" (text "dead binder")
+      OneOcc True True _ -- occurs once, but inside a non-linear lambda
+        -> whnfOrBot env rhs && someBenefit env rhs level cont
+      OneOcc False False _ -- occurs in multiple branches, but not in lambda
+        -> inlineMulti env rhs level guid cont
+      _
+        -> whnfOrBot env rhs && inlineMulti env rhs level guid cont
+
+someBenefit :: SimplEnv -> OutValue -> TopLevelFlag -> InCont -> Bool
+someBenefit env rhs level cont
+  | Cons {} <- rhs, Case {} <- cont
+  = True
+  | Lam {} <- rhs
+  = consider xs args
+  | otherwise
+  = False
+  where
+    (xs, _) = collectLambdas rhs
+    (args, cont') = collectArgs cont
+
+    -- See Secrets, section 7.2, for the someBenefit criteria
+    consider :: [OutVar] -> [InValue] -> Bool
+    consider [] (_:_)      = True -- (c) saturated call in interesting context
+    consider [] []         | Case {} <- cont' = True -- (c) ditto
+                           -- Check for (d) saturated call to nested
+                           | otherwise = isNotTopLevel level
+    consider (_:_) []      = False -- unsaturated
+                           -- Check for (b) nontrivial or known-var argument
+    consider (_:xs) (a:as) = nontrivial a || knownVar a || consider xs as
+    
+    nontrivial arg   = not (isTrivialValue arg)
+    knownVar (Var x) = x `elemVarEnv` se_defs env
+    knownVar _       = False
+
+whnfOrBot :: SimplEnv -> OutValue -> Bool
+whnfOrBot _ (Cons {}) = True
+whnfOrBot _ (Lam {})  = True
+whnfOrBot _ val       = isTrivialValue val || valueIsBottom val
+
+inlineMulti :: SimplEnv -> OutValue -> TopLevelFlag -> Guidance -> InCont -> Bool
+inlineMulti env rhs level guid cont
+  = noSizeIncrease rhs cont
+    || someBenefit env rhs level cont && smallEnough env rhs guid cont
+
+noSizeIncrease :: OutValue -> InCont -> Bool
+noSizeIncrease _rhs _cont = False --TODO
+
+smallEnough :: SimplEnv -> OutValue -> Guidance -> InCont -> Bool
+smallEnough _ _ Never _ = False
+smallEnough env _val (Sometimes bodySize argWeights resWeight) cont
+  -- The Formula (p. 40)
+  = bodySize - sizeOfCall - keenness `times` discounts <= threshold
+  where
+    (_, args, cont') = collectTypeAndOtherArgs cont
+    sizeOfCall           | null args =  0 -- a lone variable or polymorphic value
+                         | otherwise = 10 * (1 + length args)
+    keenness             = ufKeenessFactor (se_dflags env)
+    discounts            = argDiscs + resDisc
+    threshold            = ufUseThreshold (se_dflags env)
+    argDiscs             = sum (map argDisc (zip args argWeights))
+    argDisc (arg, w)     | isEvald arg = w
+                         | otherwise   = 0
+    resDisc              | length args > length argWeights || isCase cont'
+                         = resWeight
+                         | otherwise = 0
+
+    isEvald (Var x)      = x `elemVarEnv` se_defs env
+    isEvald (Compute {}) = False
+    isEvald _            = True
+
+    isCase (Case {})     = True
+    isCase _             = False
+
+    real `times` int     = ceiling (real * fromIntegral int)

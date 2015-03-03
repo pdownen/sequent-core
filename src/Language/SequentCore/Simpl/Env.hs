@@ -1,11 +1,13 @@
 module Language.SequentCore.Simpl.Env (
   SimplEnv(..), StaticEnv, SimplIdSubst, SubstAns(..), IdDefEnv, Definition(..),
+  Guidance(..),
 
   InCommand, InValue, InCont, InAlt, InBind,
   InId, InVar, InTyVar, InCoVar,
   OutCommand, OutValue, OutCont, OutAlt, OutBind,
   OutId, OutVar, OutTyVar, OutCoVar,
   
+  mkBoundTo,
   initialEnv, mkSuspension, enterScope, enterScopes, uniqAway,
   substId, substTy, substTyStatic, substCo, substCoStatic, extendIdSubst,
   zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
@@ -13,14 +15,17 @@ module Language.SequentCore.Simpl.Env (
 ) where
 
 import Language.SequentCore.Pretty ()
+import Language.SequentCore.Simpl.ExprSize
 import Language.SequentCore.Syntax
 
-import BasicTypes ( TopLevelFlag(..) )
+import BasicTypes ( OccInfo(..), TopLevelFlag(..) )
+import Bag        ( Bag, foldlBag )
 import Coercion   ( Coercion, CvSubstEnv, CvSubst, mkCvSubst )
 import qualified Coercion
+import DynFlags ( DynFlags, ufCreationThreshold )
 import Id
 import Outputable
-import Type       ( Type, TvSubstEnv, TvSubst, mkTvSubst, tyVarsOfType )
+import Type       ( Type, TvSubstEnv, TvSubst, mkTvSubst, tyVarsOfType, isFunTy )
 import qualified Type
 import Var
 import VarEnv
@@ -36,7 +41,8 @@ data SimplEnv
                 , se_cvSubst :: CvSubstEnv      -- InCoVar |--> OutCoercion
                 , se_cont    :: Maybe SuspCont
                 , se_inScope :: InScopeSet      -- OutVar  |--> OutVar
-                , se_defs    :: IdDefEnv }      -- OutId   |--> Definition (out)
+                , se_defs    :: IdDefEnv        -- OutId   |--> Definition (out)
+                , se_dflags  :: DynFlags }
 
 newtype StaticEnv = StaticEnv SimplEnv -- Ignore se_inScope and se_defs
 
@@ -54,8 +60,39 @@ data SuspCont
 -- paper, section 6.3.)
 type IdDefEnv = IdEnv Definition
 data Definition
-  = BoundTo OutValue TopLevelFlag
+  = BoundTo OutValue OccInfo TopLevelFlag Guidance
   | NotAmong [AltCon]
+
+data Guidance
+  = Never
+-- TODO: Usually  { guEvenIfUnsat :: Bool, guEvenIfBoring :: Bool }
+  | Sometimes { guSize :: Int
+              , guArgDiscounts :: [Int]
+              , guResultDiscount :: Int }
+
+mkBoundTo :: DynFlags -> OutValue -> OccInfo -> TopLevelFlag -> Definition
+mkBoundTo dflags val occ level = BoundTo val occ level (mkGuidance dflags val)
+
+mkGuidance :: DynFlags -> OutValue -> Guidance
+mkGuidance dflags val
+  = let (xs, body) = collectLambdas val
+        cap        = ufCreationThreshold dflags
+        valBinders = filter isId xs
+
+        discount :: Bag (Id, Int) -> Id -> Int
+        discount cbs bndr = foldlBag combine 0 cbs
+           where
+             combine acc (bndr', disc) 
+               | bndr == bndr' = acc `plus_disc` disc
+               | otherwise     = acc
+   
+             plus_disc :: Int -> Int -> Int
+             plus_disc | isFunTy (idType bndr) = max
+                       | otherwise             = (+)
+    in case commandSize dflags cap valBinders body of
+         TooBig -> Never
+         ExprSize base cased disc ->
+           Sometimes base (map (discount cased) valBinders) disc
 
 type InCommand  = SeqCoreCommand
 type InValue    = SeqCoreValue
@@ -77,13 +114,15 @@ type OutVar     = Var
 type OutTyVar   = TyVar
 type OutCoVar   = CoVar
 
-initialEnv :: SimplEnv
-initialEnv = SimplEnv { se_idSubst = emptyVarEnv
-                      , se_tvSubst = emptyVarEnv
-                      , se_cvSubst = emptyVarEnv
-                      , se_cont    = Nothing
-                      , se_inScope = emptyInScopeSet
-                      , se_defs    = emptyVarEnv }
+initialEnv :: DynFlags -> SimplEnv
+initialEnv dflags
+  = SimplEnv { se_idSubst = emptyVarEnv
+             , se_tvSubst = emptyVarEnv
+             , se_cvSubst = emptyVarEnv
+             , se_cont    = Nothing
+             , se_inScope = emptyInScopeSet
+             , se_defs    = emptyVarEnv
+             , se_dflags  = dflags }
 
 mkSuspension :: StaticEnv -> InValue -> SubstAns
 mkSuspension = SuspVal
@@ -186,7 +225,7 @@ setSubstEnvs env ids tvs cvs k
 
 suspendAndZapEnv :: SimplEnv -> InCont -> SimplEnv
 suspendAndZapEnv env cont
-  = suspendAndSetEnv env (StaticEnv initialEnv) cont
+  = suspendAndSetEnv env (StaticEnv (initialEnv (se_dflags env))) cont
 
 suspendAndSetEnv :: SimplEnv -> StaticEnv -> InCont -> SimplEnv
 suspendAndSetEnv env (StaticEnv stat) cont
@@ -222,7 +261,7 @@ restoreEnv env
       return (env `setStaticPart` env', cont)
 
 instance Outputable SimplEnv where
-  ppr (SimplEnv ids tvs cvs cont in_scope _defs)
+  ppr (SimplEnv ids tvs cvs cont in_scope _defs _dflags)
     =  text "<InScope =" <+> braces (fsep (map ppr (varEnvElts (getInScopeVars in_scope))))
 --    $$ text " Defs      =" <+> ppr defs
     $$ text " IdSubst   =" <+> ppr ids
@@ -232,7 +271,7 @@ instance Outputable SimplEnv where
      <> char '>'
 
 instance Outputable StaticEnv where
-  ppr (StaticEnv (SimplEnv ids tvs cvs cont _in_scope _defs))
+  ppr (StaticEnv (SimplEnv ids tvs cvs cont _in_scope _defs _dflags))
     =  text "<IdSubst   =" <+> ppr ids
     $$ text " TvSubst   =" <+> ppr tvs
     $$ text " CvSubst   =" <+> ppr cvs
@@ -250,5 +289,11 @@ instance Outputable SuspCont where
     = ppr cont
 
 instance Outputable Definition where
-  ppr (BoundTo c level) = brackets (ppr level) <+> ppr c
+  ppr (BoundTo c occ level guid)
+    = brackets (ppr occ <+> comma <+> ppr level <+> ppr guid) <+> ppr c
   ppr (NotAmong alts) = text "NotAmong" <+> ppr alts
+
+instance Outputable Guidance where
+  ppr Never = text "Never"
+  ppr (Sometimes base argDiscs resDisc)
+    = text "Sometimes" <+> brackets (int base <+> ppr argDiscs <+> int resDisc)

@@ -36,9 +36,11 @@ library
                        Language.SequentCore.Syntax
                        Language.SequentCore.Translate
   other-modules:       Language.SequentCore.Simpl.Env
+                       Language.SequentCore.Simpl.ExprSize
                        Language.SequentCore.Simpl.Monad
                        Language.SequentCore.Util
-  build-depends:       base >= 4 && < 5, ghc>=7.6, containers, transformers
+  build-depends:       base >= 4 && < 5, ghc>=7.6, containers, transformers,
+                         bytestring
   default-language:    Haskell2010
   ghc-options:         -Wall -fno-warn-name-shadowing
 
@@ -64,7 +66,7 @@ executable SpecConstrExpl
 executable SimplExpl
   hs-source-dirs:      examples
   Main-is:             Compl.hs
-  build-depends:       base >= 4 && < 5, sequent-core
+  build-depends:       base >= 4 && < 5, sequent-core, bytestring
   default-language:    Haskell2010
   ghc-options:         -fplugin=Language.SequentCore.Simpl
   if !flag(examples)

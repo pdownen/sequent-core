@@ -21,4 +21,6 @@ type SeqCoreCommand = Command Var
 type SeqCoreBind    = Bind    Var
 type SeqCoreAlt     = Alt     Var
 
-mkCommand :: [Bind b] -> Value b -> Cont b -> Command b
+class HasId b
+
+mkCommand :: HasId b => [Bind b] -> Value b -> Cont b -> Command b
