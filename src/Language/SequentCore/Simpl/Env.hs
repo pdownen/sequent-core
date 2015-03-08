@@ -75,24 +75,11 @@ mkBoundTo dflags val occ level = BoundTo val occ level (mkGuidance dflags val)
 
 mkGuidance :: DynFlags -> OutValue -> Guidance
 mkGuidance dflags val
-  = let (xs, body) = collectLambdas val
-        cap        = ufCreationThreshold dflags
-        valBinders = filter isId xs
-
-        discount :: Bag (Id, Int) -> Id -> Int
-        discount cbs bndr = foldlBag combine 0 cbs
-           where
-             combine acc (bndr', disc) 
-               | bndr == bndr' = acc `plus_disc` disc
-               | otherwise     = acc
-   
-             plus_disc :: Int -> Int -> Int
-             plus_disc | isFunTy (idType bndr) = max
-                       | otherwise             = (+)
-    in case commandSize dflags cap valBinders body of
-         TooBig -> Never
-         ExprSize base cased disc ->
-           Sometimes base (map (discount cased) valBinders) disc
+  = let cap = ufCreationThreshold dflags
+    in case valueSize dflags cap val of
+         Nothing -> Never
+         Just (ExprSize base args res) ->
+           Sometimes base args res
 
 type InCommand  = SeqCoreCommand
 type InValue    = SeqCoreValue
