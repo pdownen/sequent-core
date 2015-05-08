@@ -240,8 +240,7 @@ makes recursive bindings explicit, etc. Also note that `(+)` is called with
 Core. Finally, note that the zero is explicitly boxed; Core makes boxing and
 unboxing of primitives explicit as well.
 
-Now for the Sequent Core version (again, much simplified from the output of the
-pretty printer):
+Now for the Sequent Core version:
 
     Main.sum =
        letrec
@@ -262,9 +261,6 @@ pretty printer):
                          ; $ xs>>
          }
        in <sum' | $ <I# | $ 0>>
-
-<!-- TODO: Once we have SpecConstr, we should talk here about what benefits
-     the Sequent Core form provides. -->
 
 The Plugin Library
 ------------------
