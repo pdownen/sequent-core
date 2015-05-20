@@ -12,16 +12,22 @@ module Language.SequentCore.Syntax (
   SeqCoreValue, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreBndr,
     SeqCoreAlt,
   -- * Constructors
-  mkCommand, valueCommand, varCommand, mkCompute, lambdas, addLets,
+  mkCommand, valueCommand, varCommand, mkCompute, lambdas, addLets, addNonRec,
   -- * Deconstructors
   collectLambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs,
   partitionTypes, isLambda,
-  isTypeValue, isCoValue, isErasedValue, isRuntimeValue,
+  isValueArg, isTypeValue, isCoValue, isErasedValue, isRuntimeValue, isProperValue,
   isTrivial, isTrivialValue, isTrivialCont, isReturnCont,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
+  flattenBind, flattenBinds, bindersOf,
   -- * Calculations
   valueArity, valueType, contOuterType, commandType,
   valueIsBottom, commandIsBottom,
+  needsCaseBinding,
+  valueOkForSpeculation, commandOkForSpeculation, contOkForSpeculation,
+  valueOkForSideEffects, commandOkForSideEffects, contOkForSideEffects,
+  valueIsCheap, contIsCheap, commandIsCheap,
+  valueIsExpandable, contIsExpandable, commandIsExpandable,
   -- * Continuation ids
   contIdTag, isContId, asContId,
   -- * Alpha-equivalence
@@ -31,13 +37,18 @@ module Language.SequentCore.Syntax (
 import {-# SOURCE #-} Language.SequentCore.Pretty ()
 
 import Coercion  ( Coercion, coercionType, coercionKind )
-import CoreSyn   ( AltCon(..), Tickish, isRuntimeVar )
-import DataCon   ( DataCon, dataConRepType )
-import Id        ( Id, isDataConWorkId_maybe, idArity, idType
+import CoreSyn   ( AltCon(..), Tickish, tickishCounts, isRuntimeVar
+                 , isEvaldUnfolding )
+import DataCon   ( DataCon, dataConRepType, dataConTyCon )
+import Id        ( Id, isDataConWorkId, isDataConWorkId_maybe, isConLikeId
+                 , idArity, idType, idDetails, idUnfolding 
                  , idUnique, setIdUnique, isBottomingId )
-import Literal   ( Literal, litIsTrivial, literalType )
-import Outputable
+import IdInfo    ( IdDetails(..) )
+import Literal   ( Literal, isZeroLit, litIsTrivial, literalType )
 import Pair      ( pSnd )
+import PrimOp    ( PrimOp(..), primOpOkForSpeculation, primOpOkForSideEffects
+                 , primOpIsCheap )
+import TyCon
 import Type      ( Type, KindOrType, isTyVar )
 import qualified Type
 import TysPrim
@@ -188,6 +199,15 @@ addLets :: [Bind b] -> Command b -> Command b
 addLets [] c = c -- avoid unnecessary allocation
 addLets bs c = c { cmdLet = bs ++ cmdLet c }
 
+-- | Adds the given binding outside the given command, possibly using a case
+-- binding rather than a let. See "CoreSyn" on the let/app invariant.
+addNonRec :: HasId b => b -> Value b -> Command b -> Command b
+addNonRec bndr rhs comm
+  | needsCaseBinding (idType (identifier bndr)) rhs
+  = mkCommand [] rhs (Case bndr (valueType rhs) [Alt DEFAULT [] comm] Return)
+  | otherwise
+  = addLets [NonRec bndr rhs] comm
+
 --------------------------------------------------------------------------------
 -- Deconstructors
 --------------------------------------------------------------------------------
@@ -248,6 +268,10 @@ isLambda (Command { cmdLet = [], cmdCont = Return {}, cmdValue = Lam {} })
 isLambda _
   = False
 
+isValueArg :: Value b -> Bool
+isValueArg (Type _) = False
+isValueArg _ = True
+
 -- | True if the given value is a type. See 'Type'.
 isTypeValue :: Value b -> Bool
 isTypeValue (Type _) = True
@@ -268,6 +292,16 @@ isErasedValue _ = False
 -- coercion.
 isRuntimeValue :: Value b -> Bool
 isRuntimeValue v = not (isErasedValue v)
+
+-- | True if the given value can appear in an expression without restriction.
+-- Not true if the value is a type, coercion, or continuation; these can only
+-- appear on the RHS of a let or (except for continuations) as an argument in
+-- a function call.
+isProperValue :: Value b -> Bool
+isProperValue (Type _)     = False
+isProperValue (Coercion _) = False
+isProperValue (Cont _)     = False
+isProperValue _            = True
 
 -- | True if the given command represents no actual run-time computation or
 -- allocation. For this to hold, it must have no @let@ bindings, and its value
@@ -339,26 +373,37 @@ asValueCommand (Command { cmdLet = [], cmdValue = v, cmdCont = Return })
 asValueCommand _
   = Nothing
 
+flattenBind :: Bind b -> [(b, Value b)]
+flattenBind (NonRec bndr rhs) = [(bndr, rhs)]
+flattenBind (Rec pairs)       = pairs
+
+flattenBinds :: [Bind b] -> [(b, Value b)]
+flattenBinds = concatMap flattenBind
+
+bindersOf :: Bind b -> [b]
+bindersOf (NonRec bndr _) = [bndr]
+bindersOf (Rec pairs) = map fst pairs
+
 --------------------------------------------------------------------------------
 -- Calculations
 --------------------------------------------------------------------------------
 
 -- | Compute the type of a value.
-valueType :: SeqCoreValue -> Type
+valueType :: HasId b => Value b -> Type
 valueType (Lit l)        = literalType l
 valueType (Var x)        = idType x
-valueType (Lam b c)      = idType b `Type.mkFunTy` commandType c
+valueType (Lam b c)      = idType (identifier b) `Type.mkFunTy` commandType c
 valueType (Cons con as)  = res_ty
   where
     (tys, _) = partitionTypes as
     (_, res_ty) = Type.splitFunTys (dataConRepType con `Type.applyTys` tys)
 valueType (Compute c)    = commandType c
 -- see exprType in GHC CoreUtils
-valueType other          = pprTrace "valueType" (ppr other) alphaTy
+valueType _other         = alphaTy
 
 -- | Compute the outer type of a continuation, that is, the type of the value it
 -- eventually yields to the environment. Requires the inner type as an argument.
-contOuterType :: Type -> SeqCoreCont -> Type
+contOuterType :: HasId b => Type -> Cont b -> Type
 contOuterType ty k@App {}        = contOuterType res_ty k'
   where
     (tys, _, k') = collectTypeAndOtherArgs k
@@ -370,7 +415,7 @@ contOuterType _  (Jump x)        = snd $ Type.splitFunTy (idType x)
 contOuterType ty Return          = ty
 
 -- | Compute the type that a command yields to its outer context.
-commandType :: SeqCoreCommand -> Type
+commandType :: HasId b => Command b -> Type
 commandType Command { cmdValue = v, cmdCont = k }
   = contOuterType (valueType v) k
 
@@ -403,6 +448,171 @@ commandIsBottom (Command { cmdValue = Var x, cmdCont = cont })
       go n (Cast _ cont')  = go n cont'
       go n _               = n >= idArity x
 commandIsBottom _          = False
+
+-- | Decide whether a value should be bound using @case@ rather than @let@.
+-- See 'CoreUtils.needsCaseBinding'.
+needsCaseBinding :: Type -> Value b -> Bool
+needsCaseBinding ty rhs
+  = Type.isUnLiftedType ty && not (valueOkForSpeculation rhs)
+
+valueOkForSpeculation,   valueOkForSideEffects   :: Value b   -> Bool
+commandOkForSpeculation, commandOkForSideEffects :: Command b -> Bool
+contOkForSpeculation,    contOkForSideEffects    :: Cont b    -> Bool
+
+valueOkForSpeculation = valOk primOpOkForSpeculation
+valueOkForSideEffects = valOk primOpOkForSideEffects
+
+commandOkForSpeculation = commOk primOpOkForSpeculation
+commandOkForSideEffects = commOk primOpOkForSideEffects
+
+contOkForSpeculation = contOk primOpOkForSpeculation
+contOkForSideEffects = contOk primOpOkForSideEffects
+
+valOk :: (PrimOp -> Bool) -> Value b -> Bool
+valOk primOpOk (Var id)       = appOk primOpOk id []
+valOk primOpOk (Compute comm) = commOk primOpOk comm
+valOk _ _                     = True
+
+commOk :: (PrimOp -> Bool) -> Command b -> Bool
+commOk primOpOk (Command { cmdLet = binds, cmdValue = val, cmdCont = cont })
+  = null binds && cutOk primOpOk val cont
+
+cutOk :: (PrimOp -> Bool) -> Value b -> Cont b -> Bool
+cutOk primOpOk (Var fid) cont
+  | (args, cont') <- collectArgs cont
+  = appOk primOpOk fid args && contOk primOpOk cont'
+cutOk primOpOk val cont
+  = valOk primOpOk val && contOk primOpOk cont
+
+contOk :: (PrimOp -> Bool) -> Cont b -> Bool
+contOk _        Return    = True
+contOk _        (Jump _)  = False -- TODO Should look at unfolding??
+contOk _        (App _ _) = False
+contOk primOpOk (Case _bndr _ty alts cont)
+  =  all (\(Alt _ _ rhs) -> commOk primOpOk rhs) alts
+  && altsAreExhaustive
+  && contOk primOpOk cont
+  where
+    altsAreExhaustive
+      | (Alt con1 _ _ : _) <- alts
+      = case con1 of
+          DEFAULT    -> True
+          LitAlt {}  -> False
+          DataAlt dc -> 1 + length alts == tyConFamilySize (dataConTyCon dc)
+      | otherwise
+      = False
+contOk primOpOk (Tick ti cont)
+  = not (tickishCounts ti) && contOk primOpOk cont
+contOk primOpOk (Cast _ cont)
+  = contOk primOpOk cont
+
+-- See comments in CoreUtils.app_ok
+appOk :: (PrimOp -> Bool) -> Id -> [Value b] -> Bool
+appOk primOpOk fid args
+  = case idDetails fid of
+      DFunId _ newType -> not newType
+      DataConWorkId {} -> True
+      PrimOpId op      | isDivOp op
+                       , [arg1, Lit lit] <- args
+                       -> not (isZeroLit lit) && valOk primOpOk arg1
+                       | DataToTagOp <- op
+                       -> True
+                       | otherwise
+                       -> primOpOk op && all (valOk primOpOk) args
+      _                -> Type.isUnLiftedType (idType fid)
+                       || idArity fid > nValArgs
+                       || nValArgs == 0 && isEvaldUnfolding (idUnfolding fid)
+                       where
+                         nValArgs = length (filter isValueArg args)
+  where
+    isDivOp IntQuotOp        = True
+    isDivOp IntRemOp         = True
+    isDivOp WordQuotOp       = True
+    isDivOp WordRemOp        = True
+    isDivOp FloatDivOp       = True
+    isDivOp DoubleDivOp      = True
+    isDivOp _                = False
+
+valueIsCheap, valueIsExpandable :: HasId b => Value b -> Bool
+valueIsCheap      = valCheap isCheapApp
+valueIsExpandable = valCheap isExpandableApp
+
+contIsCheap, contIsExpandable :: HasId b => Cont b -> Bool
+contIsCheap      = contCheap isCheapApp
+contIsExpandable = contCheap isExpandableApp
+
+commandIsCheap, commandIsExpandable :: HasId b => Command b -> Bool
+commandIsCheap      = commCheap isCheapApp
+commandIsExpandable = commCheap isExpandableApp
+
+type CheapMeasure = Id -> Int -> Bool
+
+valCheap :: HasId b => CheapMeasure -> Value b -> Bool
+valCheap _        (Lit _)      = True
+valCheap _        (Var _)      = True
+valCheap _        (Type _)     = True
+valCheap _        (Coercion _) = True
+valCheap _        (Cons _ _)   = True
+valCheap appCheap (Lam x comm) = isRuntimeVar (identifier x)
+                               || commCheap appCheap comm
+valCheap appCheap (Compute c)  = commCheap appCheap c
+valCheap appCheap (Cont cont)  = contCheap appCheap cont
+
+contCheap :: HasId b => CheapMeasure -> Cont b -> Bool
+contCheap _         Return              = True
+contCheap _        (Jump _)             = True
+contCheap appCheap (Case _ _ alts cont) = contCheap appCheap cont
+                                        && and [ commCheap appCheap rhs
+                                               | Alt _ _ rhs <- alts ]
+contCheap appCheap (Cast _ cont)        = contCheap appCheap cont
+contCheap appCheap (Tick ti cont)       = not (tickishCounts ti)
+                                        && contCheap appCheap cont
+contCheap appCheap (App arg cont)       = isErasedValue arg
+                                        && contCheap appCheap cont
+
+commCheap :: HasId b => CheapMeasure -> Command b -> Bool
+commCheap appCheap (Command { cmdLet = binds, cmdValue = val, cmdCont = cont})
+  = all (valCheap appCheap . snd) (flattenBinds binds)
+  && cutCheap appCheap val cont
+
+-- See the last clause in CoreUtils.exprIsCheap' for explanations
+
+cutCheap :: HasId b => CheapMeasure -> Value b -> Cont b -> Bool
+cutCheap appCheap val (Cast _ cont) = cutCheap appCheap val cont
+cutCheap appCheap (Var fid) cont@(App {})
+  = case collectTypeAndOtherArgs cont of
+      (_, [], cont')   -> contCheap appCheap cont'
+      (_, args, cont')
+        | appCheap fid (length args)
+        -> papCheap args && contCheap appCheap cont'
+        | otherwise
+        -> case idDetails fid of
+             RecSelId {}  -> selCheap args
+             ClassOpId {} -> selCheap args
+             PrimOpId op  -> primOpCheap op args
+             _            | isBottomingId fid -> True
+                          | otherwise         -> False
+  where
+    papCheap args       = all (valCheap appCheap) args
+    selCheap [arg]      = valCheap appCheap arg
+    selCheap _          = False
+    primOpCheap op args = primOpIsCheap op && all (valCheap appCheap) args
+cutCheap _ _ _ = False
+    
+isCheapApp, isExpandableApp :: CheapMeasure
+isCheapApp fid valArgCount = isDataConWorkId fid
+                           || valArgCount == 0
+                           || valArgCount < idArity fid
+isExpandableApp fid valArgCount = isConLikeId fid
+                                || valArgCount < idArity fid
+                                || allPreds valArgCount (idType fid)
+  where
+    allPreds 0 _ = True
+    allPreds n ty
+      | Just (_, ty') <- Type.splitForAllTy_maybe ty = allPreds n ty'
+      | Just (argTy, ty') <- Type.splitFunTy_maybe ty
+      , Type.isPredTy argTy = allPreds (n-1) ty'
+      | otherwise = False
 
 --------------------------------------------------------------------------------
 -- Continuation ids

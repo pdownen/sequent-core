@@ -11,26 +11,32 @@ module Language.SequentCore.Simpl.Env (
   initialEnv, mkSuspension, enterScope, enterScopes, uniqAway,
   substId, substTy, substTyStatic, substCo, substCoStatic, extendIdSubst,
   zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
-  suspendAndZapEnv, suspendAndSetEnv, zapCont, bindCont, pushCont, restoreEnv
+  suspendAndZapEnv, suspendAndSetEnv, zapCont, bindCont, pushCont, restoreEnv,
+  
+  Floats, emptyFloats, addNonRecFloat, addRecFloats, zapFloats, mapFloats,
+  extendFloats, addFloats, wrapFloats, isEmptyFloats, doFloatFromRhs,
+  getFloatBinds, getFloats
 ) where
 
 import Language.SequentCore.Pretty ()
 import Language.SequentCore.Simpl.ExprSize
 import Language.SequentCore.Syntax
 
-import BasicTypes ( OccInfo(..), TopLevelFlag(..) )
-import Bag        ( Bag, foldlBag )
+import BasicTypes ( OccInfo(..), TopLevelFlag(..), RecFlag(..)
+                  , isTopLevel, isNotTopLevel, isNonRec )
 import Coercion   ( Coercion, CvSubstEnv, CvSubst, mkCvSubst )
 import qualified Coercion
 import DynFlags ( DynFlags, ufCreationThreshold )
 import Id
+import OrdList
 import Outputable
-import Type       ( Type, TvSubstEnv, TvSubst, mkTvSubst, tyVarsOfType, isFunTy )
+import Type       ( Type, TvSubstEnv, TvSubst, mkTvSubst, tyVarsOfType )
 import qualified Type
 import Var
 import VarEnv
 import VarSet
 
+import Control.Exception ( assert )
 import Data.Maybe
 
 infixl 1 `setStaticPart`
@@ -42,6 +48,7 @@ data SimplEnv
                 , se_cont    :: Maybe SuspCont
                 , se_inScope :: InScopeSet      -- OutVar  |--> OutVar
                 , se_defs    :: IdDefEnv        -- OutId   |--> Definition (out)
+                , se_floats  :: Floats
                 , se_dflags  :: DynFlags }
 
 newtype StaticEnv = StaticEnv SimplEnv -- Ignore se_inScope and se_defs
@@ -109,6 +116,7 @@ initialEnv dflags
              , se_cont    = Nothing
              , se_inScope = emptyInScopeSet
              , se_defs    = emptyVarEnv
+             , se_floats  = emptyFloats
              , se_dflags  = dflags }
 
 mkSuspension :: StaticEnv -> InValue -> SubstAns
@@ -186,7 +194,7 @@ cvSubstPairs ins cvs
   = mapMaybe lookupWithKey vars
   where
     lookupWithKey x = lookupVarEnv cvs x >>= \co -> Just (x, co)
-    vars = (varEnvElts (getInScopeVars ins))
+    vars = varEnvElts (getInScopeVars ins)
 
 mkCvSubstFromSubstEnv :: InScopeSet -> CvSubstEnv -> CvSubst
 mkCvSubstFromSubstEnv ins cvs = mkCvSubst ins (cvSubstPairs ins cvs)
@@ -247,18 +255,135 @@ restoreEnv env
   = se_cont env >>= \(SuspCont env' cont) ->
       return (env `setStaticPart` env', cont)
 
+-- See [Simplifier floats] in SimplEnv
+
+data Floats = Floats (OrdList OutBind) FloatFlag
+
+data FloatFlag
+  = FltLifted   -- All bindings are lifted and lazy
+                --  Hence ok to float to top level, or recursive
+
+  | FltOkSpec   -- All bindings are FltLifted *or*
+                --      strict (perhaps because unlifted,
+                --      perhaps because of a strict binder),
+                --        *and* ok-for-speculation
+                --  Hence ok to float out of the RHS
+                --  of a lazy non-recursive let binding
+                --  (but not to top level, or into a rec group)
+
+  | FltCareful  -- At least one binding is strict (or unlifted)
+                --      and not guaranteed cheap
+                --      Do not float these bindings out of a lazy let
+
+andFF :: FloatFlag -> FloatFlag -> FloatFlag
+andFF FltCareful _          = FltCareful
+andFF FltOkSpec  FltCareful = FltCareful
+andFF FltOkSpec  _          = FltOkSpec
+andFF FltLifted  flt        = flt
+
+classifyFF :: SeqCoreBind -> FloatFlag
+classifyFF (Rec _) = FltLifted
+classifyFF (NonRec bndr rhs)
+  | not (isStrictId bndr)    = FltLifted
+  | valueOkForSpeculation rhs = FltOkSpec
+  | otherwise                = FltCareful
+
+doFloatFromRhs :: TopLevelFlag -> RecFlag -> Bool -> OutValue -> SimplEnv -> Bool
+-- If you change this function look also at FloatIn.noFloatFromRhs
+doFloatFromRhs lvl rc str rhs (SimplEnv {se_floats = Floats fs ff})
+  =  not (isNilOL fs) && want_to_float && can_float
+  where
+     want_to_float = isTopLevel lvl || valueIsCheap rhs || valueIsExpandable rhs 
+                     -- See Note [Float when cheap or expandable]
+     can_float = case ff of
+                   FltLifted  -> True
+                   FltOkSpec  -> isNotTopLevel lvl && isNonRec rc
+                   FltCareful -> isNotTopLevel lvl && isNonRec rc && str
+
+emptyFloats :: Floats
+emptyFloats = Floats nilOL FltLifted
+
+unitFloat :: OutBind -> Floats
+unitFloat bind = Floats (unitOL bind) (classifyFF bind)
+
+addNonRecFloat :: SimplEnv -> OutId -> OutValue -> SimplEnv
+addNonRecFloat env id rhs
+  = id `seq`   -- This seq forces the Id, and hence its IdInfo,
+               -- and hence any inner substitutions
+    env { se_floats = se_floats env `addFlts` unitFloat (NonRec id rhs),
+          se_inScope = extendInScopeSet (se_inScope env) id }
+
+mapFloats :: SimplEnv -> ((OutId, OutValue) -> (OutId, OutValue)) -> SimplEnv
+mapFloats env@SimplEnv { se_floats = Floats fs ff } fun
+   = env { se_floats = Floats (mapOL app fs) ff }
+   where
+     app (NonRec b e) = case fun (b,e) of (b',e') -> NonRec b' e'
+     app (Rec bs)     = Rec (map fun bs)
+
+extendFloats :: SimplEnv -> OutBind -> SimplEnv
+-- Add these bindings to the floats, and extend the in-scope env too
+extendFloats env bind
+  = env { se_floats  = se_floats env `addFlts` unitFloat bind,
+          se_inScope = extendInScopeSetList (se_inScope env) bndrs }
+  where
+    bndrs = bindersOf bind
+
+addFloats :: SimplEnv -> SimplEnv -> SimplEnv
+-- Add the floats for env2 to env1;
+-- *plus* the in-scope set for env2, which is bigger
+-- than that for env1
+addFloats env1 env2
+  = env1 {se_floats = se_floats env1 `addFlts` se_floats env2,
+          se_inScope = se_inScope env2 }
+
+wrapFloats :: SimplEnv -> OutCommand -> OutCommand
+wrapFloats env cmd = foldrOL wrap cmd (floatBinds (se_floats env))
+  where
+    wrap :: OutBind -> OutCommand -> OutCommand
+    wrap bind@(Rec {}) cmd = cmd { cmdLet = bind : cmdLet cmd }
+    wrap (NonRec b r)  cmd = addNonRec b r cmd
+
+addFlts :: Floats -> Floats -> Floats
+addFlts (Floats bs1 l1) (Floats bs2 l2)
+  = Floats (bs1 `appOL` bs2) (l1 `andFF` l2)
+
+zapFloats :: SimplEnv -> SimplEnv
+zapFloats env = env { se_floats = emptyFloats }
+
+addRecFloats :: SimplEnv -> SimplEnv -> SimplEnv
+-- Flattens the floats from env2 into a single Rec group,
+-- prepends the floats from env1, and puts the result back in env2
+-- This is all very specific to the way recursive bindings are
+-- handled; see Simpl.simplRecBind
+addRecFloats env1 env2@(SimplEnv {se_floats = Floats bs ff})
+  = assert (case ff of { FltLifted -> True; _ -> False })
+  $ env2 {se_floats = se_floats env1 `addFlts` unitFloat (Rec (flattenBinds (fromOL bs)))}
+
+getFloatBinds :: Floats -> [OutBind]
+getFloatBinds = fromOL . floatBinds
+
+floatBinds :: Floats -> OrdList OutBind
+floatBinds (Floats bs _) = bs
+
+getFloats :: SimplEnv -> Floats
+getFloats = se_floats
+
+isEmptyFloats :: SimplEnv -> Bool
+isEmptyFloats = isNilOL . floatBinds . se_floats
+
 instance Outputable SimplEnv where
-  ppr (SimplEnv ids tvs cvs cont in_scope _defs _dflags)
+  ppr (SimplEnv ids tvs cvs cont in_scope _defs floats _dflags)
     =  text "<InScope =" <+> braces (fsep (map ppr (varEnvElts (getInScopeVars in_scope))))
 --    $$ text " Defs      =" <+> ppr defs
     $$ text " IdSubst   =" <+> ppr ids
     $$ text " TvSubst   =" <+> ppr tvs
     $$ text " CvSubst   =" <+> ppr cvs
     $$ text " Cont      =" <+> ppr cont
+    $$ text " Floats    =" <+> ppr floats
      <> char '>'
 
 instance Outputable StaticEnv where
-  ppr (StaticEnv (SimplEnv ids tvs cvs cont _in_scope _defs _dflags))
+  ppr (StaticEnv (SimplEnv ids tvs cvs cont _in_scope _defs _floats _dflags))
     =  text "<IdSubst   =" <+> ppr ids
     $$ text " TvSubst   =" <+> ppr tvs
     $$ text " CvSubst   =" <+> ppr cvs
@@ -284,3 +409,11 @@ instance Outputable Guidance where
   ppr Never = text "Never"
   ppr (Sometimes base argDiscs resDisc)
     = text "Sometimes" <+> brackets (int base <+> ppr argDiscs <+> int resDisc)
+
+instance Outputable Floats where
+  ppr (Floats binds ff) = ppr ff $$ ppr (fromOL binds)
+
+instance Outputable FloatFlag where
+  ppr FltLifted = text "FltLifted"
+  ppr FltOkSpec = text "FltOkSpec"
+  ppr FltCareful = text "FltCareful"
