@@ -15,7 +15,9 @@ module Language.SequentCore.Simpl.Env (
   
   Floats, emptyFloats, addNonRecFloat, addRecFloats, zapFloats, mapFloats,
   extendFloats, addFloats, wrapFloats, isEmptyFloats, doFloatFromRhs,
-  getFloatBinds, getFloats
+  getFloatBinds, getFloats,
+  
+  valueIsHNF, commandIsHNF
 ) where
 
 import Language.SequentCore.Pretty ()
@@ -370,6 +372,32 @@ getFloats = se_floats
 
 isEmptyFloats :: SimplEnv -> Bool
 isEmptyFloats = isNilOL . floatBinds . se_floats
+
+-- TODO This might be in Syntax, but since we're not storing our "unfoldings" in
+-- ids, we rely on the environment to tell us whether a variable has been
+-- evaluated.
+
+valueIsHNF :: SimplEnv -> SeqCoreValue -> Bool
+valueIsHNF _   (Lit {})  = True
+valueIsHNF _   (Cons {}) = True
+valueIsHNF env (Var id)
+  = case lookupVarEnv (se_defs env) id of
+      Just (NotAmong {})            -> True
+      Just (BoundTo val _ _ _) -> valueIsHNF env val
+      _                             -> False
+valueIsHNF env (Compute comm) = commandIsHNF env comm
+valueIsHNF _   _        = False
+
+commandIsHNF :: SimplEnv -> SeqCoreCommand -> Bool
+commandIsHNF _env (Command [] (Var fid) cont)
+  | let (args, _) = collectArgs cont
+  , length args < idArity fid
+  = True
+commandIsHNF env comm
+  | Just val <- asValueCommand comm
+  = valueIsHNF env val
+commandIsHNF _ _
+  = False
 
 instance Outputable SimplEnv where
   ppr (SimplEnv ids tvs cvs cont in_scope _defs floats _dflags)

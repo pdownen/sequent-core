@@ -31,10 +31,11 @@ import DynFlags    ( gopt, GeneralFlag(..), ufKeenessFactor, ufUseThreshold )
 import FastString
 import Id
 import HscTypes    ( ModGuts(..) )
+import Maybes
 import MonadUtils  ( mapAccumLM )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
-import Type        ( Type, mkFunTy )
+import Type        ( Type, isUnLiftedType )
 import Var
 import VarEnv
 import VarSet
@@ -42,7 +43,6 @@ import VarSet
 import Control.Applicative ( (<$>), (<*>) )
 import Control.Exception   ( assert )
 import Control.Monad       ( when, foldM )
-import Data.Maybe
 
 tracing :: Bool
 tracing = False
@@ -222,6 +222,9 @@ simplLazyBind env_x x x' env_v v level isRec
 
 wrapFloatsAroundCont :: SimplEnv -> Type -> OutCont -> SimplM OutCont
 wrapFloatsAroundCont env inTy cont
+  | isEmptyFloats env
+  = return cont
+  | otherwise
   -- Remember, all nontrivial continuations are strict contexts. Therefore it's
   -- always okay to rewrite
   --   E ==> case of [ a -> <a | E> ]
@@ -276,8 +279,9 @@ simplRec env_x env_v xvs level
     doPair env_x (x, x', v)
       = simplLazyBind env_x x x' env_v v level Recursive
 
--- TODO Deal with casts, i.e. implement the congruence rules from the
--- System FC paper
+-- TODO Deal with casts. Should maybe take the active cast as an argument;
+-- indeed, it would make sense to think of a cut as involving a value, a
+-- continuation, *and* the coercion that proves they're compatible.
 simplCut :: SimplEnv -> InValue -> StaticEnv -> InCont
                      -> SimplM (SimplEnv, OutCommand)
 {-
@@ -287,41 +291,6 @@ simplCut env_v v env_k cont
     ) False
   = undefined
 -}
-simplCut env_v (Type ty) _env_k cont
-  = assert (isReturnCont cont) $
-    let ty' = substTy env_v ty
-    in return (env_v, valueCommand (Type ty'))
-simplCut env_v (Coercion co) _env_k cont
-  = assert (isReturnCont cont) $
-    let co' = substCo env_v co
-    in return (env_v, valueCommand (Coercion co'))
-simplCut _env_v (Cont {}) _env_k _cont
-  = panic "simplCut of cont"
-simplCut env_v (Lam x c) env_k (App arg cont)
-  = do
-    tick (BetaReduction x)
-    env_v' <- simplNonRec env_v x env_k arg NotTopLevel
-    -- Effectively, here we bind the covariable in the lambda to the current
-    -- continuation before proceeding
-    simplCommand (bindCont env_v' env_k cont) c
-simplCut env_v (Lam x c) env_k cont
-  = do
-    let (env_v', x') = enterScope env_v x
-    c' <- simplCommandNoFloats (zapCont env_v') c
-    simplContWith (env_v' `setStaticPart` env_k) (Lam x' c') cont
-simplCut env_v val env_k (Case x _ alts cont)
-  | Just (pairs, body) <- matchCase env_v val alts
-  = do
-    tick (KnownBranch x)
-    env' <- go (env_v `setStaticPart` env_k) ((x, val) : pairs)
-    simplCommand (env' `pushCont` cont) body
-  where
-    go env []
-      = return env
-    go env ((x, v) : pairs)
-      = do
-        env' <- simplNonRec env x (staticPart env_v) v NotTopLevel
-        go env' pairs
 simplCut env_v (Var x) env_k cont
   = case substId env_v x of
       DoneId x'
@@ -329,28 +298,145 @@ simplCut env_v (Var x) env_k cont
            val'_maybe <- callSiteInline env_v x cont
            case val'_maybe of
              Nothing
-               -> simplContWith (env_v `setStaticPart` env_k) (Var x') cont
+               -> simplCut2 env_v (Var x') env_k cont
              Just val'
                -> simplCut (zapSubstEnvs env_v) val' env_k cont
       DoneVal v
         -- Value already simplified (then PostInlineUnconditionally'd), so
         -- don't do any substitutions when processing it again
-        -> simplCut (zapSubstEnvs env_v) v env_k cont
+        -> simplCut2 (zapSubstEnvs env_v) v env_k cont
       SuspVal stat v
         -> simplCut (env_v `setStaticPart` stat) v env_k cont
-simplCut env_v val@(Lit _) env_k cont
-  = simplContWith (env_v `setStaticPart` env_k) val cont
-simplCut env_v (Cons ctor args) env_k cont
+simplCut env_v val env_k cont
+  -- Proceed to phase 2
+  = simplCut2 env_v val env_k cont
+
+-- Second phase of simplCut. Now, if the value is a variable, we looked it up
+-- and substituted it but decided not to inline it. (In other words, if it's an
+-- id, it's an OutId.)
+simplCut2 :: SimplEnv -> OutValue -> StaticEnv -> InCont
+                      -> SimplM (SimplEnv, OutCommand)
+simplCut2 env_v (Type ty) _env_k cont
+  = assert (isReturnCont cont) $
+    let ty' = substTy env_v ty
+    in return (env_v, valueCommand (Type ty'))
+simplCut2 env_v (Coercion co) _env_k cont
+  = assert (isReturnCont cont) $
+    let co' = substCo env_v co
+    in return (env_v, valueCommand (Coercion co'))
+simplCut2 _env_v (Cont {}) _env_k _cont
+  = panic "simplCut of cont"
+simplCut2 env_v (Lam x c) env_k (App arg cont)
+  = do
+    tick (BetaReduction x)
+    env_v' <- simplNonRec env_v x env_k arg NotTopLevel
+    -- Effectively, here we bind the covariable in the lambda to the current
+    -- continuation before proceeding
+    simplCommand (bindCont env_v' env_k cont) c
+simplCut2 env_v (Lam x c) env_k cont
+  = do
+    let (env_v', x') = enterScope env_v x
+    c' <- simplCommandNoFloats (zapCont env_v') c
+    simplContWith (env_v' `setStaticPart` env_k) (Lam x' c') cont
+simplCut2 env_v val env_k (Case x _ alts cont)
+  | isManifestValue val
+  , Just (pairs, body) <- matchCase env_v val alts
+  = do
+    tick (KnownBranch x)
+    env' <- foldM doPair (env_v `setStaticPart` env_k) ((x, val) : pairs)
+    simplCommand (env' `pushCont` cont) body
+  where
+    isManifestValue (Lit {})  = True
+    isManifestValue (Cons {}) = True
+    isManifestValue _         = False
+    
+    doPair env (x, v)
+      = simplNonRec env x (staticPart env_v) v NotTopLevel
+
+-- Adapted from Simplify.rebuildCase (clause 2)
+-- See [Case elimination] in Simplify
+simplCut2 env_v val env_k (Case case_bndr ty [Alt _ bndrs rhs] cont)
+ | all isDeadBinder bndrs       -- bndrs are [InId]
+ 
+ , if isUnLiftedType ty
+   then elim_unlifted        -- Satisfy the let-binding invariant
+   else elim_lifted
+  = do  { -- pprTrace "case elim" (vcat [ppr case_bndr, ppr (exprIsHNF scrut),
+          --                            ppr ok_for_spec,
+          --                            ppr scrut]) $
+          tick (CaseElim case_bndr)
+        ; env' <- simplNonRec (env_v `setStaticPart` env_k)
+                    case_bndr (staticPart env_v) val NotTopLevel
+        ; simplCommand (env' `pushCont` cont) rhs }
+  where
+    elim_lifted   -- See Note [Case elimination: lifted case]
+      = valueIsHNF env_v val
+     || (is_plain_seq && ok_for_spec)
+              -- Note: not the same as exprIsHNF
+     || case_bndr_evald_next rhs
+ 
+    elim_unlifted
+      -- TODO This code, mostly C&P'd from Simplify.rebuildCase, illustrates a
+      -- problem: Here we want to know something about the computation that
+      -- computed the value we're cutting the Case with. This makes sense in
+      -- original Core because we can just look at the scrutinee. Right here,
+      -- though, we are considering the very moment of interaction between
+      -- scrutinee *value* and case statement; information about how the value
+      -- came to be, which is crucial to whether the case can be eliminated, is
+      -- not available.
+      --
+      -- I'm hand-waving a bit here; in fact, if we have 
+      --   case launchMissiles# 4# "Russia"# of _ -> ...,
+      -- then in Sequent Core we have
+      --   < launchMissiles# | $ 4#; $ "Russia"#; case of [ _ -> ... ] >,
+      -- where the case is buried in the continuation. The code at hand won't
+      -- even see this. But if we wait until simplCont to do case elimination,
+      -- we may miss the chance to match a value against a more interesting
+      -- continuation. It will be found in the next iteration, but this seems
+      -- likely to make several iterations often necessary (whereas the GHC
+      -- simplifier rarely even takes more than two iterations).
+      | is_plain_seq = valueOkForSideEffects val
+            -- The entire case is dead, so we can drop it,
+            -- _unless_ the scrutinee has side effects
+      | otherwise    = ok_for_spec
+            -- The case-binder is alive, but we may be able
+            -- turn the case into a let, if the expression is ok-for-spec
+            -- See Note [Case elimination: unlifted case]
+ 
+    -- Same objection as above applies. valueOkForSideEffects and
+    -- valueOkForSpeculation are almost never true unless the value is a
+    -- Compute, which is not typical.
+    ok_for_spec      = valueOkForSpeculation val
+    is_plain_seq     = isDeadBinder case_bndr -- Evaluation *only* for effect
+ 
+    case_bndr_evald_next :: SeqCoreCommand -> Bool
+      -- See Note [Case binder next]
+    case_bndr_evald_next (Command [] (Var v) _) = v == case_bndr
+    case_bndr_evald_next _                      = False
+      -- Could allow for let bindings,
+      -- but the original code in Simplify suggests doing so would be expensive
+
+simplCut2 env_v (Cons ctor args) env_k cont
   = do
     (env_v', args') <- mapAccumLM simplValue env_v args
     simplContWith (env_v' `setStaticPart` env_k) (Cons ctor args') cont
-simplCut env_v (Compute c) env_k cont
+simplCut2 env_v (Compute c) env_k cont
   = simplCommand (bindCont env_v env_k cont) c
+simplCut2 env_v val@(Lit {}) env_k cont
+  = simplContWith (env_v `setStaticPart` env_k) val cont
+simplCut2 env_v val@(Var {}) env_k cont
+  = simplContWith (env_v `setStaticPart` env_k) val cont
 
 -- TODO Somehow handle updating Definitions with NotAmong values?
 matchCase :: SimplEnv -> InValue -> [InAlt]
           -> Maybe ([(InVar, InValue)], InCommand)
--- TODO First, handle variables with substitutions/unfoldings
+-- Note that we assume that any variable whose definition is a case-able value
+-- has already been inlined by callSiteInline. So we don't check variables at
+-- all here. GHC instead relies on CoreSubst.exprIsConApp_maybe to work this out
+-- (before call-site inlining is even considered). I think GHC effectively
+-- decides it's *always* a good idea to inline a known constructor being cased,
+-- code size be damned, which seems pretty defensible given how these things
+-- tend to cascade.
 matchCase _env_v (Lit lit) (Alt (LitAlt lit') xs body : _alts)
   | assert (null xs) True
   , lit == lit'
@@ -365,8 +451,8 @@ matchCase _env_v (Cons ctor args) (Alt (DataAlt ctor') xs body : _alts)
     valArgs = filter (not . isTypeValue) args
 matchCase env_v val (Alt DEFAULT xs body : alts)
   | assert (null xs) True
-  , Nothing <- matchCase env_v val alts
-  = Just ([], body)
+  , valueIsHNF env_v val -- case is strict; don't match if not evaluated
+  = Just $ matchCase env_v val alts `orElse` ([], body)
 matchCase env_v val (_ : alts)
   = matchCase env_v val alts
 matchCase _ _ []
@@ -402,7 +488,6 @@ simplCont env cont
       -- TODO Simplify coercions
       = go env cont (kc . Cast co)
     go env (Case x ty alts cont) kc
-      -- TODO A whole lot - cases are important
       = do
         (env', cont', x') <- consider env cont
         alts' <- mapM (doCase env') alts
@@ -524,7 +609,7 @@ postInlineUnconditionally _env x v level
 
 -- Heavily based on section 7 of the Secrets paper (JFP version)
 callSiteInline :: SimplEnv -> InVar -> InCont
-               -> SimplM (Maybe InValue)
+               -> SimplM (Maybe OutValue)
 callSiteInline env_v x cont
   = do
     ans <- go <$> getMode <*> getDynFlags
@@ -556,6 +641,8 @@ shouldInline env rhs occ level guid cont
 someBenefit :: SimplEnv -> OutValue -> TopLevelFlag -> InCont -> Bool
 someBenefit env rhs level cont
   | Cons {} <- rhs, Case {} <- cont
+  = True
+  | Lit {} <- rhs, Case {} <- cont
   = True
   | Lam {} <- rhs
   = consider xs args
@@ -611,9 +698,7 @@ smallEnough env _val (Sometimes bodySize argWeights resWeight) cont
                          = resWeight
                          | otherwise = 0
 
-    isEvald (Var x)      = x `elemVarEnv` se_defs env
-    isEvald (Compute {}) = False
-    isEvald _            = True
+    isEvald val          = valueIsHNF env val
 
     isCase (Case {})     = True
     isCase _             = False

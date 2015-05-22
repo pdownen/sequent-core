@@ -12,6 +12,9 @@ import Control.Applicative
 import Control.Monad
 import Control.Monad.IO.Class
 
+traceTicks :: Bool
+traceTicks = False
+
 newtype SimplM a = SimplM { unSimplM :: SimplGlobalEnv -> CoreM (a, SimplCount) }
 
 data SimplGlobalEnv
@@ -70,7 +73,7 @@ getMode = SimplM $ \genv -> withZeroCount $ return (sg_mode genv)
 tick, freeTick :: Tick -> SimplM ()
 tick t
   = SimplM $ \_ -> do
-      -- putMsg (text "TICK:" <+> ppr t)
+      when traceTicks $ putMsg (text "TICK:" <+> ppr t)
       dflags <- getDynFlags
       let count = doSimplTick dflags t (zeroSimplCount dflags)
       return ((), count)
