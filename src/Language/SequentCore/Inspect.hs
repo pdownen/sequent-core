@@ -41,7 +41,7 @@ install opts todos =
      -- This puts the dump pass at the beginning of the pipeline, before any
      -- optimization. To see the post-optimizer state, put 'newPass' at the back
      -- of the list instead.
-     return $ todos
+     return $ newPass : todos
   where
     newPass  = CoreDoPluginPass "sequent-core-inspect" passFunc
     passFunc = sequentPass (inspectSequentCore opts)
