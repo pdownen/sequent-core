@@ -12,16 +12,16 @@ module Language.SequentCore.Syntax (
   SeqCoreValue, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreBndr,
     SeqCoreAlt,
   -- * Constructors
-  mkCommand, valueCommand, varCommand, mkCompute, lambdas, addLets, addNonRec,
+  mkCommand, mkCompute, addLets, addNonRec,
   -- * Deconstructors
-  collectLambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs,
+  lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs,
   partitionTypes, isLambda,
   isValueArg, isTypeValue, isCoValue, isErasedValue, isRuntimeValue, isProperValue,
   isTrivial, isTrivialValue, isTrivialCont, isReturnCont,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
-  flattenBind, flattenBinds, bindersOf,
+  flattenBind, flattenBinds, bindersOf, bindersOfBinds,
   -- * Calculations
-  valueArity, valueType, contOuterType, commandType,
+  valueArity, valueType, contType,
   valueIsBottom, commandIsBottom,
   needsCaseBinding,
   valueOkForSpeculation, commandOkForSpeculation, contOkForSpeculation,
@@ -45,17 +45,18 @@ import Id        ( Id, isDataConWorkId, isDataConWorkId_maybe, isConLikeId
                  , idUnique, setIdUnique, isBottomingId )
 import IdInfo    ( IdDetails(..) )
 import Literal   ( Literal, isZeroLit, litIsTrivial, literalType )
-import Pair      ( pSnd )
+import Pair
 import PrimOp    ( PrimOp(..), primOpOkForSpeculation, primOpOkForSideEffects
                  , primOpIsCheap )
 import TyCon
-import Type      ( Type, KindOrType, isTyVar )
+import Type      ( Type, KindOrType )
 import qualified Type
 import TysPrim
 import Unique    ( newTagUnique, unpkUnique )
 import Var       ( Var, isId )
 import VarEnv
 
+import Control.Exception ( assert )
 import Data.Maybe
 
 --------------------------------------------------------------------------------
@@ -69,14 +70,15 @@ import Data.Maybe
 data Value b    = Lit Literal       -- ^ A primitive literal value.
                 | Var Id            -- ^ A term variable. Must /not/ be a
                                     -- nullary constructor; use 'Cons' for this.
-                | Lam b (Command b) -- ^ A function. Binds both an argument and
+                | Lam [b] b (Command b)
+                                    -- ^ A function. Binds some arguments and
                                     -- a continuation. The body is a command.
                 | Cons DataCon [Value b]
                                     -- ^ A value formed by a saturated
                                     -- constructor application.
-                | Compute (Command b)
+                | Compute b (Command b)
                                     -- ^ A value produced by a computation.
-                                    -- Binds the current continuation.
+                                    -- Binds a continuation.
                 | Type Type         -- ^ A type. Used to pass a type as an
                                     -- argument to a type-level lambda.
                 | Coercion Coercion -- ^ A coercion. Used to pass evidence
@@ -89,16 +91,14 @@ data Value b    = Lit Literal       -- ^ A primitive literal value.
 -- value with a continuation.
 data Cont b     = App  {- expr -} (Value b) (Cont b)
                   -- ^ Apply the value to an argument.
-                | Case {- expr -} b Type [Alt b] (Cont b)
+                | Case {- expr -} b Type [Alt b]
                   -- ^ Perform case analysis on the value.
                 | Cast {- expr -} Coercion (Cont b)
                   -- ^ Cast the value using the given coercion.
                 | Tick (Tickish Id) {- expr -} (Cont b)
                   -- ^ Annotate the enclosed frame. Used by the profiler.
-                | Jump ContId
+                | Return ContId
                   -- ^ Reference to a bound continuation.
-                | Return
-                  -- ^ Top-level continuation.
 
 -- | The identifier for a covariable, which is like a variable but it binds a
 -- continuation.
@@ -163,36 +163,24 @@ mkCommand binds val@(Var f) cont
       | otherwise
       = asSaturatedCall val cont
 
-mkCommand binds (Compute (Command { cmdLet = binds'
-                                  , cmdValue = val'
-                                  , cmdCont = Return {} })) cont
+mkCommand binds (Compute kbndr (Command { cmdLet = binds'
+                                        , cmdValue = val'
+                                        , cmdCont = Return kid })) cont
+  | identifier kbndr == kid
   = mkCommand (binds ++ binds') val' cont
 
 mkCommand binds val cont
   = Command { cmdLet = binds, cmdValue = val, cmdCont = cont }
 
--- | Constructs a command that simply returns a value. If the value is a
--- computation, returns that computation instead.
-valueCommand :: Value b -> Command b
-valueCommand (Compute c) = c
-valueCommand v = Command { cmdLet = [], cmdValue = v, cmdCont = Return }
-
--- | Constructs a command that simply returns a variable.
-varCommand :: Id -> Command b
-varCommand x = valueCommand (Var x)
-
-mkCompute :: Command b -> Value b
--- | Wraps a command in a value using 'Compute'. If the command is a value
--- command (see 'asValueCommand'), unwraps it instead.
-mkCompute comm
-  | Just val <- asValueCommand comm
+mkCompute :: HasId b => b -> Command b -> Value b
+-- | Wraps a command that returns to the given continuation id in a value using
+-- 'Compute'. If the command is a value command (see 'asValueCommand'), unwraps
+-- it instead.
+mkCompute k comm
+  | Just val <- asValueCommand (identifier k) comm
   = val
   | otherwise
-  = Compute comm
-
--- | Constructs a number of lambdas surrounding a function body.
-lambdas :: [b] -> Command b -> Value b
-lambdas xs body = mkCompute $ foldr (\x c -> valueCommand (Lam x c)) body xs
+  = Compute k comm
 
 -- | Adds the given bindings outside those in the given command.
 addLets :: [Bind b] -> Command b -> Command b
@@ -204,7 +192,7 @@ addLets bs c = c { cmdLet = bs ++ cmdLet c }
 addNonRec :: HasId b => b -> Value b -> Command b -> Command b
 addNonRec bndr rhs comm
   | needsCaseBinding (idType (identifier bndr)) rhs
-  = mkCommand [] rhs (Case bndr (valueType rhs) [Alt DEFAULT [] comm] Return)
+  = mkCommand [] rhs (Case bndr (valueType rhs) [Alt DEFAULT [] comm])
   | otherwise
   = addLets [NonRec bndr rhs] comm
 
@@ -212,17 +200,9 @@ addNonRec bndr rhs comm
 -- Deconstructors
 --------------------------------------------------------------------------------
 
--- | Divide a value into a sequence of lambdas and a body. If @c@ is not a
--- lambda, then @collectLambdas v == ([], valueCommand v)@.
-collectLambdas :: Value b -> ([b], Command b)
-collectLambdas (Lam x c)
-  | Just v <- asValueCommand c
-  = let (xs, c') = collectLambdas v 
-    in (x : xs, c')
-  | otherwise
-  = ([x], c)
-collectLambdas v
-  = ([], valueCommand v)
+lambdas :: Value b -> ([b], Maybe (b, Command b))
+lambdas (Lam xs k body) = (xs, Just (k, body))
+lambdas _               = ([], Nothing)
 
 -- | Divide a continuation into a sequence of arguments and an outer
 -- continuation. If @k@ is not an application continuation, then
@@ -318,12 +298,11 @@ isTrivial c
 -- body is non-trivial is also non-trivial.
 isTrivialValue :: HasId b => Value b -> Bool
 isTrivialValue (Lit l)     = litIsTrivial l
-isTrivialValue (Lam x c)   = not (isRuntimeVar (identifier x)) && isTrivial c
-isTrivialValue (Compute _) = False
-isTrivialValue (Cont k)
-  = case k of
-      Return              -> True
-      Jump _              -> True
+isTrivialValue (Lam xs _ c)= not (any (isRuntimeVar . identifier) xs) && isTrivial c
+isTrivialValue (Compute _ _) = False
+isTrivialValue (Cont cont)
+  = case cont of
+      Return _            -> True
       _                   -> False
 isTrivialValue _           = True
 
@@ -332,15 +311,15 @@ isTrivialValue _           = True
 -- coercions). Ticks are not considered trivial, since this would cause them to
 -- be inlined.
 isTrivialCont :: Cont b -> Bool
-isTrivialCont Return     = True
+isTrivialCont (Return _) = True
 isTrivialCont (Cast _ k) = isTrivialCont k
 isTrivialCont (App v k)  = isErasedValue v && isTrivialCont k
 isTrivialCont _          = False
 
--- | True if the given continuation is the return continuation, 'Return'.
+-- | True if the given continuation is a return continuation, @Return _@.
 isReturnCont :: Cont b -> Bool
-isReturnCont Return = True
-isReturnCont _      = False
+isReturnCont (Return _) = True
+isReturnCont _          = False
 
 -- | If a command represents a saturated call to some function, splits it into
 -- the function, the arguments, and the remaining continuation after the
@@ -366,11 +345,13 @@ asSaturatedCall val cont
     arity = valueArity val
     (args, others) = collectArgs cont
 
--- | If a command does nothing but provide a value, returns that value.
-asValueCommand :: Command b -> Maybe (Value b)
-asValueCommand (Command { cmdLet = [], cmdValue = v, cmdCont = Return })
+-- | If a command does nothing but provide a value to the given continuation id,
+-- returns that value.
+asValueCommand :: ContId -> Command b -> Maybe (Value b)
+asValueCommand k (Command { cmdLet = [], cmdValue = v, cmdCont = Return k' })
+  | k == k'
   = Just v
-asValueCommand _
+asValueCommand _ _
   = Nothing
 
 flattenBind :: Bind b -> [(b, Value b)]
@@ -384,6 +365,9 @@ bindersOf :: Bind b -> [b]
 bindersOf (NonRec bndr _) = [bndr]
 bindersOf (Rec pairs) = map fst pairs
 
+bindersOfBinds :: [Bind b] -> [b]
+bindersOfBinds = concatMap bindersOf
+
 --------------------------------------------------------------------------------
 -- Calculations
 --------------------------------------------------------------------------------
@@ -392,49 +376,43 @@ bindersOf (Rec pairs) = map fst pairs
 valueType :: HasId b => Value b -> Type
 valueType (Lit l)        = literalType l
 valueType (Var x)        = idType x
-valueType (Lam b c)      = idType (identifier b) `Type.mkFunTy` commandType c
+valueType (Lam xs k _)   = Type.mkPiTypes (map identifier xs) retTy
+  where
+    retTy = Type.funArgTy (idType (identifier k))
 valueType (Cons con as)  = res_ty
   where
     (tys, _) = partitionTypes as
     (_, res_ty) = Type.splitFunTys (dataConRepType con `Type.applyTys` tys)
-valueType (Compute c)    = commandType c
+valueType (Compute k _)  = idType (identifier k)
 -- see exprType in GHC CoreUtils
 valueType _other         = alphaTy
 
--- | Compute the outer type of a continuation, that is, the type of the value it
--- eventually yields to the environment. Requires the inner type as an argument.
-contOuterType :: HasId b => Type -> Cont b -> Type
-contOuterType ty k@App {}        = contOuterType res_ty k'
-  where
-    (tys, _, k') = collectTypeAndOtherArgs k
-    (_, res_ty)  = Type.splitFunTys (ty `Type.applyTys` tys)
-contOuterType _  (Case _ ty _ k) = contOuterType ty k
-contOuterType _  (Cast co k)     = contOuterType (pSnd $ coercionKind co) k
-contOuterType ty (Tick _ k)      = contOuterType ty k
-contOuterType _  (Jump x)        = snd $ Type.splitFunTy (idType x)
-contOuterType ty Return          = ty
+-- | Compute the type a continuation accepts. IMPORTANT: This is *not* the type
+-- that a cont identifier will be assigned; for compatibility with Core, a
+-- ContId's type is a function type from the accepted type to the type of the
+-- continuation's static context.
+contType :: HasId b => Cont b -> Type
+contType (Return k)   = Type.funArgTy (idType k)
+contType (App arg k)  = Type.mkFunTy (valueType arg) (contType k)
+contType (Cast co k)  = let Pair fromTy toTy = coercionKind co
+                        in assert (toTy `Type.eqType` contType k) fromTy
+contType (Case b _ _) = idType (identifier b)
+contType (Tick _ k)   = contType k
 
--- | Compute the type that a command yields to its outer context.
-commandType :: HasId b => Command b -> Type
-commandType Command { cmdValue = v, cmdCont = k }
-  = contOuterType (valueType v) k
-
--- | Compute (a conservative estimate of) the arity of a value. If the value is
--- a variable, this may be a lower bound.
+-- | Compute (a conservative estimate of) the arity of a value.
 valueArity :: HasId b => Value b -> Int
 valueArity (Var x)
   | isId x = idArity x
-valueArity v@Lam {}
-  = let (xs, _) = collectLambdas v
-    in length (dropWhile (isTyVar . identifier) xs)
+valueArity (Lam bndrs _kbndr _)
+  = length bndrs
 valueArity _
   = 0
 
 -- | Find whether an expression is definitely bottom.
 valueIsBottom :: Value b -> Bool
-valueIsBottom (Var x)     = isBottomingId x && idArity x == 0
-valueIsBottom (Compute c) = commandIsBottom c
-valueIsBottom _           = False
+valueIsBottom (Var x)       = isBottomingId x && idArity x == 0
+valueIsBottom (Compute _ c) = commandIsBottom c
+valueIsBottom _             = False
 
 -- | Find whether a command definitely evaluates to bottom.
 commandIsBottom :: Command b -> Bool
@@ -469,9 +447,9 @@ contOkForSpeculation = contOk primOpOkForSpeculation
 contOkForSideEffects = contOk primOpOkForSideEffects
 
 valOk :: (PrimOp -> Bool) -> Value b -> Bool
-valOk primOpOk (Var id)       = appOk primOpOk id []
-valOk primOpOk (Compute comm) = commOk primOpOk comm
-valOk _ _                     = True
+valOk primOpOk (Var id)         = appOk primOpOk id []
+valOk primOpOk (Compute _ comm) = commOk primOpOk comm
+valOk _ _                       = True
 
 commOk :: (PrimOp -> Bool) -> Command b -> Bool
 commOk primOpOk (Command { cmdLet = binds, cmdValue = val, cmdCont = cont })
@@ -485,13 +463,11 @@ cutOk primOpOk val cont
   = valOk primOpOk val && contOk primOpOk cont
 
 contOk :: (PrimOp -> Bool) -> Cont b -> Bool
-contOk _        Return    = True
-contOk _        (Jump _)  = False -- TODO Should look at unfolding??
+contOk _        (Return _)= False -- TODO Should look at unfolding??
 contOk _        (App _ _) = False
-contOk primOpOk (Case _bndr _ty alts cont)
+contOk primOpOk (Case _bndr _ty alts)
   =  all (\(Alt _ _ rhs) -> commOk primOpOk rhs) alts
   && altsAreExhaustive
-  && contOk primOpOk cont
   where
     altsAreExhaustive
       | (Alt con1 _ _ : _) <- alts
@@ -553,22 +529,20 @@ valCheap _        (Var _)      = True
 valCheap _        (Type _)     = True
 valCheap _        (Coercion _) = True
 valCheap _        (Cons _ _)   = True
-valCheap appCheap (Lam x comm) = isRuntimeVar (identifier x)
-                               || commCheap appCheap comm
-valCheap appCheap (Compute c)  = commCheap appCheap c
+valCheap appCheap (Lam xs _ c) = any (isRuntimeVar . identifier) xs
+                               || commCheap appCheap c
+valCheap appCheap (Compute _ c)= commCheap appCheap c
 valCheap appCheap (Cont cont)  = contCheap appCheap cont
 
 contCheap :: HasId b => CheapMeasure -> Cont b -> Bool
-contCheap _         Return              = True
-contCheap _        (Jump _)             = True
-contCheap appCheap (Case _ _ alts cont) = contCheap appCheap cont
-                                        && and [ commCheap appCheap rhs
-                                               | Alt _ _ rhs <- alts ]
-contCheap appCheap (Cast _ cont)        = contCheap appCheap cont
-contCheap appCheap (Tick ti cont)       = not (tickishCounts ti)
-                                        && contCheap appCheap cont
-contCheap appCheap (App arg cont)       = isErasedValue arg
-                                        && contCheap appCheap cont
+contCheap _        (Return _)      = True
+contCheap appCheap (Case _ _ alts) = all (\(Alt _ _ rhs) -> commCheap appCheap rhs)
+                                         alts
+contCheap appCheap (Cast _ cont)   = contCheap appCheap cont
+contCheap appCheap (Tick ti cont)  = not (tickishCounts ti)
+                                   && contCheap appCheap cont
+contCheap appCheap (App arg cont)  = isErasedValue arg
+                                   && contCheap appCheap cont
 
 commCheap :: HasId b => CheapMeasure -> Command b -> Bool
 commCheap appCheap (Command { cmdLet = binds, cmdValue = val, cmdCont = cont})
@@ -680,16 +654,17 @@ emptyAlphaEnv = mkRnEnv2 emptyInScopeSet
 instance HasId b => AlphaEq (Value b) where
   aeqIn _ (Lit l1) (Lit l2)
     = l1 == l2
-  aeqIn env (Lam b1 c1) (Lam b2 c2)
-    = aeqIn (rnBndr2 env (identifier b1) (identifier b2)) c1 c2
+  aeqIn env (Lam bs1 k1 c1) (Lam bs2 k2 c2)
+    = aeqIn (rnBndrs2 env' (map identifier bs1) (map identifier bs2)) c1 c2
+    where env' = rnBndr2 env (identifier k1) (identifier k2)
   aeqIn env (Type t1) (Type t2)
     = aeqIn env t1 t2
   aeqIn env (Coercion co1) (Coercion co2)
     = aeqIn env co1 co2
   aeqIn env (Var x1) (Var x2)
     = env `rnOccL` x1 == env `rnOccR` x2
-  aeqIn env (Compute c1) (Compute c2)
-    = aeqIn env c1 c2
+  aeqIn env (Compute k1 c1) (Compute k2 c2)
+    = aeqIn (rnBndr2 env (identifier k1) (identifier k2)) c1 c2
   aeqIn env (Cont k1) (Cont k2)
     = aeqIn env k1 k2
   aeqIn _ _ _
@@ -698,17 +673,15 @@ instance HasId b => AlphaEq (Value b) where
 instance HasId b => AlphaEq (Cont b) where
   aeqIn env (App c1 k1) (App c2 k2)
     = aeqIn env c1 c2 && aeqIn env k1 k2
-  aeqIn env (Case x1 t1 as1 k1) (Case x2 t2 as2 k2)
-    = aeqIn env' t1 t2 && aeqIn env' as1 as2 && aeqIn env' k1 k2
+  aeqIn env (Case x1 t1 as1) (Case x2 t2 as2)
+    = aeqIn env' t1 t2 && aeqIn env' as1 as2
       where env' = rnBndr2 env (identifier x1) (identifier x2)
   aeqIn env (Cast co1 k1) (Cast co2 k2)
     = aeqIn env co1 co2 && aeqIn env k1 k2
   aeqIn env (Tick ti1 k1) (Tick ti2 k2)
     = ti1 == ti2 && aeqIn env k1 k2
-  aeqIn env (Jump x1) (Jump x2)
+  aeqIn env (Return x1) (Return x2)
     = env `rnOccL` x1 == env `rnOccR` x2
-  aeqIn _ Return Return
-    = True
   aeqIn _ _ _
     = False
 

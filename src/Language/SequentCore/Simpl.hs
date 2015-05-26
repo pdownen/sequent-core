@@ -22,8 +22,8 @@ import Language.SequentCore.Translate
 import BasicTypes
 import Coercion    ( isCoVar )
 import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
-                     CoreM, defaultPlugin, reinitializeGlobals, errorMsg,
-                     isZeroSimplCount, putMsg
+                     CoreM, defaultPlugin, reinitializeGlobals,
+                     isZeroSimplCount, pprSimplCount, putMsg, errorMsg
                    )
 import CoreSyn     ( isRuntimeVar, isCheapUnfolding )
 import CoreUnfold  ( smallEnoughToInline )
@@ -35,14 +35,14 @@ import Maybes
 import MonadUtils  ( mapAccumLM )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
-import Type        ( Type, isUnLiftedType )
+import Type        ( Type, funArgTy, isUnLiftedType, mkFunTy )
 import Var
 import VarEnv
 import VarSet
 
 import Control.Applicative ( (<$>), (<*>) )
 import Control.Exception   ( assert )
-import Control.Monad       ( when, foldM )
+import Control.Monad       ( foldM, forM, when )
 
 tracing :: Bool
 tracing = False
@@ -85,7 +85,7 @@ runSimplifier iters mode guts
             mod       = mg_module guts
             coreBinds = mg_binds guts
             occBinds  = runOccurAnal mod coreBinds
-            binds     = fromCoreBinds occBinds
+            binds     = fromCoreModule occBinds
         when tracing $ putMsg  $ text "BEFORE" <+> int n
                               $$ text "--------" $$ pprTopLevelBinds binds
         (binds', count) <- runSimplM globalEnv $ simplModule binds
@@ -93,7 +93,9 @@ runSimplifier iters mode guts
                               $$ text "-------" $$ pprTopLevelBinds binds'
         let coreBinds' = bindsToCore binds'
             guts'      = guts { mg_binds = coreBinds' }
-        when tracing $ putMsg  $ text "CORE AFTER" <+> int n
+        when tracing $ putMsg  $ text "SUMMARY" <+> int n
+                              $$ text "---------" $$ pprSimplCount count
+                              $$ text "CORE AFTER" <+> int n
                               $$ text "------------" $$ ppr coreBinds'
         if isZeroSimplCount count
           then do
@@ -132,21 +134,26 @@ simplValueNoFloats :: SimplEnv -> InValue -> SimplM OutValue
 simplValueNoFloats env val
   = do
     (env', val') <- simplValue (zapFloats env) val
-    return $ wrapFloatsAroundValue env' val'
+    wrapFloatsAroundValue env' val'
 
 simplValue :: SimplEnv -> InValue -> SimplM (SimplEnv, OutValue)
 simplValue _env (Cont {})
   = panic "simplValue"
+simplValue env (Compute k (Command [] val (Return k')))
+  | k == k'
+  = simplValue env val
 simplValue env v
   = do
-    (env'', comm) <- simplCut env' v (staticPart env') Return
-    return (env'', mkCompute comm)
-  where env' = zapCont env
+    (env', k) <- mkFreshContId env (fsLit "valk") (mkFunTy ty ty)
+    let env'' = zapFloats $ setCont env' k
+    (env''', comm) <- simplCut env'' v (staticPart env'') (Return k)
+    return (env `addFloats` env''', mkCompute k comm)
+  where ty = substTy env (valueType v)
 
 simplBinds :: SimplEnv -> [InBind] -> TopLevelFlag
            -> SimplM SimplEnv
 simplBinds env bs level
-  = foldM (\env b -> simplBind env (staticPart env) b level) env bs
+  = foldM (\env' b -> simplBind env' (staticPart env') b level) env bs
 
 simplBind :: SimplEnv -> StaticEnv -> InBind -> TopLevelFlag
           -> SimplM SimplEnv
@@ -201,7 +208,7 @@ simplLazyBind env_x x x' env_v v level isRec
                <- if not (doFloatFromRhs level NonRecursive False (Cont cont') env_v'')
                      then do -- Not floating past here, so wrap RHS and discard 
                              -- its environment
-                             cont'' <- wrapFloatsAroundCont env_v'' (idType x) cont'
+                             cont'' <- wrapFloatsAroundCont env_v'' (idType x') cont'
                              return (env_x, Cont cont'')
                      else do -- Float up from the RHS by adding floats to the
                              -- outer environment
@@ -215,35 +222,38 @@ simplLazyBind env_x x x' env_v v level isRec
              -- TODO Something like Simplify.prepareRhs
              (env_x', v'')
                <- if not (doFloatFromRhs level NonRecursive False v' env_v'')
-                     then return (env_x, wrapFloatsAroundValue env_v'' v')
+                     then do v'' <- wrapFloatsAroundValue env_v'' v'
+                             return (env_x, v'')
                      else do tick LetFloatFromLet
                              return (addFloats env_x env_v'', v')
              completeBind env_x' x x' v'' level
 
 wrapFloatsAroundCont :: SimplEnv -> Type -> OutCont -> SimplM OutCont
-wrapFloatsAroundCont env inTy cont
+wrapFloatsAroundCont env ty cont
   | isEmptyFloats env
   = return cont
   | otherwise
-  -- Remember, all nontrivial continuations are strict contexts. Therefore it's
-  -- always okay to rewrite
+  -- Remember, most nontrivial continuations are strict contexts. Therefore it's
+  -- okay to rewrite
   --   E ==> case of [ a -> <a | E> ]
-  -- *except* for E = Return. However, we only call this when something's being
-  -- floated from a continuation, and it seems unlikely we'd be floating a let
-  -- from a Return.
+  -- *except* when E is a Return or (less commonly) some Casts or Ticks before a
+  -- Return. However, we only call this when something's being floated from a
+  -- continuation, and it seems unlikely we'd be floating a let from a Return.
   = do
-    id <- mkSysLocalM (fsLit "$in") inTy
-    let comm = wrapFloats env (mkCommand [] (Var id) cont)
-    return $ Case id inTy [Alt DEFAULT [] comm] Return
+    (env', id) <- mkFreshContId env (fsLit "$in") ty
+    let comm = wrapFloats env' (mkCommand [] (Var id) cont)
+    return $ Case id (funArgTy ty) [Alt DEFAULT [] comm]
 
-wrapFloatsAroundValue :: SimplEnv -> OutValue -> OutValue
+wrapFloatsAroundValue :: SimplEnv -> OutValue -> SimplM OutValue
 wrapFloatsAroundValue env val
   | isEmptyFloats env
-  = val
+  = return val
   | not (isProperValue val)
-  = panic "wrapFloatsAroundValue"
-wrapFloatsAroundValue env val
-  = mkCompute $ wrapFloats env (valueCommand val)
+  = pprPanic "wrapFloatsAroundValue" (ppr val)
+  | otherwise
+  = do
+    k <- asContId <$> mkSysLocalM (fsLit "wrapk") (valueType val)
+    return $ mkCompute k $ wrapFloats env (mkCommand [] val (Return k))
 
 completeBind :: SimplEnv -> InVar -> OutVar -> OutValue -> TopLevelFlag
              -> SimplM SimplEnv
@@ -319,32 +329,32 @@ simplCut2 :: SimplEnv -> OutValue -> StaticEnv -> InCont
 simplCut2 env_v (Type ty) _env_k cont
   = assert (isReturnCont cont) $
     let ty' = substTy env_v ty
-    in return (env_v, valueCommand (Type ty'))
+    in return (env_v, Command [] (Type ty') cont)
 simplCut2 env_v (Coercion co) _env_k cont
   = assert (isReturnCont cont) $
     let co' = substCo env_v co
-    in return (env_v, valueCommand (Coercion co'))
+    in return (env_v, Command [] (Coercion co') cont)
 simplCut2 _env_v (Cont {}) _env_k _cont
   = panic "simplCut of cont"
-simplCut2 env_v (Lam x c) env_k (App arg cont)
+simplCut2 env_v (Lam xs k c) env_k cont@(App {})
   = do
-    tick (BetaReduction x)
-    env_v' <- simplNonRec env_v x env_k arg NotTopLevel
-    -- Effectively, here we bind the covariable in the lambda to the current
-    -- continuation before proceeding
-    simplCommand (bindCont env_v' env_k cont) c
-simplCut2 env_v (Lam x c) env_k cont
+    tick (BetaReduction (head xs))
+    let (args, cont') = collectArgs cont
+    env_v' <- foldM (\env (x, arg) -> simplNonRec env x env_k arg NotTopLevel)
+                env_v (zip xs args)
+    simplCommand (bindContAs env_v' k env_k cont') c
+simplCut2 env_v (Lam xs k c) env_k cont
   = do
-    let (env_v', x') = enterScope env_v x
+    let (env_v', k' : xs') = enterScopes env_v (k : xs)
     c' <- simplCommandNoFloats (zapCont env_v') c
-    simplContWith (env_v' `setStaticPart` env_k) (Lam x' c') cont
-simplCut2 env_v val env_k (Case x _ alts cont)
+    simplContWith (env_v' `setStaticPart` env_k) (Lam xs' k' c') cont
+simplCut2 env_v val env_k (Case x _ alts)
   | isManifestValue val
   , Just (pairs, body) <- matchCase env_v val alts
   = do
     tick (KnownBranch x)
     env' <- foldM doPair (env_v `setStaticPart` env_k) ((x, val) : pairs)
-    simplCommand (env' `pushCont` cont) body
+    simplCommand env' body
   where
     isManifestValue (Lit {})  = True
     isManifestValue (Cons {}) = True
@@ -355,7 +365,7 @@ simplCut2 env_v val env_k (Case x _ alts cont)
 
 -- Adapted from Simplify.rebuildCase (clause 2)
 -- See [Case elimination] in Simplify
-simplCut2 env_v val env_k (Case case_bndr ty [Alt _ bndrs rhs] cont)
+simplCut2 env_v val env_k (Case case_bndr ty [Alt _ bndrs rhs])
  | all isDeadBinder bndrs       -- bndrs are [InId]
  
  , if isUnLiftedType ty
@@ -367,7 +377,7 @@ simplCut2 env_v val env_k (Case case_bndr ty [Alt _ bndrs rhs] cont)
           tick (CaseElim case_bndr)
         ; env' <- simplNonRec (env_v `setStaticPart` env_k)
                     case_bndr (staticPart env_v) val NotTopLevel
-        ; simplCommand (env' `pushCont` cont) rhs }
+        ; simplCommand env' rhs }
   where
     elim_lifted   -- See Note [Case elimination: lifted case]
       = valueIsHNF env_v val
@@ -420,8 +430,8 @@ simplCut2 env_v (Cons ctor args) env_k cont
   = do
     (env_v', args') <- mapAccumLM simplValue env_v args
     simplContWith (env_v' `setStaticPart` env_k) (Cons ctor args') cont
-simplCut2 env_v (Compute c) env_k cont
-  = simplCommand (bindCont env_v env_k cont) c
+simplCut2 env_v (Compute k c) env_k cont
+  = simplCommand (bindContAs env_v k env_k cont) c
 simplCut2 env_v val@(Lit {}) env_k cont
   = simplContWith (env_v `setStaticPart` env_k) val cont
 simplCut2 env_v val@(Var {}) env_k cont
@@ -487,51 +497,27 @@ simplCont env cont
     go env (Cast co cont) kc
       -- TODO Simplify coercions
       = go env cont (kc . Cast co)
-    go env (Case x ty alts cont) kc
+    go env (Case x ty alts) kc
       = do
-        (env', cont', x') <- consider env cont
-        alts' <- mapM (doCase env') alts
-        go env cont' (kc . Case x' (substTy env ty) alts')
-      where
-        consider env cont@(Jump {})
-          = do
-            -- This is a "mu_beta-reduction", where the binder is the implicit
-            -- one for the current continuation. We make up an id for this.
-            currentContId <-
-              asContId <$> mkSysLocalM (fsLit "$currentCont") (substTy env ty)
-            tick (BetaReduction currentContId)
-            consider (bindCont env (staticPart env) cont) Return
-        consider env (Case x2 ty2 alts2 cont2)
-          = do
-            tick (CaseOfCase x2)
-            consider (bindCont env (staticPart env) (Case x2 ty2 alts2 Return))
-                       cont2
-        consider env cont
-          = let (env', x') = enterScope env x
-            in return (env', cont, x')
-        doCase env' (Alt con xs c)
-          = do
-            let (env'', xs') = enterScopes env' xs
-            c' <- simplCommandNoFloats env'' c
-            return $ Alt con xs' c'
+        let (env', x') = enterScope env x
+        alts' <- forM alts $ \(Alt con xs c) -> do
+          let (env'', xs') = enterScopes env' xs
+          c' <- simplCommandNoFloats env'' c
+          return $ Alt con xs' c'
+        return (env, kc (Case x' (substTy env ty) alts'))
     go env (Tick ti cont) kc
       = go env cont (kc . Tick ti)
-    go env (Jump x) kc
+    go env (Return x) kc
       -- TODO Consider call-site inline
       = case substId env x of
           DoneId x'
-            -> return (env, kc (Jump x'))
+            -> return (env, kc (Return x'))
           DoneVal (Cont k)
             -> go (zapSubstEnvs env) k kc
           SuspVal stat (Cont k)
             -> go (env `setStaticPart` stat) k kc
           _
-            -> panic "jump to non-continuation"
-    go env Return kc
-      | Just (env', cont) <- restoreEnv env
-      = go env' cont kc
-      | otherwise
-      = return (env, kc Return)
+            -> panic "return to non-continuation"
 
 simplContWith :: SimplEnv -> OutValue -> InCont -> SimplM (SimplEnv, OutCommand)
 simplContWith env val cont
@@ -566,13 +552,14 @@ preInlineUnconditionally _env_x x _env_rhs rhs level
         try_once inLam intCxt
           | not inLam = isNotTopLevel level || early_phase
           | otherwise = intCxt && canInlineValInLam rhs
-        canInlineInLam c
-          | Just v <- asValueCommand c  = canInlineValInLam v
-          | otherwise                   = False
-        canInlineValInLam (Lit _)       = True
-        canInlineValInLam (Lam x c)     = isRuntimeVar x || canInlineInLam c
-        canInlineValInLam (Compute c)   = canInlineInLam c
-        canInlineValInLam _             = False
+        canInlineInLam k c
+          | Just v <- asValueCommand k c = canInlineValInLam v
+          | otherwise                    = False
+        canInlineValInLam (Lit _)        = True
+        canInlineValInLam (Lam xs k c)   = any isRuntimeVar xs
+                                         || canInlineInLam k c
+        canInlineValInLam (Compute k c)  = canInlineInLam k c
+        canInlineValInLam _              = False
         early_phase = case sm_phase mode of
                         Phase 0 -> False
                         _       -> True
@@ -644,12 +631,11 @@ someBenefit env rhs level cont
   = True
   | Lit {} <- rhs, Case {} <- cont
   = True
-  | Lam {} <- rhs
+  | Lam xs _ _ <- rhs
   = consider xs args
   | otherwise
   = False
   where
-    (xs, _) = collectLambdas rhs
     (args, cont') = collectArgs cont
 
     -- See Secrets, section 7.2, for the someBenefit criteria

@@ -91,17 +91,14 @@ instance Outputable Expr where
 
 bodySize :: DynFlags -> Int -> [Id] -> Expr -> BodySize
 
-valueSize dflags cap val
-  = let (xs, body) = collectLambdas val
-        cap        = ufCreationThreshold dflags
-        valBinders = filter isId xs
-
+valueSize dflags cap (Lam xs _k body)
+  = let valBinders = filter isId xs
     in body2ExprSize valBinders $ bodySize dflags cap valBinders (C body)
+valueSize dflags cap val
+  = body2ExprSize [] $ bodySize dflags cap [] (V val)
 
 commandSize dflags cap comm
-  | Just v <- asValueCommand comm = valueSize dflags cap v
-  | otherwise                     = body2ExprSize [] $
-                                      bodySize dflags cap [] (C comm)
+  = body2ExprSize [] $ bodySize dflags cap [] (C comm)
 
 contSize dflags cap cont = body2ExprSize [] $ bodySize dflags cap [] (K cont)
 
@@ -111,23 +108,21 @@ bodySize dflags cap topArgs expr
     size (V (Type _))       = sizeZero
     size (V (Coercion _))   = sizeZero
     size (V (Var _))        = sizeZero -- invariant: not a nullary constructor
-    size (V (Compute comm)) = size (C comm)
+    size (V (Compute _ comm)) = size (C comm)
     size (V (Cont cont))    = size (K cont)
     size (V (Lit lit))      = sizeN (litSize lit)
     size (V (Cons dc args)) = sizeArgs args `addSizeNSD`
                               sizeCall (dataConWorkId dc) args voids
       where voids           = count isRealWorldValue args
-    size (V (Lam x comm))   | erased    = size (C comm)
+    size (V (Lam xs _ comm))| erased    = size (C comm)
                             | otherwise = lamScrutDiscount dflags (size (C comm))
-      where erased          = isId x && not (isRealWorldId x)
+      where erased          = all (\x -> not (isId x) || isRealWorldId x) xs
     
-    size (K Return)         = sizeZero
-    size (K (Jump _))       = sizeZero
+    size (K (Return _))     = sizeZero
     size (K (Cast _ cont))  = size (K cont)
     size (K (Tick _ cont))  = size (K cont)
     size (K (App arg cont)) = sizeArg arg `addSizeNSD` size (K cont)
-    size (K (Case _ _ alts cont))
-                            = sizeAlts alts `addSizeOfCont` cont
+    size (K (Case _ _ alts))= sizeAlts alts
 
     size (C comm)           = sizeLets (cmdLet comm) `addSizeNSD`
                               sizeCut (cmdValue comm) (cmdCont comm)
@@ -141,9 +136,9 @@ bodySize dflags cap topArgs expr
             voids         = count isRealWorldValue realArgs
         in sizeArgs realArgs `addSizeNSD` sizeCall f realArgs voids
                              `addSizeOfCont` cont'
-    sizeCut (Var x) (Case _b _ty alts cont')
+    sizeCut (Var x) (Case _b _ty alts)
       | x `elem` topArgs
-      = combineSizes total max `addSizeOfCont` cont'
+      = combineSizes total max
       where
         altSizes = map sizeAlt alts
         total    = foldr addAltSize sizeZero altSizes
@@ -164,7 +159,7 @@ bodySize dflags cap topArgs expr
     sizeArg arg = size (V arg)
 
     sizeArgs :: [SeqCoreValue] -> BodySize
-    sizeArgs args = foldr addSizeNSD sizeZero (map sizeArg args)
+    sizeArgs args = foldr (addSizeNSD . sizeArg) sizeZero args
 
     -- Lifted from CoreUnfold
     sizeCall :: Id -> [SeqCoreValue] -> Int -> BodySize
@@ -180,7 +175,7 @@ bodySize dflags cap topArgs expr
     sizeAlt (Alt _ _ rhs) = size (C rhs) `addSizeN` 10
 
     sizeAlts :: [SeqCoreAlt] -> BodySize
-    sizeAlts alts = foldr addAltSize sizeZero (map sizeAlt alts)
+    sizeAlts alts = foldr (addAltSize . sizeAlt) sizeZero alts
 
     sizeBind :: SeqCoreBind -> BodySize
     sizeBind (NonRec x rhs)
@@ -225,7 +220,7 @@ bodySize dflags cap topArgs expr
       | otherwise              = size1 `addSizeNSD` size (K cont)
 
     isPassThroughCont :: Cont b -> Bool
-    isPassThroughCont Return         = True
+    isPassThroughCont (Return _)     = True
     isPassThroughCont (Tick _ cont)  = isPassThroughCont cont
     isPassThroughCont (Cast _ cont)  = isPassThroughCont cont
     isPassThroughCont (App arg cont) = isErasedValue arg

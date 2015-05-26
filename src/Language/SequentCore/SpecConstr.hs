@@ -87,7 +87,7 @@ import Language.SequentCore.Translate
 
 import CoreMonad  ( CoreM
                   , Plugin(installCoreToDos), defaultPlugin
-                  , errorMsg
+                  , errorMsg, putMsg
                   , reinitializeGlobals
                   , CoreToDo(CoreDoSpecConstr, CoreDoPasses, CoreDoPluginPass) )
 import CoreUnfold ( couldBeSmallEnoughToInline )
@@ -106,6 +106,9 @@ import Control.Applicative  ( (<$>), (<|>) )
 import Control.Monad
 import Data.List            ( nubBy )
 import Data.Monoid
+
+tracing :: Bool
+tracing = False
 
 -- | Plugin data. The initialization code replaces the built-in SpecConstr pass
 -- in the Core-to-Core pipeline.
@@ -188,17 +191,17 @@ instance Monoid ScUsage where
     = ScUsage (plusVarEnv_C (++) calls1 calls2) (used1 `unionVarSet` used2)
 
 specInValue :: ScEnv -> SeqCoreValue -> CoreM (ScUsage, SeqCoreValue)
-specInValue env (Lam x c)
+specInValue env (Lam xs kb c)
   = do
     (usage, c') <- specInCommand env' c
-    return (usage, Lam x c')
+    return (usage, Lam xs kb c')
   where
-    env' = env { sc_how_bound = extendVarEnv hb x SpecArg }
+    env' = env { sc_how_bound = extendVarEnvList hb (zip xs (repeat SpecArg)) }
     hb   = sc_how_bound env
-specInValue env (Compute c)
+specInValue env (Compute kb c)
   = do
     (usage, c') <- specInCommand env c
-    return (usage, mkCompute c')
+    return (usage, Compute kb c')
 specInValue _ v
   = return (emptyScUsage, v)
 
@@ -208,11 +211,10 @@ specInCont env (App v k)
     (usage1, v') <- specInValue env v
     (usage2, k') <- specInCont env k
     return (usage1 <> usage2, App v' k')
-specInCont env (Case x t as k)
+specInCont env (Case x t as)
   = do
-    (usages1, as') <- unzip <$> mapM (specInAlt env) as
-    (usage2, k') <- specInCont env k
-    return (mconcat usages1 <> usage2, Case x t as' k')
+    (usages, as') <- mapAndUnzipM (specInAlt env) as
+    return (mconcat usages, Case x t as')
 specInCont env (Cast co k)
   = do
     (usage, k') <- specInCont env k
@@ -326,10 +328,16 @@ specToBinding (Spec { spec_id = x, spec_defn = v }) = (x, v)
 specialize :: ScEnv -> ScUsage -> (Var, SeqCoreValue)
                     -> CoreM [(Var, SeqCoreValue)]
 specialize env (ScUsage calls used) (x, v)
+  | tracing
+  , pprTrace "specialize" (ppr x <+> ppr v) False
+  = undefined
   | skip
-  = return [(x, v)]
+  = do
+    when tracing $ putMsg $ text "specialize: skipping" <+> ppr x
+    return [(x, v)]
   | otherwise
   = do
+    when tracing $ putMsg $ text "specialize: PROCESSING" <+> ppr x
     -- Create the specializations
     specs <- mkSpecs
     -- Add specization rules to the function's identifier
@@ -344,15 +352,19 @@ specialize env (ScUsage calls used) (x, v)
     skip | null binders
          = True -- H1 fails
          | Just sz <- sc_size env
-         , not $ couldBeSmallEnoughToInline (sc_dflags env) sz
-             (commandToCoreExpr body)
+         -- TODO Implement couldBeSmallEnoughToInline for ourselves
+         , let coreExpr = commandToCoreExpr retId body
+         , not $ couldBeSmallEnoughToInline (sc_dflags env) sz coreExpr
          = True -- H2 fails
          | otherwise
          = False
 
     binders :: [Var] -- ^ Binders for the bound function. Empty if not a function.
+    retId :: ContId -- ^ Identifier of the continuation parameter to the function.
     body :: SeqCoreCommand -- ^ Body of the bound function after all lambdas.
-    (binders, body) = collectLambdas v
+    (binders, retId, body)
+      | Lam xs k body <- v = (xs, k, body)
+      | otherwise          = ([], undefined, undefined)
 
     -- Create the specializations for the binding @let x = c@.
     mkSpecs :: CoreM [Spec]
@@ -382,7 +394,7 @@ specialize env (ScUsage calls used) (x, v)
     specCall :: CallPat -> CoreM Spec
     specCall pat@(vars :-> vals)
       = do
-        let v' = lambdas vars $
+        let v' = Lam vars retId $
                   addLets (zipWith NonRec binders vals) body
         x' <- mkSysLocalM (fsLit "scsc") (valueType v')
         return $ Spec { spec_pat = pat, spec_id = x', spec_defn = v' }
@@ -434,9 +446,9 @@ specialize env (ScUsage calls used) (x, v)
         fn    = idName x
         bndrs = patVars
         args  = map valueToCoreExpr patArgs
-        rhs   = commandToCoreExpr $
+        rhs   = commandToCoreExpr retId $
                   Command [] (Var x') (
-                    foldr (\x k -> App (Var x) k) Return patVars)
+                    foldr (\x k -> App (Var x) k) (Return retId) patVars)
           
 infix 4 `samePat`
 
@@ -444,7 +456,7 @@ infix 4 `samePat`
 samePat :: CallPat -> CallPat -> Bool
 xs1 :-> cs1 `samePat` xs2 :-> cs2 =
   -- We compare the lists cs1 and cs2 in an environment in which the variables
-  -- xs1 in cs1 are identified with the variables xs2 in cs2. (See Ops.)
+  -- xs1 in cs1 are identified with the variables xs2 in cs2. (See Syntax.)
   aeqIn env cs1 cs2
   where
     env = rnBndrs2 (mkRnEnv2 emptyInScopeSet) xs1 xs2

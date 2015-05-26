@@ -30,4 +30,4 @@ sequentPass :: ([SeqCoreBind] -> CoreM [SeqCoreBind])
             -- 'deShadowBinds').
             -> (ModGuts -> CoreM ModGuts)
 sequentPass process =
-  bindsOnlyPass (fmap bindsToCore . process . fromCoreBinds . deShadowBinds)
+  bindsOnlyPass (fmap bindsToCore . process . fromCoreModule . deShadowBinds)

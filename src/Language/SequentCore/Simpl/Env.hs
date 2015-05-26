@@ -8,10 +8,10 @@ module Language.SequentCore.Simpl.Env (
   OutId, OutVar, OutTyVar, OutCoVar,
   
   mkBoundTo,
-  initialEnv, mkSuspension, enterScope, enterScopes, uniqAway,
+  initialEnv, mkSuspension, enterScope, enterScopes, mkFreshVar, mkFreshContId,
   substId, substTy, substTyStatic, substCo, substCoStatic, extendIdSubst,
   zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
-  suspendAndZapEnv, suspendAndSetEnv, zapCont, bindCont, pushCont, restoreEnv,
+  zapCont, bindCont, bindContAs, pushCont, setCont, restoreEnv,
   
   Floats, emptyFloats, addNonRecFloat, addRecFloats, zapFloats, mapFloats,
   extendFloats, addFloats, wrapFloats, isEmptyFloats, doFloatFromRhs,
@@ -29,17 +29,19 @@ import BasicTypes ( OccInfo(..), TopLevelFlag(..), RecFlag(..)
 import Coercion   ( Coercion, CvSubstEnv, CvSubst, mkCvSubst )
 import qualified Coercion
 import DynFlags ( DynFlags, ufCreationThreshold )
+import FastString ( FastString, fsLit )
 import Id
+import Maybes
 import OrdList
 import Outputable
 import Type       ( Type, TvSubstEnv, TvSubst, mkTvSubst, tyVarsOfType )
 import qualified Type
+import UniqSupply
 import Var
 import VarEnv
 import VarSet
 
 import Control.Exception ( assert )
-import Data.Maybe
 
 infixl 1 `setStaticPart`
 
@@ -47,22 +49,19 @@ data SimplEnv
   = SimplEnv    { se_idSubst :: SimplIdSubst    -- InId    |--> SubstAns (in/out)
                 , se_tvSubst :: TvSubstEnv      -- InTyVar |--> OutType
                 , se_cvSubst :: CvSubstEnv      -- InCoVar |--> OutCoercion
-                , se_cont    :: Maybe SuspCont
+                , se_retId   :: Maybe ContId
                 , se_inScope :: InScopeSet      -- OutVar  |--> OutVar
                 , se_defs    :: IdDefEnv        -- OutId   |--> Definition (out)
                 , se_floats  :: Floats
                 , se_dflags  :: DynFlags }
 
-newtype StaticEnv = StaticEnv SimplEnv -- Ignore se_inScope and se_defs
+newtype StaticEnv = StaticEnv SimplEnv -- Ignore se_inScope, se_floats, se_defs
 
 type SimplIdSubst = IdEnv SubstAns -- InId |--> SubstAns
 data SubstAns
   = DoneVal OutValue
   | DoneId OutId
   | SuspVal StaticEnv InValue
-
-data SuspCont
-  = SuspCont StaticEnv InCont
 
 -- The original simplifier uses the IdDetails stored in a Var to store unfolding
 -- info. We store similar data externally instead. (This is based on the Secrets
@@ -115,7 +114,7 @@ initialEnv dflags
   = SimplEnv { se_idSubst = emptyVarEnv
              , se_tvSubst = emptyVarEnv
              , se_cvSubst = emptyVarEnv
-             , se_cont    = Nothing
+             , se_retId   = Nothing
              , se_inScope = emptyInScopeSet
              , se_defs    = emptyVarEnv
              , se_floats  = emptyFloats
@@ -144,6 +143,23 @@ enterScopes env (x : xs)
   where
     (env', x') = enterScope env x
     (env'', xs') = enterScopes env' xs
+
+mkFreshVar :: MonadUnique m => SimplEnv -> FastString -> Type -> m (SimplEnv, Var)
+mkFreshVar env name ty
+  = mkFresh env name ty (\x -> x)
+
+mkFreshContId :: MonadUnique m => SimplEnv -> FastString -> Type -> m (SimplEnv, ContId)
+mkFreshContId env name ty
+  = mkFresh env name ty asContId
+    
+mkFresh :: MonadUnique m => SimplEnv -> FastString -> Type -> (Id -> Id)
+                                     -> m (SimplEnv, Var)
+mkFresh env name ty tag
+  = do
+    x <- mkSysLocalM name ty
+    let x'   = uniqAway (se_inScope env) (tag x)
+        env' = env { se_inScope = extendInScopeSet (se_inScope env) x' }
+    return (env', x')
 
 substId :: SimplEnv -> InId -> SubstAns
 substId (SimplEnv { se_idSubst = ids, se_inScope = ins }) x
@@ -210,37 +226,41 @@ zapSubstEnvs env
   = env { se_idSubst = emptyVarEnv
         , se_tvSubst = emptyVarEnv
         , se_cvSubst = emptyVarEnv
-        , se_cont    = Nothing }
+        , se_retId   = Nothing }
 
 setSubstEnvs :: SimplEnv -> SimplIdSubst -> TvSubstEnv -> CvSubstEnv
-             -> Maybe SuspCont -> SimplEnv
+             -> Maybe ContId -> SimplEnv
 setSubstEnvs env ids tvs cvs k
   = env { se_idSubst = ids
         , se_tvSubst = tvs
         , se_cvSubst = cvs
-        , se_cont    = k }
+        , se_retId   = k }
 
-suspendAndZapEnv :: SimplEnv -> InCont -> SimplEnv
-suspendAndZapEnv env cont
-  = suspendAndSetEnv env (StaticEnv (initialEnv (se_dflags env))) cont
-
-suspendAndSetEnv :: SimplEnv -> StaticEnv -> InCont -> SimplEnv
-suspendAndSetEnv env (StaticEnv stat) cont
-  = env { se_idSubst = se_idSubst stat
-        , se_tvSubst = se_tvSubst stat
-        , se_cvSubst = se_cvSubst stat
-        , se_cont    = Just (SuspCont (StaticEnv env) cont) }
-
-bindCont :: SimplEnv -> StaticEnv -> InCont -> SimplEnv
+bindCont :: MonadUnique m => SimplEnv -> StaticEnv -> InCont -> m SimplEnv
 bindCont env stat cont
-  = env { se_cont = Just (SuspCont stat cont) }
+  = do
+    let retId = se_retId env `orElse` panic "bindCont at top level"
+        retTy = Type.funArgTy (idType retId)
+    k <- mkSysLocalM (fsLit "k") (Type.mkFunTy (contType cont) retTy)
+    let k' = asContId $ uniqAway (se_inScope env) k
+    return $ bindContAs env k' stat cont
 
-pushCont :: SimplEnv -> InCont -> SimplEnv
+bindContAs :: SimplEnv -> ContId -> StaticEnv -> InCont -> SimplEnv
+bindContAs env k stat cont
+  = env { se_inScope = extendInScopeSet (se_inScope env) k
+        , se_idSubst = extendVarEnv (se_idSubst env) k
+                         (SuspVal stat (Cont cont))
+        , se_retId   = Just k }
+
+pushCont :: MonadUnique m => SimplEnv -> InCont -> m SimplEnv
 pushCont env cont
   = bindCont env (staticPart env) cont
 
 zapCont :: SimplEnv -> SimplEnv
-zapCont env = env { se_cont = Nothing }
+zapCont env = env { se_retId = Nothing }
+
+setCont :: SimplEnv -> ContId -> SimplEnv
+setCont env k = env { se_retId = Just k }
 
 staticPart :: SimplEnv -> StaticEnv
 staticPart = StaticEnv
@@ -250,12 +270,23 @@ setStaticPart dest (StaticEnv src)
   = dest { se_idSubst = se_idSubst src
          , se_tvSubst = se_tvSubst src
          , se_cvSubst = se_cvSubst src
-         , se_cont    = se_cont    src }
+         , se_retId   = se_retId   src }
+
+inScope :: StaticEnv -> SimplEnv -> SimplEnv
+inScope = flip setStaticPart
 
 restoreEnv :: SimplEnv -> Maybe (SimplEnv, InCont)
 restoreEnv env
-  = se_cont env >>= \(SuspCont env' cont) ->
-      return (env `setStaticPart` env', cont)
+  = do
+    k <- se_retId env
+    substAns <- lookupVarEnv (se_idSubst env) k
+    case substAns of
+      DoneVal val -> use (zapSubstEnvs env, val)
+      DoneId _ -> Nothing -- not sure what this means, but consistent with prev
+      SuspVal env' val -> use (env' `inScope` env, val)
+      where
+        use (env', Cont cont) = Just (env', cont)
+        use (_env', val) = pprPanic "restoreEnv" (ppr val)
 
 -- See [Simplifier floats] in SimplEnv
 
@@ -385,7 +416,7 @@ valueIsHNF env (Var id)
       Just (NotAmong {})            -> True
       Just (BoundTo val _ _ _) -> valueIsHNF env val
       _                             -> False
-valueIsHNF env (Compute comm) = commandIsHNF env comm
+valueIsHNF env (Compute _ comm) = commandIsHNF env comm
 valueIsHNF _   _        = False
 
 commandIsHNF :: SimplEnv -> SeqCoreCommand -> Bool
@@ -393,8 +424,9 @@ commandIsHNF _env (Command [] (Var fid) cont)
   | let (args, _) = collectArgs cont
   , length args < idArity fid
   = True
-commandIsHNF env comm
-  | Just val <- asValueCommand comm
+commandIsHNF _env (Command _ (Compute {}) _)
+  = False
+commandIsHNF env (Command [] val (Return _))
   = valueIsHNF env val
 commandIsHNF _ _
   = False
@@ -423,10 +455,6 @@ instance Outputable SubstAns where
   ppr (DoneId x) = brackets (text "Id:" <+> ppr x)
   ppr (SuspVal env v)
     = brackets $ hang (text "Suspended:") 2 (sep [ppr env, ppr v])
-
-instance Outputable SuspCont where
-  ppr (SuspCont _env cont)
-    = ppr cont
 
 instance Outputable Definition where
   ppr (BoundTo c occ level guid)

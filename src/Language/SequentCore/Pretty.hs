@@ -57,8 +57,6 @@ ppr_comm add_par comm
           [] -> empty
           binds -> hang (text "let") 2 (ppr_binds binds) $$ text "in"
     maybe_add_par = if null (cmdLet comm) then noParens else add_par
-    cut val Return
-      = ppr_value add_par val
     cut val cont
       = cat [text "<" <> pprCoreValue val, vcat $ ppr_block "|" ";" ">" $ ppr_cont_frames cont]
 
@@ -67,35 +65,33 @@ ppr_value _ (Var name) = ppr name
 ppr_value add_par (Type ty) = add_par $ char '@' <+> ppr ty
 ppr_value _ (Coercion _) = text "CO ..."
 ppr_value add_par (Lit lit) = GHC.pprLiteral add_par lit
-ppr_value add_par value@(Lam _ _)
-  = let
-      (bndrs, body) = collectLambdas value
-    in
-      add_par $
-      hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs) <+> arrow)
-          2 (pprCoreComm body)
+ppr_value add_par (Lam bndrs kbndr body)
+  = add_par $
+      hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs ++
+                                [char '|', pprBndr LambdaBind kbndr]) <+> arrow)
+        2 (pprCoreComm body)
 ppr_value add_par (Cons ctor args)
   = add_par $
     hang (ppr ctor) 2 (sep (map (ppr_value parens) args))
-ppr_value add_par (Compute comm)
-  = ppr_comm add_par comm
+ppr_value add_par (Compute kbndr comm)
+  = add_par $
+      hang (text "compute" <+> pprBndr LambdaBind kbndr)
+        2 (pprCoreComm comm)
 ppr_value add_par (Cont k)
   = ppr_cont add_par k
 
 ppr_cont_frames :: OutputableBndr b => Cont b -> [SDoc]
 ppr_cont_frames (App v k)
   = char '$' <+> ppr_value noParens v : ppr_cont_frames k
-ppr_cont_frames (Case var _ alts k)
-  = (hang (text "case as" <+> pprBndr CaseBind var <+> text "of") 2 $
-      vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)) : ppr_cont_frames k
+ppr_cont_frames (Case var _ alts)
+  = [hang (text "case as" <+> pprBndr CaseBind var <+> text "of") 2 $
+      vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)]
 ppr_cont_frames (Cast _ k)
   = text "cast ..." : ppr_cont_frames k
 ppr_cont_frames (Tick _ k)
   = text "tick ..." : ppr_cont_frames k
-ppr_cont_frames Return
-  = []
-ppr_cont_frames (Jump x)
-  = [text "jump" <+> ppr x]
+ppr_cont_frames (Return k)
+  = [text "ret" <+> ppr k]
 
 ppr_cont :: OutputableBndr b => (SDoc -> SDoc) -> Cont b -> SDoc
 ppr_cont add_par k
@@ -111,7 +107,7 @@ pprCoreAlt (Alt con args rhs)
 
 ppr_case_pat :: OutputableBndr a => GHC.AltCon -> [a] -> SDoc
 ppr_case_pat con args
-  = ppr con <+> (fsep (map ppr_bndr args))
+  = ppr con <+> fsep (map ppr_bndr args)
   where
     ppr_bndr = pprBndr CaseBind
 
