@@ -5,16 +5,12 @@
 -- Stability   : experimental
 
 module Language.SequentCore.Util (
-  orElse, consMaybe 
+  Maybes.orElse, consMaybe 
 ) where
 
-import Data.Maybe
+import Maybes
 
-infixr 4 `orElse`
 infixr 5 `consMaybe`
-
-orElse :: Maybe a -> a -> a
-orElse = flip fromMaybe
 
 consMaybe :: Maybe a -> [a] -> [a]
 Just x  `consMaybe` xs = x : xs

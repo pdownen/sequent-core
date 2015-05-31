@@ -18,9 +18,10 @@ import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Simpl.Monad
 import Language.SequentCore.Syntax
 import Language.SequentCore.Translate
+import Language.SequentCore.Util
 
 import BasicTypes
-import Coercion    ( isCoVar )
+import Coercion    ( Coercion, isCoVar )
 import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      CoreM, defaultPlugin, reinitializeGlobals,
                      isZeroSimplCount, pprSimplCount, putMsg, errorMsg
@@ -31,11 +32,10 @@ import DynFlags    ( gopt, GeneralFlag(..), ufKeenessFactor, ufUseThreshold )
 import FastString
 import Id
 import HscTypes    ( ModGuts(..) )
-import Maybes
 import MonadUtils  ( mapAccumLM )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
-import Type        ( Type, funArgTy, isUnLiftedType, mkFunTy )
+import Type        ( Type, isUnLiftedType, mkFunTy )
 import Var
 import VarEnv
 import VarSet
@@ -144,7 +144,7 @@ simplValue env (Compute k (Command [] val (Return k')))
   = simplValue env val
 simplValue env v
   = do
-    (env', k) <- mkFreshContId env (fsLit "valk") (mkFunTy ty ty)
+    (env', k) <- mkFreshContId env (fsLit "*valk") (mkFunTy ty ty)
     let env'' = zapFloats $ setCont env' k
     (env''', comm) <- simplCut env'' v (staticPart env'') (Return k)
     return (env `addFloats` env''', mkCompute k comm)
@@ -183,10 +183,10 @@ simplLazyBind env_x x x' env_v v level isRec
     in return $ env_x { se_tvSubst = tvs' }
   | isCoVar x
   , Coercion co <- assert (isCoValue v) v
-  -- TODO Simplify coercions; for now, just apply substitutions
-  = let co'  = substCoStatic env_v co
-        cvs' = extendVarEnv (se_cvSubst env_x) x co'
-    in return $ env_x { se_cvSubst = cvs' }
+  = do
+    co' <- simplCoercion (env_v `inDynamicScope` env_x) co
+    let cvs' = extendVarEnv (se_cvSubst env_x) x co'
+    return $ env_x { se_cvSubst = cvs' }
   | otherwise
   = do
     preInline <- preInlineUnconditionally env_x x env_v v level
@@ -198,38 +198,48 @@ simplLazyBind env_x x x' env_v v level isRec
         return env'
       else case v of
         Cont cont
+          | TopLevel <- level
+          -> pprPanic "simplLazyBind: top-level cont" (ppr x)
+          | otherwise
           -> do
-             let env_v' = zapFloats (env_x `setStaticPart` env_v)
-             (env_v'', cont') <- simplCont env_v' cont
-             -- Remember, env_v' may contain floated bindings, without which
-             -- cont' is invalid. Therefore we either float them past here by
-             -- adding them to the outer environment or wrap cont' in them now.
-             (env_x', rhs')
-               <- if not (doFloatFromRhs level NonRecursive False (Cont cont') env_v'')
-                     then do -- Not floating past here, so wrap RHS and discard 
-                             -- its environment
-                             cont'' <- wrapFloatsAroundCont env_v'' (idType x') cont'
-                             return (env_x, Cont cont'')
-                     else do -- Float up from the RHS by adding floats to the
-                             -- outer environment
-                             tick LetFloatFromLet
-                             return (addFloats env_x env_v'', Cont cont')
-             completeBind env_x' x x' rhs' level
+             let env_v' = zapFloats (env_v `inDynamicScope` env_x)
+             (env_v'', split) <- splitDupableCont env_v' cont
+             case split of
+               DupeAll dup -> do
+                 tick (PostInlineUnconditionally x)
+                 return $ extendIdSubst env_x x (DoneVal (Cont dup))
+               DupeNone -> do
+                 (env_v''', cont') <- simplCont env_v'' cont
+                 finish x x' env_v''' (Cont cont')
+               DupeSome dupk nodup -> do
+                 (env_v''', nodup') <- simplCont env_v'' nodup
+                 (env_v'''', new_x) <- mkFreshContId env_v''' (fsLit "*nodup") (contType nodup')
+                 env_x' <- finish new_x new_x env_v'''' (Cont nodup')
+                 tick (PostInlineUnconditionally x)
+                 -- Trickily, nodup may have been duped after all if it's
+                 -- post-inlined. Thus check before assembling dup.
+                 val_new_x <- simplContId env_x' new_x
+                 let dup = dupk val_new_x
+                 return $ extendIdSubst env_x' x (DoneVal (Cont dup))
         _ -> do
              -- TODO Handle floating type lambdas
-             let env_v' = zapFloats (env_x `setStaticPart` env_v)
+             let env_v' = zapFloats (env_v `inDynamicScope` env_x)
              (env_v'', v') <- simplValue env_v' v
              -- TODO Something like Simplify.prepareRhs
-             (env_x', v'')
-               <- if not (doFloatFromRhs level NonRecursive False v' env_v'')
-                     then do v'' <- wrapFloatsAroundValue env_v'' v'
-                             return (env_x, v'')
-                     else do tick LetFloatFromLet
-                             return (addFloats env_x env_v'', v')
-             completeBind env_x' x x' v'' level
+             finish x x' env_v'' v'
+  where
+    finish new_x new_x' env_v' v'
+      = do
+        (env_x', v'')
+          <- if not (doFloatFromRhs level isRec False v' env_v')
+                then do v'' <- wrapFloatsAroundValue env_v' v'
+                        return (env_x, v'')
+                else do tick LetFloatFromLet
+                        return (env_x `addFloats` env_v', v')
+        completeBind env_x' new_x new_x' v'' level
 
-wrapFloatsAroundCont :: SimplEnv -> Type -> OutCont -> SimplM OutCont
-wrapFloatsAroundCont env ty cont
+wrapFloatsAroundCont :: SimplEnv -> OutCont -> SimplM OutCont
+wrapFloatsAroundCont env cont
   | isEmptyFloats env
   = return cont
   | otherwise
@@ -240,11 +250,14 @@ wrapFloatsAroundCont env ty cont
   -- Return. However, we only call this when something's being floated from a
   -- continuation, and it seems unlikely we'd be floating a let from a Return.
   = do
-    (env', id) <- mkFreshContId env (fsLit "$in") ty
-    let comm = wrapFloats env' (mkCommand [] (Var id) cont)
-    return $ Case id (funArgTy ty) [Alt DEFAULT [] comm]
-
+    let ty = contType cont
+    (env', k) <- mkFreshContId env (fsLit "*in") ty
+    let comm = wrapFloats env' (mkCommand [] (Var k) cont)
+    return $ Case k ty [Alt DEFAULT [] comm]
+    
 wrapFloatsAroundValue :: SimplEnv -> OutValue -> SimplM OutValue
+wrapFloatsAroundValue env (Cont cont)
+  = Cont <$> wrapFloatsAroundCont env cont
 wrapFloatsAroundValue env val
   | isEmptyFloats env
   = return val
@@ -252,8 +265,13 @@ wrapFloatsAroundValue env val
   = pprPanic "wrapFloatsAroundValue" (ppr val)
   | otherwise
   = do
-    k <- asContId <$> mkSysLocalM (fsLit "wrapk") (valueType val)
-    return $ mkCompute k $ wrapFloats env (mkCommand [] val (Return k))
+    (env', k) <- mkFreshContId env (fsLit "*wrap") (valueType val)
+    return $ mkCompute k $ wrapFloats env' (mkCommand [] val (Return k))
+
+completeNonRec :: SimplEnv -> InVar -> OutVar -> OutValue -> TopLevelFlag
+                           -> SimplM SimplEnv
+-- TODO Something like Simplify.prepareRhs
+completeNonRec = completeBind
 
 completeBind :: SimplEnv -> InVar -> OutVar -> OutValue -> TopLevelFlag
              -> SimplM SimplEnv
@@ -310,7 +328,9 @@ simplCut env_v (Var x) env_k cont
              Nothing
                -> simplCut2 env_v (Var x') env_k cont
              Just val'
-               -> simplCut (zapSubstEnvs env_v) val' env_k cont
+               -> do
+                  tick (UnfoldingDone x')
+                  simplCut (zapSubstEnvs env_v) val' env_k cont
       DoneVal v
         -- Value already simplified (then PostInlineUnconditionally'd), so
         -- don't do any substitutions when processing it again
@@ -346,10 +366,11 @@ simplCut2 env_v (Lam xs k c) env_k cont@(App {})
 simplCut2 env_v (Lam xs k c) env_k cont
   = do
     let (env_v', k' : xs') = enterScopes env_v (k : xs)
-    c' <- simplCommandNoFloats (zapCont env_v') c
+    c' <- simplCommandNoFloats (env_v' `setCont` k') c
     simplContWith (env_v' `setStaticPart` env_k) (Lam xs' k' c') cont
-simplCut2 env_v val env_k (Case x _ alts)
+simplCut2 env_v val env_k cont
   | isManifestValue val
+  , Just (x, _, alts) <- contIsCase_maybe (env_v `setStaticPart` env_k) cont
   , Just (pairs, body) <- matchCase env_v val alts
   = do
     tick (KnownBranch x)
@@ -468,6 +489,12 @@ matchCase env_v val (_ : alts)
 matchCase _ _ []
   = Nothing
 
+simplContNoFloats :: SimplEnv -> InCont -> SimplM OutCont
+simplContNoFloats env cont
+  = do
+    (env', cont') <- simplCont (zapFloats env) cont
+    wrapFloatsAroundCont env' cont'
+
 simplCont :: SimplEnv -> InCont -> SimplM (SimplEnv, OutCont)
 {-
 simplCont env cont
@@ -495,8 +522,9 @@ simplCont env cont
         arg' <- simplValueNoFloats env arg
         go env cont (kc . App arg')
     go env (Cast co cont) kc
-      -- TODO Simplify coercions
-      = go env cont (kc . Cast co)
+      = do
+        co' <- simplCoercion env co
+        go env cont (kc . Cast co')
     go env (Case x ty alts) kc
       = do
         let (env', x') = enterScope env x
@@ -524,6 +552,34 @@ simplContWith env val cont
   = do
     (env', cont') <- simplCont env cont
     return (env', mkCommand [] val cont')
+
+simplCoercion :: SimplEnv -> Coercion -> SimplM Coercion
+simplCoercion env co =
+  -- TODO Actually simplify
+  return $ substCo env co
+
+simplVar :: SimplEnv -> InVar -> SimplM OutValue
+simplVar env x
+  | isTyVar x = return $ Type (substTyVar env x)
+  | isCoVar x = return $ Coercion (substCoVar env x)
+  | otherwise
+  = case substId env x of
+    DoneId x' -> return $ Var x'
+    DoneVal v -> return v
+    SuspVal stat v -> simplValueNoFloats (env `setStaticPart` stat) v
+
+simplContId :: SimplEnv -> ContId -> SimplM OutCont
+simplContId env k
+  | isContId k
+  = case substId env k of
+      DoneId k'           -> return $ Return k'
+      DoneVal (Cont cont) -> return cont
+      SuspVal stat (Cont cont)
+        -> simplContNoFloats (env `setStaticPart` stat) cont
+      other               -> pprPanic "simplContId: bad cont binding"
+                               (ppr k <+> arrow <+> ppr other)
+  | otherwise
+  = pprPanic "simplContId: not a cont id" (ppr k)
 
 -- Based on preInlineUnconditionally in SimplUtils; see comments there
 preInlineUnconditionally :: SimplEnv -> InVar -> StaticEnv -> InValue
@@ -627,9 +683,9 @@ shouldInline env rhs occ level guid cont
 
 someBenefit :: SimplEnv -> OutValue -> TopLevelFlag -> InCont -> Bool
 someBenefit env rhs level cont
-  | Cons {} <- rhs, Case {} <- cont
+  | Cons {} <- rhs, contIsCase env cont
   = True
-  | Lit {} <- rhs, Case {} <- cont
+  | Lit {} <- rhs, contIsCase env cont
   = True
   | Lam xs _ _ <- rhs
   = consider xs args
@@ -641,7 +697,7 @@ someBenefit env rhs level cont
     -- See Secrets, section 7.2, for the someBenefit criteria
     consider :: [OutVar] -> [InValue] -> Bool
     consider [] (_:_)      = True -- (c) saturated call in interesting context
-    consider [] []         | Case {} <- cont' = True -- (c) ditto
+    consider [] []         | contIsCase env cont' = True -- (c) ditto
                            -- Check for (d) saturated call to nested
                            | otherwise = isNotTopLevel level
     consider (_:_) []      = False -- unsaturated
@@ -690,3 +746,109 @@ smallEnough env _val (Sometimes bodySize argWeights resWeight) cont
     isCase _             = False
 
     real `times` int     = ceiling (real * fromIntegral int)
+
+data ContSplitting
+  = DupeAll OutCont
+  | DupeNone
+  | DupeSome (OutCont -> OutCont) InCont
+
+-- | Divide a continuation into some (floated) bindings, a simplified
+-- continuation we'll happily copy into many case branches, and possibly an
+-- unsimplified continuation that we'll keep in a let binding and invoke from
+-- each branch.
+--
+-- The rules:
+--   1. Duplicate returns.
+--   2. Duplicate casts.
+--   3. Don't duplicate ticks (because GHC doesn't).
+--   4. Duplicate applications, but ANF-ize them first to share the arguments.
+--   5. Don't duplicate cases (!) because, unlike with Simplify.mkDupableCont,
+--        we don't need to (see comment in Case clause).
+--
+-- TODO We could conceivably copy single-branch cases, since this would still
+-- limit bloat, but we would need polyadic continuations in most cases (just as
+-- GHC's join points can be polyadic). The simplest option would be to use
+-- regular continuations of unboxed tuples for this, though that could make
+-- inlining decisions trickier.
+
+splitDupableCont :: SimplEnv -> InCont -> SimplM (SimplEnv, ContSplitting)
+splitDupableCont env cont
+  = do
+    (env', ans) <- go env True (\cont' -> cont') cont
+    return $ case ans of
+      Left dup                 -> (env', DupeAll dup)
+      Right (True,  _,  _)     -> (env', DupeNone)
+      Right (False, kk, nodup) -> (env', DupeSome kk nodup)
+  where
+    -- The OutCont -> OutCont is a continuation for the outer continuation (!!).
+    -- The Bool is there because we can't test whether the continuation is the
+    -- identity.
+    go :: SimplEnv -> Bool -> (OutCont -> OutCont) -> InCont
+       -> SimplM (SimplEnv, Either OutCont (Bool, OutCont -> OutCont, InCont))
+    go env top kk (Return kid)
+      = case substId env kid of
+          DoneId  kid'              -> return (env, Left $ kk (Return kid'))
+          DoneVal (Cont cont')      -> do
+                                       let env' = zapFloats (zapSubstEnvs env)
+                                       (env'', ans) <- go env' top kk cont'
+                                       return (env `addFloats` env'', ans)
+          SuspVal stat (Cont cont') -> do
+                                       let env' = zapFloats (stat `inDynamicScope` env)
+                                       (env'', ans) <- go env' top kk cont'
+                                       return (env `addFloats` env'', ans)
+          other                     -> pprPanic "non-continuation at cont id"
+                                         (ppr other)
+    
+    go env _top kk (Cast co cont)
+      = do
+        co' <- simplCoercion env co
+        go env False (kk . Cast co') cont
+    
+    go env top kk cont@(Tick {})
+      = return (env, Right (top, kk, cont))
+    
+    go env _top kk (App arg cont)
+      = do
+        (env', arg') <- makeTrivial env arg
+        go env' False (kk . App arg') cont
+
+    go env top kk cont@(Case {})
+      -- Never duplicate cases! This is a marked departure from the original
+      -- simplifier, which goes to great lengths to inline case statements in
+      -- the hopes of making a case reduction possible. (For instance, this is
+      -- the purpose of the case-of-case transform.) However, we are much better
+      -- prepared than it is to detect known-branch conditions because we can
+      -- easily check whether an id is bound to a case (much as GHC uses
+      -- exprIsConApp_maybe to find whether one is bound to a constructor).
+      = return (env, Right (top, kk, cont))
+
+makeTrivial :: SimplEnv -> OutValue
+                        -> SimplM (SimplEnv, OutValue)
+makeTrivial env val
+  | isTrivialValue val
+  = return (env, val)
+  | otherwise
+  = do
+    (env', bndr) <- case val of
+      Cont cont -> mkFreshContId env (fsLit "*k") contTy 
+        where
+          Just retId = se_retId env
+          contTy     = mkFunTy (contType cont) (idType retId)
+      _         -> mkFreshVar    env (fsLit "a") (valueType val)
+    env'' <- simplLazyBind env' bndr bndr (staticPart env') val NotTopLevel NonRecursive
+    val_final <- simplVar env'' bndr
+    return (env'', val_final)
+
+contIsCase :: SimplEnv -> InCont -> Bool
+contIsCase _env (Case {}) = True
+contIsCase env (Return k)
+  | Just (BoundTo (Cont cont) _ _ _) <- lookupVarEnv (se_defs env) k
+  = contIsCase env cont
+contIsCase _ _ = False
+
+contIsCase_maybe :: SimplEnv -> InCont -> Maybe (Id, Type, [InAlt])
+contIsCase_maybe _env (Case bndr ty alts) = Just (bndr, ty, alts)
+contIsCase_maybe env (Return k)
+  | Just (BoundTo (Cont cont) _ _ _) <- lookupVarEnv (se_defs env) k
+  = contIsCase_maybe env cont
+contIsCase_maybe _ _ = Nothing

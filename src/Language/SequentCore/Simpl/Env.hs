@@ -9,9 +9,9 @@ module Language.SequentCore.Simpl.Env (
   
   mkBoundTo,
   initialEnv, mkSuspension, enterScope, enterScopes, mkFreshVar, mkFreshContId,
-  substId, substTy, substTyStatic, substCo, substCoStatic, extendIdSubst,
-  zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
-  zapCont, bindCont, bindContAs, pushCont, setCont, restoreEnv,
+  substId, substTy, substTyVar, substTyStatic, substCo, substCoVar, substCoStatic,
+  extendIdSubst, zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
+  inDynamicScope, zapCont, bindCont, bindContAs, pushCont, setCont, restoreEnv,
   
   Floats, emptyFloats, addNonRecFloat, addRecFloats, zapFloats, mapFloats,
   extendFloats, addFloats, wrapFloats, isEmptyFloats, doFloatFromRhs,
@@ -185,6 +185,9 @@ getTvSubst env = mkTvSubst (se_inScope env) (se_tvSubst env)
 substTy :: SimplEnv -> Type -> Type
 substTy env t = Type.substTy (getTvSubst env) t
 
+substTyVar :: SimplEnv -> TyVar -> Type
+substTyVar env tv = Type.substTyVar (getTvSubst env) tv
+
 substTyStatic :: StaticEnv -> Type -> Type
 substTyStatic (StaticEnv env) = substTy env
 
@@ -203,6 +206,9 @@ getCvSubst env = mkCvSubstFromSubstEnv (se_inScope env) (se_cvSubst env)
 
 substCo :: SimplEnv -> Coercion -> Coercion
 substCo env co = Coercion.substCo (getCvSubst env) co
+
+substCoVar :: SimplEnv -> CoVar -> Coercion
+substCoVar env co = Coercion.substCoVar (getCvSubst env) co
 
 substCoStatic :: StaticEnv -> Coercion -> Coercion
 substCoStatic (StaticEnv env) = substCo env
@@ -272,8 +278,8 @@ setStaticPart dest (StaticEnv src)
          , se_cvSubst = se_cvSubst src
          , se_retId   = se_retId   src }
 
-inScope :: StaticEnv -> SimplEnv -> SimplEnv
-inScope = flip setStaticPart
+inDynamicScope :: StaticEnv -> SimplEnv -> SimplEnv
+inDynamicScope = flip setStaticPart
 
 restoreEnv :: SimplEnv -> Maybe (SimplEnv, InCont)
 restoreEnv env
@@ -283,7 +289,7 @@ restoreEnv env
     case substAns of
       DoneVal val -> use (zapSubstEnvs env, val)
       DoneId _ -> Nothing -- not sure what this means, but consistent with prev
-      SuspVal env' val -> use (env' `inScope` env, val)
+      SuspVal env' val -> use (env' `inDynamicScope` env, val)
       where
         use (env', Cont cont) = Just (env', cont)
         use (_env', val) = pprPanic "restoreEnv" (ppr val)
@@ -357,9 +363,13 @@ extendFloats :: SimplEnv -> OutBind -> SimplEnv
 -- Add these bindings to the floats, and extend the in-scope env too
 extendFloats env bind
   = env { se_floats  = se_floats env `addFlts` unitFloat bind,
-          se_inScope = extendInScopeSetList (se_inScope env) bndrs }
+          se_inScope = extendInScopeSetList (se_inScope env) bndrs,
+          se_defs    = extendVarEnvList (se_defs env) defs}
   where
     bndrs = bindersOf bind
+    defs = map asDef (flattenBind bind)
+    -- FIXME The NotTopLevel flag might wind up being wrong!
+    asDef (x, val) = (x, mkBoundTo (se_dflags env) val (idOccInfo x) NotTopLevel)
 
 addFloats :: SimplEnv -> SimplEnv -> SimplEnv
 -- Add the floats for env2 to env1;
@@ -367,7 +377,8 @@ addFloats :: SimplEnv -> SimplEnv -> SimplEnv
 -- than that for env1
 addFloats env1 env2
   = env1 {se_floats = se_floats env1 `addFlts` se_floats env2,
-          se_inScope = se_inScope env2 }
+          se_inScope = se_inScope env2,
+          se_defs = se_defs env2 }
 
 wrapFloats :: SimplEnv -> OutCommand -> OutCommand
 wrapFloats env cmd = foldrOL wrap cmd (floatBinds (se_floats env))

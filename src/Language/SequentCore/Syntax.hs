@@ -283,30 +283,26 @@ isProperValue (Coercion _) = False
 isProperValue (Cont _)     = False
 isProperValue _            = True
 
--- | True if the given command represents no actual run-time computation or
--- allocation. For this to hold, it must have no @let@ bindings, and its value
--- and its continuation must both be trivial. Equivalent to
--- 'CoreUtils.exprIsTrivial' in GHC.
+-- | True if the given command is so simple we can duplicate it freely. This
+-- means it has no bindings and its value and continuation are both trivial.
 isTrivial :: HasId b => Command b -> Bool
 isTrivial c
   = null (cmdLet c) &&
       isTrivialCont (cmdCont c) &&
       isTrivialValue (cmdValue c)
 
--- | True if the given value represents no actual run-time computation. Some
+-- | True if the given value is so simple we can duplicate it freely. Some
 -- literals are not trivial, and a lambda whose argument is not erased or whose
 -- body is non-trivial is also non-trivial.
 isTrivialValue :: HasId b => Value b -> Bool
 isTrivialValue (Lit l)     = litIsTrivial l
 isTrivialValue (Lam xs _ c)= not (any (isRuntimeVar . identifier) xs) && isTrivial c
-isTrivialValue (Compute _ _) = False
-isTrivialValue (Cont cont)
-  = case cont of
-      Return _            -> True
-      _                   -> False
+isTrivialValue (Cons _ as) = all isErasedValue as
+isTrivialValue (Compute _ c) = isTrivial c
+isTrivialValue (Cont cont) = isTrivialCont cont
 isTrivialValue _           = True
 
--- | True if the given continuation represents no actual run-time computation.
+-- | True if the given continuation is so simple we can duplicate it freely.
 -- This is true of casts and of applications of erased arguments (types and
 -- coercions). Ticks are not considered trivial, since this would cause them to
 -- be inlined.
