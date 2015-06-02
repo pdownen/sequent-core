@@ -315,13 +315,12 @@ simplRec env xvs level
 -- continuation, *and* the coercion that proves they're compatible.
 simplCut :: SimplEnv -> InValue -> StaticEnv -> InCont
                      -> SimplM (SimplEnv, OutCommand)
-{-
 simplCut env_v v env_k cont
-  | pprTrace "simplCut" (
+  | tracing
+  , pprTrace "simplCut" (
       ppr env_v $$ ppr v $$ ppr env_k $$ ppr cont
     ) False
   = undefined
--}
 simplCut env_v (Var x) env_k cont
   = case substId env_v x of
       DoneId x'
@@ -361,18 +360,18 @@ simplCut2 _env_v (Cont {}) _env_k _cont
   = panic "simplCut of cont"
 simplCut2 env_v (Lam xs k c) env_k cont@(App {})
   = do
-    tick (BetaReduction (head xs))
     -- Need to address three cases: More args than xs; more xs than args; equal
     let n = length xs
         (args, cont') = collectArgsUpTo n cont -- force xs >= args by ignoring
                                                -- extra args
+    mapM_ (tick . BetaReduction) (take (length args) xs)
     env_v' <- foldM (\env (x, arg) -> simplNonRec env x env_k arg NotTopLevel)
                 env_v (zip xs args)
     if n == length args
       -- No more args (xs == args)
       then simplCommand (bindContAs env_v' k env_k cont') c
       -- Still more args (xs > args)
-      else simplCut env_v (Lam (drop (length args) xs) k c) env_k cont'
+      else simplCut env_v' (Lam (drop (length args) xs) k c) env_k cont'
 simplCut2 env_v (Lam xs k c) env_k cont
   = do
     let (env_v', k' : xs') = enterScopes env_v (k : xs)
@@ -506,13 +505,12 @@ simplContNoFloats env cont
     wrapFloatsAroundCont env' cont'
 
 simplCont :: SimplEnv -> InCont -> SimplM (SimplEnv, OutCont)
-{-
 simplCont env cont
-  | pprTrace "simplCont" (
+  | tracing
+  , pprTrace "simplCont" (
       ppr env $$ ppr cont
     ) False
   = undefined
--}
 simplCont env cont
   = go env cont (\k -> k)
   where
