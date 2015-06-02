@@ -211,10 +211,10 @@ specInCont env (App v k)
     (usage1, v') <- specInValue env v
     (usage2, k') <- specInCont env k
     return (usage1 <> usage2, App v' k')
-specInCont env (Case x t as)
+specInCont env (Case x as)
   = do
     (usages, as') <- mapAndUnzipM (specInAlt env) as
-    return (mconcat usages, Case x t as')
+    return (mconcat usages, Case x as')
 specInCont env (Cast co k)
   = do
     (usage, k') <- specInCont env k

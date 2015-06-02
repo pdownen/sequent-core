@@ -92,7 +92,7 @@ data Value b    = Lit Literal       -- ^ A primitive literal value.
 -- value with a continuation.
 data Cont b     = App  {- expr -} (Value b) (Cont b)
                   -- ^ Apply the value to an argument.
-                | Case {- expr -} b Type [Alt b]
+                | Case {- expr -} b [Alt b]
                   -- ^ Perform case analysis on the value.
                 | Cast {- expr -} Coercion (Cont b)
                   -- ^ Cast the value using the given coercion.
@@ -203,7 +203,7 @@ addLets bs c = c { cmdLet = bs ++ cmdLet c }
 addNonRec :: HasId b => b -> Value b -> Command b -> Command b
 addNonRec bndr rhs comm
   | needsCaseBinding (idType (identifier bndr)) rhs
-  = mkCommand [] rhs (Case bndr (valueType rhs) [Alt DEFAULT [] comm])
+  = mkCommand [] rhs (Case bndr [Alt DEFAULT [] comm])
   | otherwise
   = addLets [NonRec bndr rhs] comm
 
@@ -415,7 +415,7 @@ contType (Return k)   = Type.funArgTy (idType k)
 contType (App arg k)  = Type.mkFunTy (valueType arg) (contType k)
 contType (Cast co k)  = let Pair fromTy toTy = coercionKind co
                         in assert (toTy `Type.eqType` contType k) fromTy
-contType (Case b _ _) = idType (identifier b)
+contType (Case b _)   = idType (identifier b)
 contType (Tick _ k)   = contType k
 
 -- | Compute (a conservative estimate of) the arity of a value.
@@ -484,7 +484,7 @@ cutOk primOpOk val cont
 contOk :: (PrimOp -> Bool) -> Cont b -> Bool
 contOk _        (Return _)= False -- TODO Should look at unfolding??
 contOk _        (App _ _) = False
-contOk primOpOk (Case _bndr _ty alts)
+contOk primOpOk (Case _bndr alts)
   =  all (\(Alt _ _ rhs) -> commOk primOpOk rhs) alts
   && altsAreExhaustive
   where
@@ -555,7 +555,7 @@ valCheap appCheap (Cont cont)  = contCheap appCheap cont
 
 contCheap :: HasId b => CheapMeasure -> Cont b -> Bool
 contCheap _        (Return _)      = True
-contCheap appCheap (Case _ _ alts) = all (\(Alt _ _ rhs) -> commCheap appCheap rhs)
+contCheap appCheap (Case _ alts) = all (\(Alt _ _ rhs) -> commCheap appCheap rhs)
                                          alts
 contCheap appCheap (Cast _ cont)   = contCheap appCheap cont
 contCheap appCheap (Tick ti cont)  = not (tickishCounts ti)
@@ -692,8 +692,8 @@ instance HasId b => AlphaEq (Value b) where
 instance HasId b => AlphaEq (Cont b) where
   aeqIn env (App c1 k1) (App c2 k2)
     = aeqIn env c1 c2 && aeqIn env k1 k2
-  aeqIn env (Case x1 t1 as1) (Case x2 t2 as2)
-    = aeqIn env' t1 t2 && aeqIn env' as1 as2
+  aeqIn env (Case x1 as1) (Case x2 as2)
+    = aeqIn env' as1 as2
       where env' = rnBndr2 env (identifier x1) (identifier x2)
   aeqIn env (Cast co1 k1) (Cast co2 k2)
     = aeqIn env co1 co2 && aeqIn env k1 k2

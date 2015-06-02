@@ -122,7 +122,7 @@ bodySize dflags cap topArgs expr
     size (K (Cast _ cont))  = size (K cont)
     size (K (Tick _ cont))  = size (K cont)
     size (K (App arg cont)) = sizeArg arg `addSizeNSD` size (K cont)
-    size (K (Case _ _ alts))= sizeAlts alts
+    size (K (Case _ alts))  = sizeAlts alts
 
     size (C comm)           = sizeLets (cmdLet comm) `addSizeNSD`
                               sizeCut (cmdValue comm) (cmdCont comm)
@@ -136,7 +136,7 @@ bodySize dflags cap topArgs expr
             voids         = count isRealWorldValue realArgs
         in sizeArgs realArgs `addSizeNSD` sizeCall f realArgs voids
                              `addSizeOfCont` cont'
-    sizeCut (Var x) (Case _b _ty alts)
+    sizeCut (Var x) (Case _b alts)
       | x `elem` topArgs
       = combineSizes total max
       where

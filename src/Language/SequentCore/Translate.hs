@@ -67,8 +67,9 @@ runFromCoreM m = initUs_ uniqSupply m
 -- | Translates a Core expression into Sequent Core.
 fromCoreExpr :: FromCoreEnv -> Core.CoreExpr -> SeqCoreCont
                             -> FromCoreM SeqCoreCommand
-fromCoreExpr = go []
+fromCoreExpr env expr cont = go [] env expr cont
   where
+    topCont = cont
     go binds env expr cont = case expr of
       Core.Var x         -> done $ Var (lookupInScope env x `orElse` x)
       Core.Lit l         -> done $ Lit l
@@ -79,18 +80,18 @@ fromCoreExpr = go []
       Core.Let bs e      ->
         do (env', bs') <- fromCoreBind env (Just cont) bs
            go (bs' : binds) env' e cont
-      Core.Case e x t as
+      Core.Case e x _ as
         | Return _ <- cont ->
           do as' <- mapM (fromCoreAlt env cont) as
-             go binds env e $ Case x t as'
+             go binds env e $ Case x as'
         | otherwise ->
           -- Translating a case naively can duplicate lots of code. Rather than
           -- copy the continuation for each branch, we stuff it into a let
           -- binding and copy only a Return to that binding.
-          do let contTy = mkFunTy t (contType cont)
+          do let contTy = mkFunTy (contType cont) (contType topCont)
              (env', k) <- fresh env contTy (fsLit "*casek")
              as' <- mapM (fromCoreAlt env' (Return k)) as
-             go (NonRec k (Cont cont) : binds) env' e $ Case x t as'
+             go (NonRec k (Cont cont) : binds) env' e $ Case x as'
       Core.Coercion co   -> done $ Coercion co
       Core.Cast e co     -> go binds env e (Cast co cont)
       Core.Tick ti e     -> go binds env e (Tick ti cont)
@@ -127,7 +128,7 @@ fromCoreLamAsCont env cont (Core.Lam b e)
       outer (Core.App (Core.Var k) e)
                                   | isContId k
                                   = inner e <*> pure (Return k)
-      outer (Core.Case e b ty as) = inner e <*> (Case b ty <$>
+      outer (Core.Case e b _ as)  = inner e <*> (Case b <$>
                                       mapM (fromCoreAlt env' cont) as)
         where env'                = extendInScopeSet env b
       outer body                  = inner body <*> pure cont
@@ -207,7 +208,7 @@ contToCoreExpr :: ContId -> SeqCoreCont -> (Core.CoreExpr -> Core.CoreExpr)
 contToCoreExpr retId k e =
   case k of
     App  {- expr -} v k'      -> contToCoreExpr retId k' $ Core.mkCoreApp e (valueToCoreExpr v)
-    Case {- expr -} b t as    -> Core.Case e b t (map (altToCore retId) as)
+    Case {- expr -} b as      -> Core.Case e b (funResultTy (idType retId)) (map (altToCore retId) as)
     Cast {- expr -} co k'     -> contToCoreExpr retId k' $ Core.Cast e co
     Tick ti {- expr -} k'     -> contToCoreExpr retId k' $ Core.Tick ti e
     Return x

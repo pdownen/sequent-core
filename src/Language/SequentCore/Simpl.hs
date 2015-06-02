@@ -36,7 +36,7 @@ import MkCore      ( mkWildValBinder )
 import MonadUtils  ( mapAccumLM )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
-import Type        ( Type, isUnLiftedType )
+import Type        ( isUnLiftedType )
 import Var
 import VarEnv
 import VarSet
@@ -255,7 +255,7 @@ wrapFloatsAroundCont env cont
     let ty = contType cont
     (env', x) <- mkFreshVar env (fsLit "$in") ty
     let comm = wrapFloats env' (mkCommand [] (Var x) cont)
-    return $ Case (mkWildValBinder ty) (retType env) [Alt DEFAULT [] comm]
+    return $ Case (mkWildValBinder ty) [Alt DEFAULT [] comm]
     
 wrapFloatsAroundValue :: SimplEnv -> OutValue -> SimplM OutValue
 wrapFloatsAroundValue env (Cont cont)
@@ -380,7 +380,7 @@ simplCut2 env_v (Lam xs k c) env_k cont
     simplContWith (env_v' `setStaticPart` env_k) (Lam xs' k' c') cont
 simplCut2 env_v val env_k cont
   | isManifestValue val
-  , Just (x, _, alts) <- contIsCase_maybe (env_v `setStaticPart` env_k) cont
+  , Just (x, alts) <- contIsCase_maybe (env_v `setStaticPart` env_k) cont
   , Just (pairs, body) <- matchCase env_v val alts
   = do
     tick (KnownBranch x)
@@ -396,10 +396,10 @@ simplCut2 env_v val env_k cont
 
 -- Adapted from Simplify.rebuildCase (clause 2)
 -- See [Case elimination] in Simplify
-simplCut2 env_v val env_k (Case case_bndr ty [Alt _ bndrs rhs])
+simplCut2 env_v val env_k (Case case_bndr [Alt _ bndrs rhs])
  | all isDeadBinder bndrs       -- bndrs are [InId]
  
- , if isUnLiftedType ty
+ , if isUnLiftedType (idType case_bndr)
    then elim_unlifted        -- Satisfy the let-binding invariant
    else elim_lifted
   = do  { -- pprTrace "case elim" (vcat [ppr case_bndr, ppr (exprIsHNF scrut),
@@ -535,14 +535,14 @@ simplCont env cont
       = do
         co' <- simplCoercion env co
         go env cont (kc . Cast co')
-    go env (Case x ty alts) kc
+    go env (Case x alts) kc
       = do
         let (env', x') = enterScope env x
         alts' <- forM alts $ \(Alt con xs c) -> do
           let (env'', xs') = enterScopes env' xs
           c' <- simplCommandNoFloats env'' c
           return $ Alt con xs' c'
-        return (env, kc (Case x' (substTy env ty) alts'))
+        return (env, kc (Case x' alts'))
     go env (Tick ti cont) kc
       = go env cont (kc . Tick ti)
     go env (Return x) kc
@@ -853,8 +853,8 @@ contIsCase env (Return k)
   = contIsCase env cont
 contIsCase _ _ = False
 
-contIsCase_maybe :: SimplEnv -> InCont -> Maybe (Id, Type, [InAlt])
-contIsCase_maybe _env (Case bndr ty alts) = Just (bndr, ty, alts)
+contIsCase_maybe :: SimplEnv -> InCont -> Maybe (Id, [InAlt])
+contIsCase_maybe _env (Case bndr alts) = Just (bndr, alts)
 contIsCase_maybe env (Return k)
   | Just (BoundTo (Cont cont) _ _ _) <- lookupVarEnv (se_defs env) k
   = contIsCase_maybe env cont
