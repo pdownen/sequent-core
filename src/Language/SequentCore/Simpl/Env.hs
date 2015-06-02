@@ -11,7 +11,7 @@ module Language.SequentCore.Simpl.Env (
   initialEnv, mkSuspension, enterScope, enterScopes, mkFreshVar, mkFreshContId,
   substId, substTy, substTyVar, substTyStatic, substCo, substCoVar, substCoStatic,
   extendIdSubst, zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
-  inDynamicScope, zapCont, bindCont, bindContAs, pushCont, setCont, restoreEnv,
+  inDynamicScope, zapCont, bindCont, bindContAs, pushCont, setCont, retType, restoreEnv,
   
   Floats, emptyFloats, addNonRecFloat, addRecFloats, zapFloats, mapFloats,
   extendFloats, addFloats, wrapFloats, isEmptyFloats, doFloatFromRhs,
@@ -148,9 +148,10 @@ mkFreshVar :: MonadUnique m => SimplEnv -> FastString -> Type -> m (SimplEnv, Va
 mkFreshVar env name ty
   = mkFresh env name ty (\x -> x)
 
-mkFreshContId :: MonadUnique m => SimplEnv -> FastString -> Type -> m (SimplEnv, ContId)
-mkFreshContId env name ty
-  = mkFresh env name ty asContId
+mkFreshContId :: MonadUnique m => SimplEnv -> FastString -> Type -> Type
+              -> m (SimplEnv, ContId)
+mkFreshContId env name inTy outTy
+  = mkFresh env name (Type.mkFunTy inTy outTy) asContId
     
 mkFresh :: MonadUnique m => SimplEnv -> FastString -> Type -> (Id -> Id)
                                      -> m (SimplEnv, Var)
@@ -267,6 +268,13 @@ zapCont env = env { se_retId = Nothing }
 
 setCont :: SimplEnv -> ContId -> SimplEnv
 setCont env k = env { se_retId = Just k }
+
+retType :: SimplEnv -> Type
+retType env
+  | Just k <- se_retId env
+  = substTy env (Type.funArgTy (idType k))
+  | otherwise
+  = panic "retType at top level"
 
 staticPart :: SimplEnv -> StaticEnv
 staticPart = StaticEnv
@@ -449,23 +457,26 @@ instance Outputable SimplEnv where
     $$ text " IdSubst   =" <+> ppr ids
     $$ text " TvSubst   =" <+> ppr tvs
     $$ text " CvSubst   =" <+> ppr cvs
-    $$ text " Cont      =" <+> ppr cont
-    $$ text " Floats    =" <+> ppr floats
+    $$ text " RetId     =" <+> ppr cont
+    $$ text " Floats    =" <+> ppr floatBndrs
      <> char '>'
+    where
+      floatBndrs = bindersOfBinds (getFloatBinds floats)
 
 instance Outputable StaticEnv where
   ppr (StaticEnv (SimplEnv ids tvs cvs cont _in_scope _defs _floats _dflags))
     =  text "<IdSubst   =" <+> ppr ids
     $$ text " TvSubst   =" <+> ppr tvs
     $$ text " CvSubst   =" <+> ppr cvs
-    $$ text " Cont      =" <+> ppr cont
+    $$ text " RetId     =" <+> ppr cont
      <> char '>'
 
 instance Outputable SubstAns where
   ppr (DoneVal v) = brackets (text "Value:" <+> ppr v)
   ppr (DoneId x) = brackets (text "Id:" <+> ppr x)
-  ppr (SuspVal env v)
-    = brackets $ hang (text "Suspended:") 2 (sep [ppr env, ppr v])
+--  ppr (SuspVal env v)
+--    = brackets $ hang (text "Suspended:") 2 (sep [ppr env, ppr v])
+  ppr (SuspVal {}) = text "Suspended"
 
 instance Outputable Definition where
   ppr (BoundTo c occ level guid)

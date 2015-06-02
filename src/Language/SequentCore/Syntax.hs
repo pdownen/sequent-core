@@ -14,7 +14,7 @@ module Language.SequentCore.Syntax (
   -- * Constructors
   mkCommand, mkCompute, addLets, addNonRec,
   -- * Deconstructors
-  lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs,
+  lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
   partitionTypes, isLambda,
   isValueArg, isTypeValue, isCoValue, isErasedValue, isRuntimeValue, isProperValue,
   isTrivial, isTrivialValue, isTrivialCont, isReturnCont,
@@ -45,6 +45,7 @@ import Id        ( Id, isDataConWorkId, isDataConWorkId_maybe, isConLikeId
                  , idUnique, setIdUnique, isBottomingId )
 import IdInfo    ( IdDetails(..) )
 import Literal   ( Literal, isZeroLit, litIsTrivial, literalType )
+import Outputable
 import Pair
 import PrimOp    ( PrimOp(..), primOpOkForSpeculation, primOpOkForSideEffects
                  , primOpIsCheap )
@@ -177,10 +178,20 @@ mkCompute :: HasId b => b -> Command b -> Value b
 -- 'Compute'. If the command is a value command (see 'asValueCommand'), unwraps
 -- it instead.
 mkCompute k comm
-  | Just val <- asValueCommand (identifier k) comm
+  | Just val <- asValueCommand kid comm
   = val
+  | not correctType -- skip the test if it's a value command because idType
+                    -- gives a warning if it's a type variable
+  = pprPanic "mkCompute" (ppr kid <+> dcolon <+> ppr (idType kid))
   | otherwise
   = Compute k comm
+  where
+    kid = identifier k
+    correctType
+      | Just (argTy, retTy) <- Type.splitFunTy_maybe (idType kid)
+      = argTy `Type.eqType` retTy
+      | otherwise
+      = False
 
 -- | Adds the given bindings outside those in the given command.
 addLets :: [Bind b] -> Command b -> Command b
@@ -232,6 +243,18 @@ collectTypeAndOtherArgs k
   = let (tys, k') = collectTypeArgs k
         (vs, k'') = collectArgs k'
     in (tys, vs, k'')
+
+-- | Divide a continuation into a sequence of up to @n@ arguments and an outer
+-- continuation. If @k@ is not an application continuation, then
+-- @collectArgsUpTo n k == ([], k)@.
+collectArgsUpTo :: Int -> Cont b -> ([Value b], Cont b)
+collectArgsUpTo 0 k
+  = ([], k)
+collectArgsUpTo n (App v k)
+  = (v : vs, k')
+  where (vs, k') = collectArgsUpTo (n - 1) k
+collectArgsUpTo _ k
+  = ([], k)
 
 -- | Divide a list of values into an initial sublist of types and the remaining
 -- values.
@@ -379,7 +402,7 @@ valueType (Cons con as)  = res_ty
   where
     (tys, _) = partitionTypes as
     (_, res_ty) = Type.splitFunTys (dataConRepType con `Type.applyTys` tys)
-valueType (Compute k _)  = idType (identifier k)
+valueType (Compute k _)  = Type.funArgTy (idType (identifier k))
 -- see exprType in GHC CoreUtils
 valueType _other         = alphaTy
 

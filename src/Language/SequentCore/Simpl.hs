@@ -32,10 +32,11 @@ import DynFlags    ( gopt, GeneralFlag(..), ufKeenessFactor, ufUseThreshold )
 import FastString
 import Id
 import HscTypes    ( ModGuts(..) )
+import MkCore      ( mkWildValBinder )
 import MonadUtils  ( mapAccumLM )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
-import Type        ( Type, isUnLiftedType, mkFunTy )
+import Type        ( Type, isUnLiftedType )
 import Var
 import VarEnv
 import VarSet
@@ -144,7 +145,7 @@ simplValue env (Compute k (Command [] val (Return k')))
   = simplValue env val
 simplValue env v
   = do
-    (env', k) <- mkFreshContId env (fsLit "*valk") (mkFunTy ty ty)
+    (env', k) <- mkFreshContId env (fsLit "*valk") ty ty
     let env'' = zapFloats $ setCont env' k
     (env''', comm) <- simplCut env'' v (staticPart env'') (Return k)
     return (env `addFloats` env''', mkCompute k comm)
@@ -153,18 +154,18 @@ simplValue env v
 simplBinds :: SimplEnv -> [InBind] -> TopLevelFlag
            -> SimplM SimplEnv
 simplBinds env bs level
-  = foldM (\env' b -> simplBind env' (staticPart env') b level) env bs
+  = foldM (\env' b -> simplBind env' b level) env bs
 
-simplBind :: SimplEnv -> StaticEnv -> InBind -> TopLevelFlag
+simplBind :: SimplEnv -> InBind -> TopLevelFlag
           -> SimplM SimplEnv
 --simplBind env level bind
 --  | pprTrace "simplBind" (text "Binding" <+> parens (ppr level) <> colon <+>
 --                          ppr bind) False
 --  = undefined
-simplBind env_x env_c (NonRec x c) level
-  = simplNonRec env_x x env_c c level
-simplBind env_x env_c (Rec xcs) level
-  = simplRec env_x env_c xcs level
+simplBind env (NonRec x v) level
+  = simplNonRec env x (staticPart env) v level
+simplBind env (Rec xcs) level
+  = simplRec env xcs level
 
 simplNonRec :: SimplEnv -> InVar -> StaticEnv -> InValue -> TopLevelFlag
             -> SimplM SimplEnv
@@ -213,7 +214,8 @@ simplLazyBind env_x x x' env_v v level isRec
                  finish x x' env_v''' (Cont cont')
                DupeSome dupk nodup -> do
                  (env_v''', nodup') <- simplCont env_v'' nodup
-                 (env_v'''', new_x) <- mkFreshContId env_v''' (fsLit "*nodup") (contType nodup')
+                 (env_v'''', new_x) <-
+                   mkFreshContId env_v''' (fsLit "*nodup") (contType nodup') (retType env_v''')
                  env_x' <- finish new_x new_x env_v'''' (Cont nodup')
                  tick (PostInlineUnconditionally x)
                  -- Trickily, nodup may have been duped after all if it's
@@ -251,9 +253,9 @@ wrapFloatsAroundCont env cont
   -- continuation, and it seems unlikely we'd be floating a let from a Return.
   = do
     let ty = contType cont
-    (env', k) <- mkFreshContId env (fsLit "*in") ty
-    let comm = wrapFloats env' (mkCommand [] (Var k) cont)
-    return $ Case k ty [Alt DEFAULT [] comm]
+    (env', x) <- mkFreshVar env (fsLit "$in") ty
+    let comm = wrapFloats env' (mkCommand [] (Var x) cont)
+    return $ Case (mkWildValBinder ty) (retType env) [Alt DEFAULT [] comm]
     
 wrapFloatsAroundValue :: SimplEnv -> OutValue -> SimplM OutValue
 wrapFloatsAroundValue env (Cont cont)
@@ -265,7 +267,8 @@ wrapFloatsAroundValue env val
   = pprPanic "wrapFloatsAroundValue" (ppr val)
   | otherwise
   = do
-    (env', k) <- mkFreshContId env (fsLit "*wrap") (valueType val)
+    let ty = valueType val
+    (env', k) <- mkFreshContId env (fsLit "*wrap") ty ty
     return $ mkCompute k $ wrapFloats env' (mkCommand [] val (Return k))
 
 completeNonRec :: SimplEnv -> InVar -> OutVar -> OutValue -> TopLevelFlag
@@ -294,18 +297,18 @@ completeBind env x x' v level
             env'  = env { se_inScope = ins', se_defs = defs' }
         return $ addNonRecFloat env' x'' v
 
-simplRec :: SimplEnv -> StaticEnv -> [(InVar, InValue)] -> TopLevelFlag
+simplRec :: SimplEnv -> [(InVar, InValue)] -> TopLevelFlag
          -> SimplM SimplEnv
-simplRec env_x env_v xvs level
+simplRec env xvs level
   = do
-    let (env_x', xs') = enterScopes env_x (map fst xvs)
-    env_x'' <- foldM doPair (zapFloats env_x') 
-                [ (x, x', v) | (x, v) <- xvs | x' <- xs' ] 
-    return $ env_x' `addRecFloats` env_x''
+    let (env', xs') = enterScopes env (map fst xvs)
+    env'' <- foldM doBinding (zapFloats env')
+               [ (x, x', v) | (x, v) <- xvs | x' <- xs' ]
+    return $ env' `addRecFloats` env''
   where
-    doPair :: SimplEnv -> (InId, OutId, InValue) -> SimplM SimplEnv
-    doPair env_x (x, x', v)
-      = simplLazyBind env_x x x' env_v v level Recursive
+    doBinding :: SimplEnv -> (InId, OutId, InValue) -> SimplM SimplEnv
+    doBinding env' (x, x', v)
+      = simplLazyBind env' x x' (staticPart env') v level Recursive
 
 -- TODO Deal with casts. Should maybe take the active cast as an argument;
 -- indeed, it would make sense to think of a cut as involving a value, a
@@ -359,10 +362,17 @@ simplCut2 _env_v (Cont {}) _env_k _cont
 simplCut2 env_v (Lam xs k c) env_k cont@(App {})
   = do
     tick (BetaReduction (head xs))
-    let (args, cont') = collectArgs cont
+    -- Need to address three cases: More args than xs; more xs than args; equal
+    let n = length xs
+        (args, cont') = collectArgsUpTo n cont -- force xs >= args by ignoring
+                                               -- extra args
     env_v' <- foldM (\env (x, arg) -> simplNonRec env x env_k arg NotTopLevel)
                 env_v (zip xs args)
-    simplCommand (bindContAs env_v' k env_k cont') c
+    if n == length args
+      -- No more args (xs == args)
+      then simplCommand (bindContAs env_v' k env_k cont') c
+      -- Still more args (xs > args)
+      else simplCut env_v (Lam (drop (length args) xs) k c) env_k cont'
 simplCut2 env_v (Lam xs k c) env_k cont
   = do
     let (env_v', k' : xs') = enterScopes env_v (k : xs)
@@ -830,10 +840,7 @@ makeTrivial env val
   | otherwise
   = do
     (env', bndr) <- case val of
-      Cont cont -> mkFreshContId env (fsLit "*k") contTy 
-        where
-          Just retId = se_retId env
-          contTy     = mkFunTy (contType cont) (idType retId)
+      Cont cont -> mkFreshContId env (fsLit "*k") (contType cont) (retType env)
       _         -> mkFreshVar    env (fsLit "a") (valueType val)
     env'' <- simplLazyBind env' bndr bndr (staticPart env') val NotTopLevel NonRecursive
     val_final <- simplVar env'' bndr
