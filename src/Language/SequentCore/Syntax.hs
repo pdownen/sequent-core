@@ -29,7 +29,8 @@ module Language.SequentCore.Syntax (
   valueIsCheap, contIsCheap, commandIsCheap,
   valueIsExpandable, contIsExpandable, commandIsExpandable,
   -- * Continuation ids
-  contIdTag, isContId, asContId,
+  contIdTag, builtinContIdTag, builtinContRelatedIdTag,
+  isContId, asContId, uniqAwayContId,
   -- * Alpha-equivalence
   (=~=), AlphaEq(..), AlphaEnv, HasId(..)
 ) where
@@ -153,16 +154,20 @@ type SeqCoreAlt     = Alt     Var
 -- This smart constructor enforces the invariant that a saturated constructor
 -- invocation is represented as a 'Cons' value rather than using 'App' frames.
 mkCommand :: HasId b => [Bind b] -> Value b -> Cont b -> Command b
-mkCommand binds val@(Var f) cont
+mkCommand binds (Var f) cont
   | Just ctor <- isDataConWorkId_maybe f
   , Just (args, cont') <- ctorCall
   = mkCommand binds (Cons ctor args) cont'
   where
+    (tyVars, monoTy) = Type.splitForAllTys (idType f)
+    (argTys, _)      = Type.splitFunTys monoTy
+    argsNeeded       = length tyVars + length argTys
     ctorCall
-      | 0 <- idArity f
-      = Just ([], cont)
+      | let (args, cont') = collectArgsUpTo argsNeeded cont
+      , length args == argsNeeded
+      = Just (args, cont')
       | otherwise
-      = asSaturatedCall val cont
+      = Nothing
 
 mkCommand binds (Compute kbndr (Command { cmdLet = binds'
                                         , cmdValue = val'
@@ -397,12 +402,16 @@ valueType (Lit l)        = literalType l
 valueType (Var x)        = idType x
 valueType (Lam xs k _)   = Type.mkPiTypes (map identifier xs) retTy
   where
-    retTy = Type.funArgTy (idType (identifier k))
+    retTy = case Type.splitFunTy_maybe (idType (identifier k)) of
+              Just (argTy, _) -> argTy
+              Nothing         -> pprPanic "valueType (Lam)" (pprBndr LetBind (identifier k))
 valueType (Cons con as)  = res_ty
   where
     (tys, _) = partitionTypes as
     (_, res_ty) = Type.splitFunTys (dataConRepType con `Type.applyTys` tys)
-valueType (Compute k _)  = Type.funArgTy (idType (identifier k))
+valueType (Compute k _)  = case Type.splitFunTy_maybe (idType (identifier k)) of
+                             Just (argTy, _) -> argTy
+                             Nothing         -> pprPanic "valueType (Compute)" (pprBndr LetBind (identifier k))
 -- see exprType in GHC CoreUtils
 valueType _other         = alphaTy
 
@@ -612,14 +621,21 @@ isExpandableApp fid valArgCount = isConLikeId fid
 --------------------------------------------------------------------------------
 
 -- | INTERNAL USE ONLY.
-contIdTag :: Char
+contIdTag, builtinContIdTag, builtinContRelatedIdTag :: Char
 -- TODO Yuck. Find a way around this by any means necessary.
 -- Should be different from any unique tag used anywhere else (!!)
-contIdTag = 'Q'
+contIdTag = '*'
+
+-- | INTERNAL USE ONLY.
+builtinContIdTag = 'Q'
+
+-- | INTERNAL USE ONLY.
+builtinContRelatedIdTag = 'q'
 
 -- | Find whether an id is a continuation id.
 isContId :: Id -> Bool
-isContId x = tag == contIdTag where (tag, _) = unpkUnique (idUnique x) -- barf
+isContId x = tag == contIdTag || tag == builtinContIdTag
+  where (tag, _) = unpkUnique (idUnique x) -- barf
 
 -- | Tag an id as a continuation id. This changes the unique of the id, so the
 -- returned id is always distinct from the argument in comparisons.
@@ -627,6 +643,19 @@ asContId :: Id -> ContId
 asContId x = x `setIdUnique` uniq'
   where
     uniq' = newTagUnique (idUnique x) contIdTag
+
+-- | Version of 'VarEnv.uniqAway' that works for continuation variables.
+uniqAwayContId :: InScopeSet -> ContId -> ContId
+uniqAwayContId ins k
+  = let k' = asContId (uniqAway ins k)
+    in case lookupInScope ins k' of
+         -- Apparently, once we change the tag of the unique returned by
+         -- uniqAway, we get something that collides again. Hence we use this
+         -- (exceedingly hacky) way of asking again: Adding something to an
+         -- InScopeSet, even if it's already there, increases the counter that
+         -- feeds into uniqAway's id creation.
+         Just cont -> uniqAwayContId (extendInScopeSet ins cont) k'
+         Nothing -> k'
 
 --------------------------------------------------------------------------------
 -- Alpha-Equivalence

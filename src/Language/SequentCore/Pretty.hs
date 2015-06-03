@@ -84,7 +84,7 @@ ppr_cont_frames :: OutputableBndr b => Cont b -> [SDoc]
 ppr_cont_frames (App v k)
   = char '$' <+> ppr_value noParens v : ppr_cont_frames k
 ppr_cont_frames (Case var alts)
-  = [hang (text "case as" <+> pprBndr CaseBind var <+> text "of") 2 $
+  = [hang (text "case as" <+> pprBndr LetBind var <+> text "of") 2 $
       vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)]
 ppr_cont_frames (Cast _ k)
   = text "cast ..." : ppr_cont_frames k

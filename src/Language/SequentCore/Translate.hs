@@ -52,11 +52,11 @@ uniqSupply :: UniqSupply
 uniqSupply = unsafePerformIO (mkSplitUniqSupply contIdTag) -- tag will mark as
                                                            -- continuation var
 
-fresh :: MonadUnique m => InScopeSet -> Type -> FastString -> m (FromCoreEnv, Var)
-fresh ins name ty
+freshContId :: MonadUnique m => InScopeSet -> Type -> Type -> FastString -> m (FromCoreEnv, ContId)
+freshContId ins inTy outTy name
   = do
-    tryVar <- mkSysLocalM ty name
-    let var = uniqAway ins tryVar
+    tryVar <- asContId `liftM` mkSysLocalM name (mkFunTy inTy outTy)
+    let var = uniqAwayContId ins tryVar
     return (extendInScopeSet ins var, var)
 
 type FromCoreM a = UniqSM a
@@ -73,6 +73,8 @@ fromCoreExpr env expr cont = go [] env expr cont
     go binds env expr cont = case expr of
       Core.Var x         -> done $ Var (lookupInScope env x `orElse` x)
       Core.Lit l         -> done $ Lit l
+      Core.App (Core.Var k) e | isContId k
+                         -> go binds env e (Return k)
       Core.App e1 e2     ->
         do e2' <- fromCoreExprAsValue env e2 mkArgContId
            go binds env e1 (App e2' cont)
@@ -88,8 +90,7 @@ fromCoreExpr env expr cont = go [] env expr cont
           -- Translating a case naively can duplicate lots of code. Rather than
           -- copy the continuation for each branch, we stuff it into a let
           -- binding and copy only a Return to that binding.
-          do let contTy = mkFunTy (contType cont) (contType topCont)
-             (env', k) <- fresh env contTy (fsLit "*casek")
+          do (env', k) <- freshContId env (contType cont) (contType topCont) (fsLit "*casek")
              as' <- mapM (fromCoreAlt env' (Return k)) as
              go (NonRec k (Cont cont) : binds) env' e $ Case x as'
       Core.Coercion co   -> done $ Coercion co
@@ -109,14 +110,14 @@ fromCoreLams env x expr
     ty  = Core.exprType body
     env' = extendInScopeSetList env (x : kid : xs)
 
-fromCoreExprAsValue :: FromCoreEnv -> Core.CoreExpr -> (Type -> Id)
+fromCoreExprAsValue :: FromCoreEnv -> Core.CoreExpr -> (Type -> ContId)
                                    -> FromCoreM SeqCoreValue
 fromCoreExprAsValue env expr mkId
   = do
     comm <- fromCoreExpr env' expr (Return k)
     return $ mkCompute k comm
   where
-    k  = uniqAway env (mkId (mkFunTy ty ty))
+    k  = uniqAwayContId env (mkId (mkFunTy ty ty))
     ty = Core.exprType expr
     env' = extendInScopeSet env k
 
@@ -222,7 +223,8 @@ bindToCore retId_maybe bind =
     NonRec b (Cont k) -> Core.NonRec b (Core.Lam x (k' (Core.Var x)))
       where 
         x     = setOneShotLambda $ contArgId argTy
-        argTy = snd $ splitFunTy (idType b)
+        argTy | Just (arg, _) <- splitFunTy_maybe (idType b) = arg
+              | otherwise = pprPanic "bindToCore" (pprBndr LetBind b)
         retId = retId_maybe `orElse` panic "bind2C: top-level cont"
         k'    = contToCoreExpr retId k
     NonRec b v        -> Core.NonRec b (valueToCoreExpr v)
@@ -241,8 +243,8 @@ altToCore retId (Alt ac bs c) = (ac, bs, commandToCoreExpr retId c)
 -- change. 
 
 mkContIdUnique, mkContArgIdUnique :: Int -> Unique
-mkContIdUnique    = mkUnique contIdTag -- should be 'Q'
-mkContArgIdUnique = mkUnique 'q'
+mkContIdUnique    = mkUnique builtinContIdTag -- should be 'Q'
+mkContArgIdUnique = mkUnique builtinContRelatedIdTag -- should be 'q'
 
 lamContKey, argContKey, letContKey, contArgKey :: Unique
 [lamContKey, argContKey, letContKey] = map mkContIdUnique [1..3]

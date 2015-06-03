@@ -42,6 +42,7 @@ import VarEnv
 import VarSet
 
 import Control.Exception ( assert )
+import Control.Monad     ( liftM )
 
 infixl 1 `setStaticPart`
 
@@ -128,7 +129,8 @@ enterScope env x
   = (env'', x')
   where
     SimplEnv { se_inScope = ins, se_idSubst = ids } = env
-    x1    = uniqAway ins x
+    x1    | isContId x = uniqAwayContId ins x
+          | otherwise  = uniqAway ins x
     x'    = substIdType env x1
     env'  | x' /= x   = env { se_idSubst = extendVarEnv ids x (DoneId x') }
           | otherwise = env
@@ -146,21 +148,20 @@ enterScopes env (x : xs)
 
 mkFreshVar :: MonadUnique m => SimplEnv -> FastString -> Type -> m (SimplEnv, Var)
 mkFreshVar env name ty
-  = mkFresh env name ty (\x -> x)
+  = do
+    x <- mkSysLocalM name ty
+    let x'   = uniqAway (se_inScope env) x
+        env' = env { se_inScope = extendInScopeSet (se_inScope env) x' }
+    return (env', x')
 
 mkFreshContId :: MonadUnique m => SimplEnv -> FastString -> Type -> Type
               -> m (SimplEnv, ContId)
 mkFreshContId env name inTy outTy
-  = mkFresh env name (Type.mkFunTy inTy outTy) asContId
-    
-mkFresh :: MonadUnique m => SimplEnv -> FastString -> Type -> (Id -> Id)
-                                     -> m (SimplEnv, Var)
-mkFresh env name ty tag
   = do
-    x <- mkSysLocalM name ty
-    let x'   = uniqAway (se_inScope env) (tag x)
-        env' = env { se_inScope = extendInScopeSet (se_inScope env) x' }
-    return (env', x')
+    k <- asContId `liftM` mkSysLocalM name (Type.mkFunTy inTy outTy)
+    let k'   = uniqAwayContId (se_inScope env) k
+        env' = env { se_inScope = extendInScopeSet (se_inScope env) k' }
+    return (env', k')
 
 substId :: SimplEnv -> InId -> SubstAns
 substId (SimplEnv { se_idSubst = ids, se_inScope = ins }) x
@@ -247,9 +248,11 @@ bindCont :: MonadUnique m => SimplEnv -> StaticEnv -> InCont -> m SimplEnv
 bindCont env stat cont
   = do
     let retId = se_retId env `orElse` panic "bindCont at top level"
-        retTy = Type.funArgTy (idType retId)
+        retTy = case Type.splitFunTy_maybe (idType retId) of
+                  Just (argTy, _) -> argTy
+                  Nothing         -> pprPanic "bindCont with retId" (pprBndr LetBind retId)
     k <- mkSysLocalM (fsLit "k") (Type.mkFunTy (contType cont) retTy)
-    let k' = asContId $ uniqAway (se_inScope env) k
+    let k' = uniqAwayContId (se_inScope env) k
     return $ bindContAs env k' stat cont
 
 bindContAs :: SimplEnv -> ContId -> StaticEnv -> InCont -> SimplEnv
@@ -272,7 +275,9 @@ setCont env k = env { se_retId = Just k }
 retType :: SimplEnv -> Type
 retType env
   | Just k <- se_retId env
-  = substTy env (Type.funArgTy (idType k))
+  = case Type.splitFunTy_maybe (idType k) of
+      Just (argTy, _) -> substTy env argTy
+      Nothing         -> pprPanic "retType" (pprBndr LetBind k)
   | otherwise
   = panic "retType at top level"
 

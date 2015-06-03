@@ -30,6 +30,7 @@ library
   exposed-modules:     Language.SequentCore
                        Language.SequentCore.Dump
                        Language.SequentCore.Inspect
+                       Language.SequentCore.Lint
                        Language.SequentCore.Plugin
                        Language.SequentCore.Pretty
                        Language.SequentCore.Simpl

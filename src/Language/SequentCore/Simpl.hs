@@ -13,6 +13,7 @@
 
 module Language.SequentCore.Simpl (plugin) where
 
+import Language.SequentCore.Lint
 import Language.SequentCore.Pretty (pprTopLevelBinds)
 import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Simpl.Monad
@@ -45,8 +46,10 @@ import Control.Applicative ( (<$>), (<*>) )
 import Control.Exception   ( assert )
 import Control.Monad       ( foldM, forM, when )
 
-tracing :: Bool
+tracing, dumping, linting :: Bool
 tracing = False
+dumping = False
+linting = True
 
 -- | Plugin data. The initializer replaces all instances of the original
 -- simplifier with the new one.
@@ -87,14 +90,21 @@ runSimplifier iters mode guts
             coreBinds = mg_binds guts
             occBinds  = runOccurAnal mod coreBinds
             binds     = fromCoreModule occBinds
-        when tracing $ putMsg  $ text "BEFORE" <+> int n
+        when linting $ case lintCoreBindings binds of
+          Just err -> pprPanic "Core Lint error (pre-simpl)"
+            (err $$ pprTopLevelBinds binds)
+          Nothing -> return ()
+        when dumping $ putMsg  $ text "BEFORE" <+> int n
                               $$ text "--------" $$ pprTopLevelBinds binds
         (binds', count) <- runSimplM globalEnv $ simplModule binds
-        when tracing $ putMsg  $ text "AFTER" <+> int n
+        when dumping $ putMsg  $ text "AFTER" <+> int n
                               $$ text "-------" $$ pprTopLevelBinds binds'
+        when linting $ case lintCoreBindings binds' of
+          Just err -> pprPanic "Core Lint error" (err $$ pprTopLevelBinds binds')
+          Nothing -> return ()
         let coreBinds' = bindsToCore binds'
             guts'      = guts { mg_binds = coreBinds' }
-        when tracing $ putMsg  $ text "SUMMARY" <+> int n
+        when dumping $ putMsg  $ text "SUMMARY" <+> int n
                               $$ text "---------" $$ pprSimplCount count
                               $$ text "CORE AFTER" <+> int n
                               $$ text "------------" $$ ppr coreBinds'
@@ -356,8 +366,8 @@ simplCut2 env_v (Coercion co) _env_k cont
   = assert (isReturnCont cont) $
     let co' = substCo env_v co
     in return (env_v, Command [] (Coercion co') cont)
-simplCut2 _env_v (Cont {}) _env_k _cont
-  = panic "simplCut of cont"
+simplCut2 _env_v (Cont {}) _env_k cont
+  = pprPanic "simplCut of cont" (ppr cont)
 simplCut2 env_v (Lam xs k c) env_k cont@(App {})
   = do
     -- Need to address three cases: More args than xs; more xs than args; equal
