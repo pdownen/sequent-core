@@ -471,6 +471,8 @@ setDef env x def
 
 defToUnfolding :: Definition -> Unfolding
 defToUnfolding (NotAmong cons) = mkOtherCon cons
+defToUnfolding (BoundTo { defValue = Cont {} })
+  = NoUnfolding -- TODO Can we do better? Translating requires knowing the outer linear cont.
 defToUnfolding (BoundTo { defValue = val, defLevel = lev, defGuidance = guid })
   = mkCoreUnfolding InlineRhs (isTopLevel lev) (valueToCoreExpr val)
       (valueArity val) (guidanceToUnfGuidance guid)

@@ -92,17 +92,17 @@ runSimplifier iters mode guts
             occBinds  = runOccurAnal mod coreBinds
             binds     = fromCoreModule occBinds
         when linting $ case lintCoreBindings binds of
-          Just err -> pprPgmError "Core Lint error (pre-simpl)"
+          Just err -> pprPgmError "Sequent Core Lint error (pre-simpl)"
             (withPprStyle defaultUserStyle $ err $$ pprTopLevelBinds binds)
           Nothing -> return ()
         when dumping $ putMsg  $ text "BEFORE" <+> int n
                               $$ text "--------" $$ pprTopLevelBinds binds
         (binds', count) <- runSimplM globalEnv $ simplModule binds
+        when linting $ case lintCoreBindings binds' of
+          Just err -> pprPanic "Sequent Core Lint error" (err $$ pprTopLevelBinds binds')
+          Nothing -> return ()
         when dumping $ putMsg  $ text "AFTER" <+> int n
                               $$ text "-------" $$ pprTopLevelBinds binds'
-        when linting $ case lintCoreBindings binds' of
-          Just err -> pprPanic "Core Lint error" (err $$ pprTopLevelBinds binds')
-          Nothing -> return ()
         let coreBinds' = bindsToCore binds'
             guts'      = guts { mg_binds = coreBinds' }
         when dumping $ putMsg  $ text "SUMMARY" <+> int n
@@ -474,7 +474,7 @@ simplCut2 env_v (Cons ctor args) env_k cont
     (env_v', args') <- mapAccumLM simplValue env_v args
     simplContWith (env_v' `setStaticPart` env_k) (Cons ctor args') cont
 simplCut2 env_v (Compute k c) env_k cont
-  = simplCommand (bindContAs env_v k env_k cont) c
+  = (env_v,) <$> simplCommandNoFloats (bindContAs env_v k env_k cont) c
 simplCut2 env_v val@(Lit {}) env_k cont
   = simplContWith (env_v `setStaticPart` env_k) val cont
 simplCut2 env_v val@(Var {}) env_k cont

@@ -217,7 +217,7 @@ valueToCoreExpr val =
     Type t       -> Core.Type t
     Coercion co  -> Core.Coercion co
     Compute kb c -> commandToCoreExpr kb c
-    Cont _       -> error "valueToCoreExpr"
+    Cont _       -> pprPanic "valueToCoreExpr" (ppr val)
 
 -- | Translates a continuation into a function that will wrap a Core expression
 -- with a fragment of context (an argument to apply to, a case expression to
