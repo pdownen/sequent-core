@@ -29,6 +29,7 @@ import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                    )
 import CoreSyn     ( isRuntimeVar, isCheapUnfolding )
 import CoreUnfold  ( smallEnoughToInline )
+import DataCon
 import DynFlags    ( gopt, GeneralFlag(..), ufKeenessFactor, ufUseThreshold )
 import FastString
 import Id
@@ -37,7 +38,7 @@ import MkCore      ( mkWildValBinder )
 import MonadUtils  ( mapAccumLM )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
-import Type        ( isUnLiftedType )
+import Type        ( applyTys, isUnLiftedType, mkFunTy, mkTyVarTy, splitFunTys )
 import Var
 import VarEnv
 import VarSet
@@ -187,6 +188,9 @@ simplNonRec env_x x env_v v level
 simplLazyBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InValue -> TopLevelFlag
               -> RecFlag -> SimplM SimplEnv
 simplLazyBind env_x x x' env_v v level isRec
+  | tracing
+  , pprTrace "simplLazyBind" (ppr x <+> darrow <+> ppr x' <+> ppr level <+> ppr isRec) False
+  = undefined
   | isTyVar x
   , Type ty <- assert (isTypeValue v) v
   = let ty'  = substTyStatic env_v ty
@@ -300,12 +304,11 @@ completeBind env x x' v level
         -- TODO Eta-expansion goes here
         dflags <- getDynFlags
         let ins   = se_inScope env
-            defs  = se_defs env
             x''   = x' `setIdInfo` idInfo x
             ins'  = extendInScopeSet ins x''
-            defs' = extendVarEnv defs x'' (mkBoundTo dflags v (idOccInfo x'') level)
-            env'  = env { se_inScope = ins', se_defs = defs' }
-        return $ addNonRecFloat env' x'' v
+            env'  = env { se_inScope = ins' }
+            (env'', x''') = setDef env' x'' (mkBoundTo dflags v level)
+        return $ addNonRecFloat env'' x''' v
 
 simplRec :: SimplEnv -> [(InVar, InValue)] -> TopLevelFlag
          -> SimplM SimplEnv
@@ -389,11 +392,11 @@ simplCut2 env_v (Lam xs k c) env_k cont
     simplContWith (env_v' `setStaticPart` env_k) (Lam xs' k' c') cont
 simplCut2 env_v val env_k cont
   | isManifestValue val
-  , Just (x, alts) <- contIsCase_maybe (env_v `setStaticPart` env_k) cont
+  , Just (env_k', x, alts) <- contIsCase_maybe (env_v `setStaticPart` env_k) cont
   , Just (pairs, body) <- matchCase env_v val alts
   = do
     tick (KnownBranch x)
-    env' <- foldM doPair (env_v `setStaticPart` env_k) ((x, val) : pairs)
+    env' <- foldM doPair (env_v `setStaticPart` env_k') ((x, val) : pairs)
     simplCommand env' body
   where
     isManifestValue (Lit {})  = True
@@ -524,14 +527,13 @@ simplCont env cont
 simplCont env cont
   = go env cont (\k -> k)
   where
-    {-
-    go env cont _
-      | pprTrace "simplCont::go" (
+    go :: SimplEnv -> InCont -> (OutCont -> OutCont) -> SimplM (SimplEnv, OutCont)
+    go _env cont _
+      | tracing
+      , pprTrace "simplCont::go" (
           ppr cont
         ) False
       = undefined
-    -}
-    go :: SimplEnv -> InCont -> (OutCont -> OutCont) -> SimplM (SimplEnv, OutCont)
     go env (App arg cont) kc
       -- TODO Handle strict arguments differently? GHC detects whether arg is
       -- strict, but here we've lost that information.
@@ -678,11 +680,14 @@ callSiteInline env_v x cont
     return ans
   where
     go _mode _dflags
-      | Just (BoundTo rhs occ level guid) <- lookupVarEnv (se_defs env_v) x
-      , shouldInline env_v rhs occ level guid cont
+      | Just (BoundTo rhs level guid) <- def
+      , shouldInline env_v rhs (idOccInfo x) level guid cont
       = Just rhs
+      | Just (BoundToDFun bndrs con args) <- def
+      = inlineDFun env_v bndrs con args cont
       | otherwise
       = Nothing
+    def = findDef env_v x
 
 shouldInline :: SimplEnv -> OutValue -> OccInfo -> TopLevelFlag -> Guidance
              -> InCont -> Bool
@@ -741,6 +746,14 @@ noSizeIncrease _rhs _cont = False --TODO
 
 smallEnough :: SimplEnv -> OutValue -> Guidance -> InCont -> Bool
 smallEnough _ _ Never _ = False
+smallEnough _ val (Usually unsatOk boringOk) cont
+  = (unsatOk || unsat) && (boringOk || boring)
+  where
+    unsat = length valArgs < valueArity val
+    (_, valArgs, _) = collectTypeAndOtherArgs cont
+    boring = isReturnCont cont -- FIXME Not all returns are boring! Also, in
+                               -- fact, some non-returns *are* boring (a cast
+                               -- isn't in itself interesting, for instance).
 smallEnough env _val (Sometimes bodySize argWeights resWeight) cont
   -- The Formula (p. 40)
   = bodySize - sizeOfCall - keenness `times` discounts <= threshold
@@ -764,6 +777,25 @@ smallEnough env _val (Sometimes bodySize argWeights resWeight) cont
     isCase _             = False
 
     real `times` int     = ceiling (real * fromIntegral int)
+
+inlineDFun :: SimplEnv -> [Var] -> DataCon -> [OutValue] -> InCont -> Maybe OutValue
+inlineDFun env bndrs con conArgs cont
+--  | pprTrace "inlineDFun" (sep [ppr bndrs, ppr con, ppr conArgs, ppr cont] $$
+--      if enoughArgs && contIsCase env cont' then text "YES" else text "NO") False
+--  = undefined
+  | enoughArgs, contIsCase env cont'
+  = Just val
+  | otherwise
+  = Nothing
+  where
+    (args, cont') = collectArgsUpTo (length bndrs) cont
+    enoughArgs    = length args == length bndrs
+    val | null bndrs = bodyVal
+        | otherwise  = Lam bndrs k (Command [] bodyVal (Return k))
+    bodyVal       = Cons con conArgs
+    k             = mkLamContId (mkFunTy ty ty)
+    (_, ty)       = splitFunTys (applyTys (dataConRepType con) (map mkTyVarTy tyBndrs))
+    tyBndrs       = takeWhile isTyVar bndrs
 
 data ContSplitting
   = DupeAll OutCont
@@ -857,13 +889,19 @@ makeTrivial env val
 contIsCase :: SimplEnv -> InCont -> Bool
 contIsCase _env (Case {}) = True
 contIsCase env (Return k)
-  | Just (BoundTo (Cont cont) _ _ _) <- lookupVarEnv (se_defs env) k
+  | Just (BoundTo (Cont cont) _ _) <- lookupVarEnv (se_defs env) k
   = contIsCase env cont
 contIsCase _ _ = False
 
-contIsCase_maybe :: SimplEnv -> InCont -> Maybe (Id, [InAlt])
-contIsCase_maybe _env (Case bndr alts) = Just (bndr, alts)
+contIsCase_maybe :: SimplEnv -> InCont -> Maybe (StaticEnv, InId, [InAlt])
+contIsCase_maybe env (Case bndr alts) = Just (staticPart env, bndr, alts)
 contIsCase_maybe env (Return k)
-  | Just (BoundTo (Cont cont) _ _ _) <- lookupVarEnv (se_defs env) k
-  = contIsCase_maybe env cont
+  = case substId env k of
+      DoneId k' ->
+        case lookupVarEnv (se_defs env) k' of
+          Just (BoundTo (Cont cont) _ _) -> contIsCase_maybe (zapSubstEnvs env) cont
+          _                              -> Nothing
+      DoneVal (Cont cont)                -> contIsCase_maybe (zapSubstEnvs env) cont
+      SuspVal stat (Cont cont)           -> contIsCase_maybe (stat `inDynamicScope` env) cont
+      _                                  -> panic "contIsCase_maybe"
 contIsCase_maybe _ _ = Nothing

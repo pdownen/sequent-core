@@ -13,6 +13,7 @@ import Type
 import VarEnv
 
 import Control.Monad
+import Data.List    ( mapAccumL )
 
 type LintM = Either SDoc
 type LintEnv = TvSubst
@@ -67,12 +68,20 @@ lintCoreValue env (Var x)
 
 lintCoreValue env (Lam xs k comm)
   = do
-    let xs'  = map (substTyInId env) xs
-        k'   = substTyInId env k
-        env' = extendTvInScopeList env (k' : xs')
-    lintCoreCommand env' comm
-    retTy <- contIdTyOrError env k'
+    let (env', xs') = mapAccumL lintBind env xs
+        (env'', k') = lintBind env' k
+    lintCoreCommand env'' comm
+    retTy <- contIdTyOrError env' k'
     return $ mkPiTypes xs' retTy
+  where
+    lintBind env x
+      | isTyVar x
+      = substTyVarBndr env x
+      | otherwise
+      = (env', x')
+      where
+        x' = substTyInId env x
+        env' = extendTvInScope env x'
 
 lintCoreValue env (Cons dc args)
   = do

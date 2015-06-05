@@ -7,7 +7,7 @@ module Language.SequentCore.Simpl.Env (
   OutCommand, OutValue, OutCont, OutAlt, OutBind,
   OutId, OutVar, OutTyVar, OutCoVar,
   
-  mkBoundTo,
+  mkBoundTo, findDef, setDef,
   initialEnv, mkSuspension, enterScope, enterScopes, mkFreshVar, mkFreshContId,
   substId, substTy, substTyVar, substTyStatic, substCo, substCoVar, substCoStatic,
   extendIdSubst, zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
@@ -23,14 +23,20 @@ module Language.SequentCore.Simpl.Env (
 import Language.SequentCore.Pretty ()
 import Language.SequentCore.Simpl.ExprSize
 import Language.SequentCore.Syntax
+import Language.SequentCore.Translate
 
-import BasicTypes ( OccInfo(..), TopLevelFlag(..), RecFlag(..)
+import BasicTypes ( TopLevelFlag(..), RecFlag(..)
                   , isTopLevel, isNotTopLevel, isNonRec )
 import Coercion   ( Coercion, CvSubstEnv, CvSubst, mkCvSubst )
 import qualified Coercion
-import DynFlags ( DynFlags, ufCreationThreshold )
+import CoreSyn    ( Unfolding(..), UnfoldingGuidance(..), UnfoldingSource(..)
+                  , mkOtherCon )
+import CoreUnfold ( mkCoreUnfolding, mkDFunUnfolding  )
+import DataCon    ( DataCon, dataConRepType )
+import DynFlags   ( DynFlags, ufCreationThreshold )
 import FastString ( FastString, fsLit )
 import Id
+import IdInfo
 import Maybes
 import OrdList
 import Outputable
@@ -41,8 +47,9 @@ import Var
 import VarEnv
 import VarSet
 
-import Control.Exception ( assert )
-import Control.Monad     ( liftM )
+import Control.Applicative ( (<|>) )
+import Control.Exception   ( assert )
+import Control.Monad       ( liftM )
 
 infixl 1 `setStaticPart`
 
@@ -69,18 +76,26 @@ data SubstAns
 -- paper, section 6.3.)
 type IdDefEnv = IdEnv Definition
 data Definition
-  = BoundTo OutValue OccInfo TopLevelFlag Guidance
+  = BoundTo { defValue :: OutValue
+            , defLevel :: TopLevelFlag
+            , defGuidance :: Guidance
+            }
+  | BoundToDFun { dfunBndrs :: [Var]
+                , dfunDataCon :: DataCon
+                , dfunArgs :: [OutValue] }
   | NotAmong [AltCon]
 
 data Guidance
   = Never
--- TODO: Usually  { guEvenIfUnsat :: Bool, guEvenIfBoring :: Bool }
+  | Usually   { guEvenIfUnsat :: Bool
+              , guEvenIfBoring :: Bool } -- currently only used when translated
+                                         -- from a Core unfolding
   | Sometimes { guSize :: Int
               , guArgDiscounts :: [Int]
               , guResultDiscount :: Int }
 
-mkBoundTo :: DynFlags -> OutValue -> OccInfo -> TopLevelFlag -> Definition
-mkBoundTo dflags val occ level = BoundTo val occ level (mkGuidance dflags val)
+mkBoundTo :: DynFlags -> OutValue -> TopLevelFlag -> Definition
+mkBoundTo dflags val level = BoundTo val level (mkGuidance dflags val)
 
 mkGuidance :: DynFlags -> OutValue -> Guidance
 mkGuidance dflags val
@@ -382,7 +397,7 @@ extendFloats env bind
     bndrs = bindersOf bind
     defs = map asDef (flattenBind bind)
     -- FIXME The NotTopLevel flag might wind up being wrong!
-    asDef (x, val) = (x, mkBoundTo (se_dflags env) val (idOccInfo x) NotTopLevel)
+    asDef (x, val) = (x, mkBoundTo (se_dflags env) val NotTopLevel)
 
 addFloats :: SimplEnv -> SimplEnv -> SimplEnv
 -- Add the floats for env2 to env1;
@@ -428,6 +443,54 @@ getFloats = se_floats
 isEmptyFloats :: SimplEnv -> Bool
 isEmptyFloats = isNilOL . floatBinds . se_floats
 
+findDef :: SimplEnv -> OutId -> Maybe Definition
+findDef env var
+  = lookupVarEnv (se_defs env) var <|> unfoldingToDef (unfoldingInfo (idInfo var))
+
+unfoldingToDef :: Unfolding -> Maybe Definition
+unfoldingToDef NoUnfolding     = Nothing
+unfoldingToDef (OtherCon cons) = Just (NotAmong cons)
+unfoldingToDef unf@(CoreUnfolding {})
+  = Just $ BoundTo { defValue    = valueFromCoreExpr (uf_tmpl unf)
+                   , defLevel    = if uf_is_top unf then TopLevel else NotTopLevel
+                   , defGuidance = unfGuidanceToGuidance (uf_guidance unf) }
+unfoldingToDef unf@(DFunUnfolding {})
+  = Just $ BoundToDFun { dfunBndrs    = df_bndrs unf
+                       , dfunDataCon  = df_con unf
+                       , dfunArgs     = map valueFromCoreExpr (df_args unf) }
+
+unfGuidanceToGuidance :: UnfoldingGuidance -> Guidance
+unfGuidanceToGuidance UnfNever = Never
+unfGuidanceToGuidance (UnfWhen { ug_unsat_ok = unsat , ug_boring_ok = boring })
+  = Usually { guEvenIfUnsat = unsat , guEvenIfBoring = boring }
+unfGuidanceToGuidance (UnfIfGoodArgs { ug_args = args, ug_size = size, ug_res = res })
+  = Sometimes { guSize = size, guArgDiscounts = args, guResultDiscount = res }
+
+setDef :: SimplEnv -> OutId -> Definition -> (SimplEnv, OutId)
+setDef env x def
+  = (env', x')
+  where
+    env' = env { se_inScope = extendInScopeSet (se_inScope env) x'
+               , se_defs    = extendVarEnv (se_defs env) x def }
+    x'   | DFunUnfolding {} <- idUnfolding x = x -- don't mess with these since
+                                                 -- we don't generate them
+         | otherwise = x `setIdUnfolding` defToUnfolding def
+
+defToUnfolding :: Definition -> Unfolding
+defToUnfolding (NotAmong cons) = mkOtherCon cons
+defToUnfolding (BoundTo { defValue = val, defLevel = lev, defGuidance = guid })
+  = mkCoreUnfolding InlineRhs (isTopLevel lev) (valueToCoreExpr val)
+      (valueArity val) (guidanceToUnfGuidance guid)
+defToUnfolding (BoundToDFun { dfunBndrs = bndrs, dfunDataCon = con, dfunArgs = args})
+  = mkDFunUnfolding bndrs con (map valueToCoreExpr args)
+
+guidanceToUnfGuidance :: Guidance -> UnfoldingGuidance
+guidanceToUnfGuidance Never = UnfNever
+guidanceToUnfGuidance (Usually { guEvenIfUnsat = unsat, guEvenIfBoring = boring })
+  = UnfWhen { ug_unsat_ok = unsat, ug_boring_ok = boring }
+guidanceToUnfGuidance (Sometimes { guSize = size, guArgDiscounts = args, guResultDiscount = res})
+  = UnfIfGoodArgs { ug_size = size, ug_args = args, ug_res = res }
+
 -- TODO This might be in Syntax, but since we're not storing our "unfoldings" in
 -- ids, we rely on the environment to tell us whether a variable has been
 -- evaluated.
@@ -437,9 +500,9 @@ valueIsHNF _   (Lit {})  = True
 valueIsHNF _   (Cons {}) = True
 valueIsHNF env (Var id)
   = case lookupVarEnv (se_defs env) id of
-      Just (NotAmong {})            -> True
-      Just (BoundTo val _ _ _) -> valueIsHNF env val
-      _                             -> False
+      Just (NotAmong {})      -> True
+      Just (BoundTo val _ _)  -> valueIsHNF env val
+      _                       -> False
 valueIsHNF env (Compute _ comm) = commandIsHNF env comm
 valueIsHNF _   _        = False
 
@@ -479,17 +542,24 @@ instance Outputable StaticEnv where
 instance Outputable SubstAns where
   ppr (DoneVal v) = brackets (text "Value:" <+> ppr v)
   ppr (DoneId x) = brackets (text "Id:" <+> ppr x)
---  ppr (SuspVal env v)
---    = brackets $ hang (text "Suspended:") 2 (sep [ppr env, ppr v])
+  ppr (SuspVal _ val@(Cont (Return _))) = brackets (text "Suspended:" <+> ppr val)
   ppr (SuspVal {}) = text "Suspended"
+--  ppr (SuspVal _env v)
+--    = brackets $ hang (text "Suspended:") 2 (ppr v)
 
 instance Outputable Definition where
-  ppr (BoundTo c occ level guid)
-    = brackets (ppr occ <+> comma <+> ppr level <+> ppr guid) <+> ppr c
+  ppr (BoundTo c level guid)
+    = brackets (ppr level <+> ppr guid) <+> ppr c
+  ppr (BoundToDFun bndrs con args)
+    = char '\\' <+> hsep (map ppr bndrs) <+> arrow <+> ppr con <+> hsep (map (parens . ppr) args)
   ppr (NotAmong alts) = text "NotAmong" <+> ppr alts
 
 instance Outputable Guidance where
   ppr Never = text "Never"
+  ppr (Usually unsatOk boringOk)
+    = text "Usually" <+> brackets (hsep $ punctuate comma $ catMaybes
+                                    [if unsatOk then Just (text "even if unsat") else Nothing,
+                                     if boringOk then Just (text "even if boring cxt") else Nothing])
   ppr (Sometimes base argDiscs resDisc)
     = text "Sometimes" <+> brackets (int base <+> ppr argDiscs <+> int resDisc)
 

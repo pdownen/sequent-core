@@ -10,9 +10,11 @@
 
 module Language.SequentCore.Translate (
   -- $txn
-  fromCoreModule,
+  fromCoreModule, valueFromCoreExpr,
   bindsToCore,
-  commandToCoreExpr, valueToCoreExpr, contToCoreExpr
+  commandToCoreExpr, valueToCoreExpr, contToCoreExpr,
+  
+  mkLetContId, mkArgContId, mkLamContId -- TODO Move these elsewhwere
 ) where
 
 import Language.SequentCore.Syntax
@@ -21,6 +23,7 @@ import qualified CoreSyn as Core
 import qualified CoreUtils as Core
 import DataCon
 import FastString
+import qualified CoreFVs as Core
 import Id
 import Maybes
 import qualified MkCore as Core
@@ -43,6 +46,19 @@ import System.IO.Unsafe (unsafePerformIO)
 -- of the indended invariants of these functions would entail some sort of
 -- /bisimulation/, but it should suffice to know that the translations are
 -- "faithful enough."
+
+-- Public interface for Core --> Sequent Core
+
+-- | Translates a list of Core bindings into Sequent Core.
+fromCoreModule :: [Core.CoreBind] -> [SeqCoreBind]
+fromCoreModule binds = runFromCoreM $ fromCoreBinds emptyInScopeSet binds
+
+-- | Translates a single Core expression as a Sequent Core value.
+valueFromCoreExpr :: Core.CoreExpr -> SeqCoreValue
+valueFromCoreExpr expr
+  = runFromCoreM $ fromCoreExprAsValue freeVarSet expr mkLetContId
+  where
+    freeVarSet = mkInScopeSet (Core.exprFreeVars expr)
 
 type FromCoreEnv = InScopeSet
 
@@ -174,13 +190,9 @@ fromCoreBind env cont_maybe bind =
                        return (env', Rec pairs')
       where env'    = extendInScopeSetList env (map fst pairs)
 
--- | Translates a list of Core bindings into Sequent Core.
 fromCoreBinds :: FromCoreEnv -> [Core.CoreBind] -> FromCoreM [SeqCoreBind]
 fromCoreBinds env binds
   = snd <$> mapAccumLM (\env' -> fromCoreBind env' Nothing) env binds
-
-fromCoreModule :: [Core.CoreBind] -> [SeqCoreBind]
-fromCoreModule binds = runFromCoreM $ fromCoreBinds emptyInScopeSet binds
 
 -- | Translates a command into Core.
 commandToCoreExpr :: ContId -> SeqCoreCommand -> Core.CoreExpr
