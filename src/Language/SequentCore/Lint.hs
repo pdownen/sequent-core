@@ -1,6 +1,7 @@
 module Language.SequentCore.Lint ( lintCoreBindings, lintValue ) where
 
 import Language.SequentCore.Syntax
+import Language.SequentCore.WiredIn
 
 import Coercion     ( coercionKind, coercionType )
 import DataCon
@@ -216,59 +217,8 @@ checkingType desc ex go
     unless (ex `eqType` act) $ mkError desc (ppr ex) (ppr act)
     return act
 
-{-
-checkingPiVsSigmaType :: SDoc -> Type -> LintM Type -> LintM Type
-checkingPiVsSigmaType desc ex go
-  = do
-    act <- go
-    unless (ex `orthTypes` act) $
-      Left (desc $$ text "expected orth to:" <+> pprSigmaTy ex
-                 $$ text "          actual:" <+> pprSigmaTy act)
-    return act
--}
-  
 contIdTyOrError :: LintEnv -> ContId -> LintM Type
 contIdTyOrError env k
-  = case splitFunTy_maybe (substTy env (idType k)) of
-      Just (arg, _) -> return arg
-      _             -> Left (text "bad cont type:" <+> pprBndr LetBind k)
-
-{-
-promotedPairDataCon :: TyCon
-promotedPairDataCon = promotedTupleDataCon BoxedTuple 2
-
--- Dual of a pi-type. We fake this using promoted pairs. Can't be confused with
--- the type of actual data, since such a thing always has kind * (or # or a few
--- others, but certainly not kind '(*, *)).
-mkSigmaType :: Type -> Type -> Type
-mkSigmaType ty1 ty2 = mkTyConApp promotedPairDataCon [ty1, ty2]
-
-splitSigmaTy_maybe :: Type -> Maybe (Type, Type)
-splitSigmaTy_maybe ty
-  | Just (con, [t1, t2]) <- splitTyConApp_maybe ty
-  , con == promotedPairDataCon
-  = Just (t1, t2)
-  | otherwise
-  = Nothing
-
-orthTypes :: Type -> Type -> Bool
-orthTypes ty1 ty2
-  | Just (tyArg, restTy2) <- splitSigmaTy_maybe ty2
-  = case splitForAllTy_maybe ty1 of
-      Nothing -> False
-      Just (tyVar, restTy1)
-        -> let boundTy | isKindVar tyVar = typeKind tyArg -- undo sigma-type hack
-                       | otherwise       = tyArg
-               tvs = extendTvSubst emptyTvSubst tyVar boundTy
-           in substTy tvs restTy1 `orthTypes` substTy tvs restTy2
-           -- It's O(n^2) to substitute one-by-one, but types aren't that big
-  | otherwise
-  = ty1 `eqType` ty2
-
-pprSigmaTy :: Type -> SDoc
-pprSigmaTy ty
-  | Just (ty1, ty2) <- splitSigmaTy_maybe ty
-  = parens (ppr ty1 <> comma <+> pprSigmaTy ty2)
-  | otherwise
-  = ppr ty
--}
+  = case isContTy_maybe (substTy env (idType k)) of
+      Just arg -> return arg
+      _        -> Left (text "bad cont type:" <+> pprBndr LetBind k)

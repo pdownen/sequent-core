@@ -32,7 +32,7 @@ import qualified Coercion
 import CoreSyn    ( Unfolding(..), UnfoldingGuidance(..), UnfoldingSource(..)
                   , mkOtherCon )
 import CoreUnfold ( mkCoreUnfolding, mkDFunUnfolding  )
-import DataCon    ( DataCon, dataConRepType )
+import DataCon    ( DataCon )
 import DynFlags   ( DynFlags, ufCreationThreshold )
 import FastString ( FastString, fsLit )
 import Id
@@ -144,11 +144,10 @@ enterScope env x
   = (env'', x')
   where
     SimplEnv { se_inScope = ins, se_idSubst = ids } = env
-    x1    | isContId x = uniqAwayContId ins x
-          | otherwise  = uniqAway ins x
+    x1    = uniqAway ins x
     x'    = substIdType env x1
     env'  | x' /= x   = env { se_idSubst = extendVarEnv ids x (DoneId x') }
-          | otherwise = env
+          | otherwise = env { se_idSubst = delVarEnv ids x }
     ins'  = extendInScopeSet ins x'
     env'' = env' { se_inScope = ins' }
 
@@ -169,12 +168,11 @@ mkFreshVar env name ty
         env' = env { se_inScope = extendInScopeSet (se_inScope env) x' }
     return (env', x')
 
-mkFreshContId :: MonadUnique m => SimplEnv -> FastString -> Type -> Type
-              -> m (SimplEnv, ContId)
-mkFreshContId env name inTy outTy
+mkFreshContId :: MonadUnique m => SimplEnv -> FastString -> Type -> m (SimplEnv, ContId)
+mkFreshContId env name inTy
   = do
-    k <- asContId `liftM` mkSysLocalM name (Type.mkFunTy inTy outTy)
-    let k'   = uniqAwayContId (se_inScope env) k
+    k <- asContId `liftM` mkSysLocalM name inTy
+    let k'   = uniqAway (se_inScope env) k
         env' = env { se_inScope = extendInScopeSet (se_inScope env) k' }
     return (env', k')
 
@@ -262,18 +260,13 @@ setSubstEnvs env ids tvs cvs k
 bindCont :: MonadUnique m => SimplEnv -> StaticEnv -> InCont -> m SimplEnv
 bindCont env stat cont
   = do
-    let retId = se_retId env `orElse` panic "bindCont at top level"
-        retTy = case Type.splitFunTy_maybe (idType retId) of
-                  Just (argTy, _) -> argTy
-                  Nothing         -> pprPanic "bindCont with retId" (pprBndr LetBind retId)
-    k <- mkSysLocalM (fsLit "k") (Type.mkFunTy (contType cont) retTy)
-    let k' = uniqAwayContId (se_inScope env) k
+    k <- mkSysLocalM (fsLit "k") (contType cont)
+    let k' = uniqAway (se_inScope env) k
     return $ bindContAs env k' stat cont
 
 bindContAs :: SimplEnv -> ContId -> StaticEnv -> InCont -> SimplEnv
 bindContAs env k stat cont
-  = env { se_inScope = extendInScopeSet (se_inScope env) k
-        , se_idSubst = extendVarEnv (se_idSubst env) k
+  = env { se_idSubst = extendVarEnv (se_idSubst env) k
                          (SuspVal stat (Cont cont))
         , se_retId   = Just k }
 

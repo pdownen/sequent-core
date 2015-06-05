@@ -1,4 +1,4 @@
-{-# LANGUAGE ParallelListComp #-}
+{-# LANGUAGE ParallelListComp, TupleSections #-}
 
 -- | 
 -- Module      : Language.SequentCore.Simpl
@@ -38,7 +38,7 @@ import MkCore      ( mkWildValBinder )
 import MonadUtils  ( mapAccumLM )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
-import Type        ( applyTys, isUnLiftedType, mkFunTy, mkTyVarTy, splitFunTys )
+import Type        ( applyTys, isUnLiftedType, mkTyVarTy, splitFunTys )
 import Var
 import VarEnv
 import VarSet
@@ -71,7 +71,7 @@ plugin = defaultPlugin {
     = []
 
   newPass max mode
-    = CoreDoPluginPass "SeqSimpl" (runSimplifier max mode)
+    = CoreDoPluginPass "SeqSimpl" (runSimplifier (3*max) mode) -- TODO Use less gas
 
 runSimplifier :: Int -> SimplifierMode -> ModGuts -> CoreM ModGuts
 runSimplifier iters mode guts
@@ -92,8 +92,8 @@ runSimplifier iters mode guts
             occBinds  = runOccurAnal mod coreBinds
             binds     = fromCoreModule occBinds
         when linting $ case lintCoreBindings binds of
-          Just err -> pprPanic "Core Lint error (pre-simpl)"
-            (err $$ pprTopLevelBinds binds)
+          Just err -> pprPgmError "Core Lint error (pre-simpl)"
+            (withPprStyle defaultUserStyle $ err $$ pprTopLevelBinds binds)
           Nothing -> return ()
         when dumping $ putMsg  $ text "BEFORE" <+> int n
                               $$ text "--------" $$ pprTopLevelBinds binds
@@ -156,7 +156,7 @@ simplValue env (Compute k (Command [] val (Return k')))
   = simplValue env val
 simplValue env v
   = do
-    (env', k) <- mkFreshContId env (fsLit "*valk") ty ty
+    (env', k) <- mkFreshContId env (fsLit "*valk") ty
     let env'' = zapFloats $ setCont env' k
     (env''', comm) <- simplCut env'' v (staticPart env'') (Return k)
     return (env `addFloats` env''', mkCompute k comm)
@@ -170,7 +170,7 @@ simplBinds env bs level
 simplBind :: SimplEnv -> InBind -> TopLevelFlag
           -> SimplM SimplEnv
 --simplBind env level bind
---  | pprTrace "simplBind" (text "Binding" <+> parens (ppr level) <> colon <+>
+--  | pprTraceShort "simplBind" (text "Binding" <+> parens (ppr level) <> colon <+>
 --                          ppr bind) False
 --  = undefined
 simplBind env (NonRec x v) level
@@ -189,7 +189,7 @@ simplLazyBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InValue -> TopLevel
               -> RecFlag -> SimplM SimplEnv
 simplLazyBind env_x x x' env_v v level isRec
   | tracing
-  , pprTrace "simplLazyBind" (ppr x <+> darrow <+> ppr x' <+> ppr level <+> ppr isRec) False
+  , pprTraceShort "simplLazyBind" (ppr x <+> darrow <+> ppr x' <+> ppr level <+> ppr isRec) False
   = undefined
   | isTyVar x
   , Type ty <- assert (isTypeValue v) v
@@ -229,7 +229,7 @@ simplLazyBind env_x x x' env_v v level isRec
                DupeSome dupk nodup -> do
                  (env_v''', nodup') <- simplCont env_v'' nodup
                  (env_v'''', new_x) <-
-                   mkFreshContId env_v''' (fsLit "*nodup") (contType nodup') (retType env_v''')
+                   mkFreshContId env_v''' (fsLit "*nodup") (contType nodup')
                  env_x' <- finish new_x new_x env_v'''' (Cont nodup')
                  tick (PostInlineUnconditionally x)
                  -- Trickily, nodup may have been duped after all if it's
@@ -282,7 +282,7 @@ wrapFloatsAroundValue env val
   | otherwise
   = do
     let ty = valueType val
-    (env', k) <- mkFreshContId env (fsLit "*wrap") ty ty
+    (env', k) <- mkFreshContId env (fsLit "*wrap") ty
     return $ mkCompute k $ wrapFloats env' (mkCommand [] val (Return k))
 
 completeNonRec :: SimplEnv -> InVar -> OutVar -> OutValue -> TopLevelFlag
@@ -330,7 +330,7 @@ simplCut :: SimplEnv -> InValue -> StaticEnv -> InCont
                      -> SimplM (SimplEnv, OutCommand)
 simplCut env_v v env_k cont
   | tracing
-  , pprTrace "simplCut" (
+  , pprTraceShort "simplCut" (
       ppr env_v $$ ppr v $$ ppr env_k $$ ppr cont
     ) False
   = undefined
@@ -414,7 +414,7 @@ simplCut2 env_v val env_k (Case case_bndr [Alt _ bndrs rhs])
  , if isUnLiftedType (idType case_bndr)
    then elim_unlifted        -- Satisfy the let-binding invariant
    else elim_lifted
-  = do  { -- pprTrace "case elim" (vcat [ppr case_bndr, ppr (exprIsHNF scrut),
+  = do  { -- pprTraceShort "case elim" (vcat [ppr case_bndr, ppr (exprIsHNF scrut),
           --                            ppr ok_for_spec,
           --                            ppr scrut]) $
           tick (CaseElim case_bndr)
@@ -520,7 +520,7 @@ simplContNoFloats env cont
 simplCont :: SimplEnv -> InCont -> SimplM (SimplEnv, OutCont)
 simplCont env cont
   | tracing
-  , pprTrace "simplCont" (
+  , pprTraceShort "simplCont" (
       ppr env $$ ppr cont
     ) False
   = undefined
@@ -528,10 +528,10 @@ simplCont env cont
   = go env cont (\k -> k)
   where
     go :: SimplEnv -> InCont -> (OutCont -> OutCont) -> SimplM (SimplEnv, OutCont)
-    go _env cont _
+    go env cont _
       | tracing
-      , pprTrace "simplCont::go" (
-          ppr cont
+      , pprTraceShort "simplCont::go" (
+          ppr env $$ ppr cont
         ) False
       = undefined
     go env (App arg cont) kc
@@ -780,7 +780,7 @@ smallEnough env _val (Sometimes bodySize argWeights resWeight) cont
 
 inlineDFun :: SimplEnv -> [Var] -> DataCon -> [OutValue] -> InCont -> Maybe OutValue
 inlineDFun env bndrs con conArgs cont
---  | pprTrace "inlineDFun" (sep [ppr bndrs, ppr con, ppr conArgs, ppr cont] $$
+--  | pprTraceShort "inlineDFun" (sep [ppr bndrs, ppr con, ppr conArgs, ppr cont] $$
 --      if enoughArgs && contIsCase env cont' then text "YES" else text "NO") False
 --  = undefined
   | enoughArgs, contIsCase env cont'
@@ -793,7 +793,7 @@ inlineDFun env bndrs con conArgs cont
     val | null bndrs = bodyVal
         | otherwise  = Lam bndrs k (Command [] bodyVal (Return k))
     bodyVal       = Cons con conArgs
-    k             = mkLamContId (mkFunTy ty ty)
+    k             = mkLamContId ty
     (_, ty)       = splitFunTys (applyTys (dataConRepType con) (map mkTyVarTy tyBndrs))
     tyBndrs       = takeWhile isTyVar bndrs
 
@@ -880,7 +880,7 @@ makeTrivial env val
   | otherwise
   = do
     (env', bndr) <- case val of
-      Cont cont -> mkFreshContId env (fsLit "*k") (contType cont) (retType env)
+      Cont cont -> mkFreshContId env (fsLit "*k") (contType cont)
       _         -> mkFreshVar    env (fsLit "a") (valueType val)
     env'' <- simplLazyBind env' bndr bndr (staticPart env') val NotTopLevel NonRecursive
     val_final <- simplVar env'' bndr

@@ -29,13 +29,13 @@ module Language.SequentCore.Syntax (
   valueIsCheap, contIsCheap, commandIsCheap,
   valueIsExpandable, contIsExpandable, commandIsExpandable,
   -- * Continuation ids
-  contIdTag, builtinContIdTag, builtinContRelatedIdTag,
-  isContId, asContId, uniqAwayContId,
+  isContId, asContId, Language.SequentCore.WiredIn.mkContTy, contTyArg,
   -- * Alpha-equivalence
   (=~=), AlphaEq(..), AlphaEnv, HasId(..)
 ) where
 
 import {-# SOURCE #-} Language.SequentCore.Pretty ()
+import Language.SequentCore.WiredIn
 
 import Coercion  ( Coercion, coercionType, coercionKind )
 import CoreSyn   ( AltCon(..), Tickish, tickishCounts, isRuntimeVar
@@ -43,9 +43,10 @@ import CoreSyn   ( AltCon(..), Tickish, tickishCounts, isRuntimeVar
 import DataCon   ( DataCon, dataConRepType, dataConTyCon )
 import Id        ( Id, isDataConWorkId, isDataConWorkId_maybe, isConLikeId
                  , idArity, idType, idDetails, idUnfolding 
-                 , idUnique, setIdUnique, isBottomingId )
+                 , setIdType, isBottomingId )
 import IdInfo    ( IdDetails(..) )
 import Literal   ( Literal, isZeroLit, litIsTrivial, literalType )
+import Maybes    ( orElse )
 import Outputable
 import Pair
 import PrimOp    ( PrimOp(..), primOpOkForSpeculation, primOpOkForSideEffects
@@ -54,7 +55,6 @@ import TyCon
 import Type      ( Type, KindOrType )
 import qualified Type
 import TysPrim
-import Unique    ( newTagUnique, unpkUnique )
 import Var       ( Var, isId )
 import VarEnv
 
@@ -185,18 +185,10 @@ mkCompute :: HasId b => b -> Command b -> Value b
 mkCompute k comm
   | Just val <- asValueCommand kid comm
   = val
-  | not correctType -- skip the test if it's a value command because idType
-                    -- gives a warning if it's a type variable
-  = pprPanic "mkCompute" (ppr kid <+> dcolon <+> ppr (idType kid))
   | otherwise
   = Compute k comm
   where
     kid = identifier k
-    correctType
-      | Just (argTy, retTy) <- Type.splitFunTy_maybe (idType kid)
-      = argTy `Type.eqType` retTy
-      | otherwise
-      = False
 
 -- | Adds the given bindings outside those in the given command.
 addLets :: [Bind b] -> Command b -> Command b
@@ -400,27 +392,19 @@ bindersOfBinds = concatMap bindersOf
 valueType :: HasId b => Value b -> Type
 valueType (Lit l)        = literalType l
 valueType (Var x)        = idType x
-valueType (Lam xs k _)   = Type.mkPiTypes (map identifier xs) retTy
-  where
-    retTy = case Type.splitFunTy_maybe (idType (identifier k)) of
-              Just (argTy, _) -> argTy
-              Nothing         -> pprPanic "valueType (Lam)" (pprBndr LetBind (identifier k))
+valueType (Lam xs k _)   = Type.mkPiTypes (map identifier xs) (contTyArg (idType (identifier k)))
 valueType (Cons con as)  = res_ty
   where
     (tys, _) = partitionTypes as
     (_, res_ty) = Type.splitFunTys (dataConRepType con `Type.applyTys` tys)
-valueType (Compute k _)  = case Type.splitFunTy_maybe (idType (identifier k)) of
-                             Just (argTy, _) -> argTy
-                             Nothing         -> pprPanic "valueType (Compute)" (pprBndr LetBind (identifier k))
+valueType (Compute k _)  = contTyArg (idType (identifier k))
 -- see exprType in GHC CoreUtils
 valueType _other         = alphaTy
 
--- | Compute the type a continuation accepts. IMPORTANT: This is *not* the type
--- that a cont identifier will be assigned; for compatibility with Core, a
--- ContId's type is a function type from the accepted type to the type of the
--- continuation's static context.
+-- | Compute the type a continuation accepts. If @contType cont@ is Foo and @cont@ is bound
+-- to @k@, then @k@'s @idType@ will be @!Foo@.
 contType :: HasId b => Cont b -> Type
-contType (Return k)   = Type.funArgTy (idType k)
+contType (Return k)   = contTyArg (idType k)
 contType (App arg k)  = Type.mkFunTy (valueType arg) (contType k)
 contType (Cast co k)  = let Pair fromTy toTy = coercionKind co
                         in assert (toTy `Type.eqType` contType k) fromTy
@@ -620,42 +604,17 @@ isExpandableApp fid valArgCount = isConLikeId fid
 -- Continuation ids
 --------------------------------------------------------------------------------
 
--- | INTERNAL USE ONLY.
-contIdTag, builtinContIdTag, builtinContRelatedIdTag :: Char
--- TODO Yuck. Find a way around this by any means necessary.
--- Should be different from any unique tag used anywhere else (!!)
-contIdTag = '*'
-
--- | INTERNAL USE ONLY.
-builtinContIdTag = 'Q'
-
--- | INTERNAL USE ONLY.
-builtinContRelatedIdTag = 'q'
-
 -- | Find whether an id is a continuation id.
 isContId :: Id -> Bool
-isContId x = tag == contIdTag || tag == builtinContIdTag
-  where (tag, _) = unpkUnique (idUnique x) -- barf
+isContId x = isContTy (idType x)
 
--- | Tag an id as a continuation id. This changes the unique of the id, so the
--- returned id is always distinct from the argument in comparisons.
+-- | Tag an id as a continuation id.
 asContId :: Id -> ContId
-asContId x = x `setIdUnique` uniq'
-  where
-    uniq' = newTagUnique (idUnique x) contIdTag
+asContId x | isContId x = x
+           | otherwise  = x `setIdType` mkContTy (idType x)
 
--- | Version of 'VarEnv.uniqAway' that works for continuation variables.
-uniqAwayContId :: InScopeSet -> ContId -> ContId
-uniqAwayContId ins k
-  = let k' = asContId (uniqAway ins k)
-    in case lookupInScope ins k' of
-         -- Apparently, once we change the tag of the unique returned by
-         -- uniqAway, we get something that collides again. Hence we use this
-         -- (exceedingly hacky) way of asking again: Adding something to an
-         -- InScopeSet, even if it's already there, increases the counter that
-         -- feeds into uniqAway's id creation.
-         Just cont -> uniqAwayContId (extendInScopeSet ins cont) k'
-         Nothing -> k'
+contTyArg :: Type -> Type
+contTyArg ty = isContTy_maybe ty `orElse` pprPanic "contTyArg" (ppr ty)
 
 --------------------------------------------------------------------------------
 -- Alpha-Equivalence
