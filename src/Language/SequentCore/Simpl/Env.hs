@@ -9,7 +9,7 @@ module Language.SequentCore.Simpl.Env (
   
   mkBoundTo, findDef, setDef,
   initialEnv, mkSuspension, enterScope, enterScopes, mkFreshVar, mkFreshContId,
-  substId, substTy, substTyVar, substTyStatic, substCo, substCoVar, substCoStatic,
+  substId, substTy, substTyVar, substCo, substCoVar,
   extendIdSubst, zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
   inDynamicScope, zapCont, bindCont, bindContAs, pushCont, setCont, retType, restoreEnv,
   
@@ -27,7 +27,7 @@ import Language.SequentCore.Translate
 
 import BasicTypes ( TopLevelFlag(..), RecFlag(..)
                   , isTopLevel, isNotTopLevel, isNonRec )
-import Coercion   ( Coercion, CvSubstEnv, CvSubst, mkCvSubst )
+import Coercion   ( Coercion, CvSubstEnv, CvSubst(..), isCoVar )
 import qualified Coercion
 import CoreSyn    ( Unfolding(..), UnfoldingGuidance(..), UnfoldingSource(..)
                   , mkOtherCon )
@@ -141,15 +141,21 @@ mkSuspension = SuspVal
 
 enterScope :: SimplEnv -> InVar -> (SimplEnv, OutVar)
 enterScope env x
-  = (env'', x')
+  = (env', x')
   where
-    SimplEnv { se_inScope = ins, se_idSubst = ids } = env
+    SimplEnv { se_inScope = ins, se_idSubst = ids, se_tvSubst = tvs, se_cvSubst = cvs } = env
     x1    = uniqAway ins x
     x'    = substIdType env x1
-    env'  | x' /= x   = env { se_idSubst = extendVarEnv ids x (DoneId x') }
-          | otherwise = env { se_idSubst = delVarEnv ids x }
+    env'  | isTyVar x = env { se_tvSubst = tvs', se_inScope = ins' }
+          | isCoVar x = env { se_cvSubst = cvs', se_inScope = ins' }
+          | otherwise = env { se_idSubst = ids', se_inScope = ins' }
+    ids'  | x' /= x   = extendVarEnv ids x (DoneId x')
+          | otherwise = delVarEnv ids x
+    tvs'  | x' /= x   = extendVarEnv tvs x (Type.mkTyVarTy x')
+          | otherwise = delVarEnv tvs x
+    cvs'  | x' /= x   = extendVarEnv cvs x (Coercion.mkCoVarCo x')
+          | otherwise = delVarEnv cvs x
     ins'  = extendInScopeSet ins x'
-    env'' = env' { se_inScope = ins' }
 
 enterScopes :: SimplEnv -> [InVar] -> (SimplEnv, [OutVar])
 enterScopes env []
@@ -203,9 +209,6 @@ substTy env t = Type.substTy (getTvSubst env) t
 substTyVar :: SimplEnv -> TyVar -> Type
 substTyVar env tv = Type.substTyVar (getTvSubst env) tv
 
-substTyStatic :: StaticEnv -> Type -> Type
-substTyStatic (StaticEnv env) = substTy env
-
 substIdType :: SimplEnv -> Var -> Var
 substIdType env x
   | isEmptyVarEnv tvs || isEmptyVarSet (tyVarsOfType ty)
@@ -217,26 +220,13 @@ substIdType env x
     ty = idType x
 
 getCvSubst :: SimplEnv -> CvSubst
-getCvSubst env = mkCvSubstFromSubstEnv (se_inScope env) (se_cvSubst env)
+getCvSubst env = CvSubst (se_inScope env) (se_tvSubst env) (se_cvSubst env)
 
 substCo :: SimplEnv -> Coercion -> Coercion
 substCo env co = Coercion.substCo (getCvSubst env) co
 
 substCoVar :: SimplEnv -> CoVar -> Coercion
 substCoVar env co = Coercion.substCoVar (getCvSubst env) co
-
-substCoStatic :: StaticEnv -> Coercion -> Coercion
-substCoStatic (StaticEnv env) = substCo env
-
-cvSubstPairs :: InScopeSet -> CvSubstEnv -> [(Var, Coercion)]
-cvSubstPairs ins cvs
-  = mapMaybe lookupWithKey vars
-  where
-    lookupWithKey x = lookupVarEnv cvs x >>= \co -> Just (x, co)
-    vars = varEnvElts (getInScopeVars ins)
-
-mkCvSubstFromSubstEnv :: InScopeSet -> CvSubstEnv -> CvSubst
-mkCvSubstFromSubstEnv ins cvs = mkCvSubst ins (cvSubstPairs ins cvs)
 
 extendIdSubst :: SimplEnv -> InVar -> SubstAns -> SimplEnv
 extendIdSubst env x rhs

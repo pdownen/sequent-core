@@ -8,9 +8,9 @@
 
 module Language.SequentCore.Syntax (
   -- * AST Types
-  Value(..), Cont(..), Command(..), Bind(..), Alt(..), AltCon(..), ContId,
+  Value(..), Cont(..), Command(..), Bind(..), Alt(..), AltCon(..), Expr(..), ContId,
   SeqCoreValue, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreBndr,
-    SeqCoreAlt,
+    SeqCoreAlt, SeqCoreExpr,
   -- * Constructors
   mkCommand, mkCompute, addLets, addNonRec,
   -- * Deconstructors
@@ -132,6 +132,10 @@ data Bind b     = NonRec b (Value b) -- ^ A single non-recursive binding.
 -- bound variables (empty for a literal), and the body as a 'Command'.
 data Alt b      = Alt AltCon [b] (Command b)
 
+-- | Some expression -- a value, a command, or a continuation. Useful for
+-- writing mutually recursive functions.
+data Expr a = V { unV :: Value a } | C { unC :: Command a } | K { unK :: Cont a }
+
 -- | Usual binders for Sequent Core terms
 type SeqCoreBndr    = Var
 -- | Usual instance of 'Value', with 'Var's for binders
@@ -144,6 +148,8 @@ type SeqCoreCommand = Command Var
 type SeqCoreBind    = Bind    Var
 -- | Usual instance of 'Alt', with 'Var's for binders
 type SeqCoreAlt     = Alt     Var
+-- | Usual instance of 'Expr', with 'Var's for binders
+type SeqCoreExpr    = Expr    Var
 
 --------------------------------------------------------------------------------
 -- Constructors

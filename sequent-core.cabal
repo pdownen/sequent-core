@@ -35,6 +35,7 @@ library
                        Language.SequentCore.Pretty
                        Language.SequentCore.Simpl
                        Language.SequentCore.SpecConstr
+                       Language.SequentCore.Subst
                        Language.SequentCore.Syntax
                        Language.SequentCore.Translate
   other-modules:       Language.SequentCore.Simpl.Env

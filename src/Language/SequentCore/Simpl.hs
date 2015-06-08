@@ -20,6 +20,7 @@ import Language.SequentCore.Simpl.Monad
 import Language.SequentCore.Syntax
 import Language.SequentCore.Translate
 import Language.SequentCore.Util
+import Language.SequentCore.WiredIn
 
 import BasicTypes
 import Coercion    ( Coercion, isCoVar )
@@ -93,13 +94,14 @@ runSimplifier iters mode guts
             binds     = fromCoreModule occBinds
         when linting $ case lintCoreBindings binds of
           Just err -> pprPgmError "Sequent Core Lint error (pre-simpl)"
-            (withPprStyle defaultUserStyle $ err $$ pprTopLevelBinds binds)
+            (withPprStyle defaultUserStyle $ err $$ pprTopLevelBinds binds $$ vcat (map ppr occBinds))
           Nothing -> return ()
         when dumping $ putMsg  $ text "BEFORE" <+> int n
                               $$ text "--------" $$ pprTopLevelBinds binds
         (binds', count) <- runSimplM globalEnv $ simplModule binds
         when linting $ case lintCoreBindings binds' of
-          Just err -> pprPanic "Sequent Core Lint error" (err $$ pprTopLevelBinds binds')
+          Just err -> pprPanic "Sequent Core Lint error"
+            (withPprStyle defaultUserStyle $ err $$ pprTopLevelBinds binds')
           Nothing -> return ()
         when dumping $ putMsg  $ text "AFTER" <+> int n
                               $$ text "-------" $$ pprTopLevelBinds binds'
@@ -193,7 +195,7 @@ simplLazyBind env_x x x' env_v v level isRec
   = undefined
   | isTyVar x
   , Type ty <- assert (isTypeValue v) v
-  = let ty'  = substTyStatic env_v ty
+  = let ty'  = substTy (env_v `inDynamicScope` env_x) ty
         tvs' = extendVarEnv (se_tvSubst env_x) x ty'
     in return $ env_x { se_tvSubst = tvs' }
   | isCoVar x
@@ -222,7 +224,7 @@ simplLazyBind env_x x x' env_v v level isRec
              case split of
                DupeAll dup -> do
                  tick (PostInlineUnconditionally x)
-                 return $ extendIdSubst env_x x (DoneVal (Cont dup))
+                 return $ extendIdSubst (env_x `addFloats` env_v'') x (DoneVal (Cont dup))
                DupeNone -> do
                  (env_v''', cont') <- simplCont env_v'' cont
                  finish x x' env_v''' (Cont cont')
@@ -387,9 +389,10 @@ simplCut2 env_v (Lam xs k c) env_k cont@(App {})
       else simplCut env_v' (Lam (drop (length args) xs) k c) env_k cont'
 simplCut2 env_v (Lam xs k c) env_k cont
   = do
-    let (env_v', k' : xs') = enterScopes env_v (k : xs)
-    c' <- simplCommandNoFloats (env_v' `setCont` k') c
-    simplContWith (env_v' `setStaticPart` env_k) (Lam xs' k' c') cont
+    let (env_v', xs') = enterScopes env_v xs
+        (env_v'', k') = enterScope env_v' k
+    c' <- simplCommandNoFloats (env_v'' `setCont` k') c
+    simplContWith (env_v'' `setStaticPart` env_k) (Lam xs' k' c') cont
 simplCut2 env_v val env_k cont
   | isManifestValue val
   , Just (env_k', x, alts) <- contIsCase_maybe (env_v `setStaticPart` env_k) cont

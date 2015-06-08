@@ -82,14 +82,7 @@ commandSize :: DynFlags -> Int -> SeqCoreCommand -> Maybe ExprSize
 -- between recursive calls; easiest to use one recursive function that takes
 -- a sum
 
-data Expr = V SeqCoreValue | C SeqCoreCommand | K SeqCoreCont
-
-instance Outputable Expr where
-  ppr (V val) = ppr val
-  ppr (C comm) = ppr comm
-  ppr (K cont) = ppr cont
-
-bodySize :: DynFlags -> Int -> [Id] -> Expr -> BodySize
+bodySize :: DynFlags -> Int -> [Id] -> SeqCoreExpr -> BodySize
 
 valueSize dflags cap (Lam xs _k body)
   = let valBinders = filter isId xs
