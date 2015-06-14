@@ -48,6 +48,8 @@ import Control.Applicative ( (<$>), (<*>) )
 import Control.Exception   ( assert )
 import Control.Monad       ( foldM, forM, when )
 
+import Data.Maybe          ( isJust )
+
 tracing, dumping, linting :: Bool
 tracing = False
 dumping = False
@@ -309,7 +311,9 @@ completeBind env x x' v level
             x''   = x' `setIdInfo` idInfo x
             ins'  = extendInScopeSet ins x''
             env'  = env { se_inScope = ins' }
-            (env'', x''') = setDef env' x'' (mkBoundTo dflags v level)
+            def   = mkBoundTo dflags v level
+            (env'', x''') = setDef env' x'' def
+        when tracing $ liftCoreM $ putMsg (text "defined" <+> ppr x''' <+> equals <+> ppr def)
         return $ addNonRecFloat env'' x''' v
 
 simplRec :: SimplEnv -> [(InVar, InValue)] -> TopLevelFlag
@@ -661,7 +665,6 @@ postInlineUnconditionally _env x v level
       | otherwise
       = case occ_info of
           OneOcc in_lam _one_br int_cxt
-            -- TODO Actually update unfoldings so that this makes sense
             ->     smallEnoughToInline dflags unfolding
                && (not in_lam ||
                     (isCheapUnfolding unfolding && int_cxt))
@@ -679,7 +682,9 @@ callSiteInline :: SimplEnv -> InVar -> InCont
 callSiteInline env_v x cont
   = do
     ans <- go <$> getMode <*> getDynFlags
-    -- liftCoreM $ putMsg $ text "callSiteInline" <+> pprBndr LetBind x <> colon <+> ppr ans
+    when tracing $ liftCoreM $ putMsg $ ans `seq`
+      hang (text "callSiteInline") 6 (pprBndr LetBind x <> colon
+        <+> (if isJust ans then text "YES" else text "NO") $$ ppr def)
     return ans
   where
     go _mode _dflags
@@ -749,14 +754,14 @@ noSizeIncrease _rhs _cont = False --TODO
 
 smallEnough :: SimplEnv -> OutValue -> Guidance -> InCont -> Bool
 smallEnough _ _ Never _ = False
-smallEnough _ val (Usually unsatOk boringOk) cont
-  = (unsatOk || unsat) && (boringOk || boring)
+smallEnough env val (Usually unsatOk boringOk) cont
+  = (unsatOk || not unsat) && (boringOk || not boring)
   where
     unsat = length valArgs < valueArity val
     (_, valArgs, _) = collectTypeAndOtherArgs cont
-    boring = isReturnCont cont -- FIXME Not all returns are boring! Also, in
-                               -- fact, some non-returns *are* boring (a cast
-                               -- isn't in itself interesting, for instance).
+    boring = isReturnCont cont && not (contIsCase env cont)
+    -- FIXME Should probably count known applications as interesting, too
+
 smallEnough env _val (Sometimes bodySize argWeights resWeight) cont
   -- The Formula (p. 40)
   = bodySize - sizeOfCall - keenness `times` discounts <= threshold

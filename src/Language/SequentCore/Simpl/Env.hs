@@ -454,7 +454,7 @@ setDef env x def
   = (env', x')
   where
     env' = env { se_inScope = extendInScopeSet (se_inScope env) x'
-               , se_defs    = extendVarEnv (se_defs env) x def }
+               , se_defs    = extendVarEnv (se_defs env) x' def }
     x'   | DFunUnfolding {} <- idUnfolding x = x -- don't mess with these since
                                                  -- we don't generate them
          | otherwise = x `setIdUnfolding` defToUnfolding def
@@ -534,7 +534,7 @@ instance Outputable SubstAns where
 
 instance Outputable Definition where
   ppr (BoundTo c level guid)
-    = brackets (ppr level <+> ppr guid) <+> ppr c
+    = sep [brackets (ppr level <+> ppr guid), ppr c]
   ppr (BoundToDFun bndrs con args)
     = char '\\' <+> hsep (map ppr bndrs) <+> arrow <+> ppr con <+> hsep (map (parens . ppr) args)
   ppr (NotAmong alts) = text "NotAmong" <+> ppr alts

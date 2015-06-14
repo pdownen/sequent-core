@@ -42,7 +42,7 @@ install :: [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
 install _ todos =
   do reinitializeGlobals
      -- This puts the dump pass at the beginning of the pipeline, before any
-     -- optimization. To see the post-optimizer state, put 'dump' at the back
+     -- optimization. To see the post-optimizer state, put @newPass@ at the back
      -- of the list instead.
      return $ newPass : todos
   where
