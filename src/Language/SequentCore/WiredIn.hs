@@ -1,7 +1,7 @@
 module Language.SequentCore.WiredIn (
   contKindTyCon, contTyCon, contFunTyCon,
   
-  contKind, mkContTy, isContTy, isContTy_maybe,
+  mkContKind, mkContTy, isContTy, isContTy_maybe,
   mkContFunTy, isContFunTy, splitContFunTy_maybe,
   sequentCoreTag, sequentCoreWiredInTag,
   
@@ -54,7 +54,10 @@ contKindTyCon = mkKindTyCon contKindTyConName superKind
 
 -- TODO VoidRep isn't really right, but does it matter? This type should never
 -- appear in Core anyway.
-contTyCon = mkPrimTyCon contTyConName (mkArrowKind openTypeKind contKind) [Representational] VoidRep
+contTyCon = mkPrimTyCon contTyConName kind [Representational] VoidRep
+  where
+    kKi  = mkTyVarTy kKiVar
+    kind = mkPiTypes [kKiVar] (mkFunTy kKi (mkContKind kKi))
 
 contFunTyCon = mkSynTyCon contFunTyConName kind vars roles rhs parent
   where
@@ -64,11 +67,11 @@ contFunTyCon = mkSynTyCon contFunTyConName kind vars roles rhs parent
     rhs = SynonymTyCon (mkFunTy openAlphaTy openBetaTy)
     parent = NoParentTyCon
 
-contKind :: Kind
-contKind = mkTyConApp contKindTyCon []
+mkContKind :: Kind -> Kind
+mkContKind kind = mkTyConApp contKindTyCon [kind]
 
 mkContTy :: Type -> Type
-mkContTy ty = mkTyConApp contTyCon [ty]
+mkContTy ty = mkTyConApp contTyCon [typeKind ty, ty]
 
 isContTy :: Type -> Bool
 isContTy ty | Just (con, _) <- splitTyConApp_maybe ty
@@ -77,7 +80,7 @@ isContTy ty | Just (con, _) <- splitTyConApp_maybe ty
             = False
 
 isContTy_maybe :: Type -> Maybe Type
-isContTy_maybe ty | Just (con, [arg]) <- splitTyConApp_maybe ty
+isContTy_maybe ty | Just (con, [_, arg]) <- splitTyConApp_maybe ty
                   , con == contTyCon
                   = Just arg
                   | otherwise
