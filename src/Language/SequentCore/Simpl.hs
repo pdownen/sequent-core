@@ -307,14 +307,11 @@ completeBind env x x' v level
       else do
         -- TODO Eta-expansion goes here
         dflags <- getDynFlags
-        let ins   = se_inScope env
-            x''   = x' `setIdInfo` idInfo x
-            ins'  = extendInScopeSet ins x''
-            env'  = env { se_inScope = ins' }
+        let x''   = x' `setIdInfo` idInfo x
             def   = mkBoundTo dflags v level
-            (env'', x''') = setDef env' x'' def
+            (env', x''') = setDef env x'' def
         when tracing $ liftCoreM $ putMsg (text "defined" <+> ppr x''' <+> equals <+> ppr def)
-        return $ addNonRecFloat env'' x''' v
+        return $ addNonRecFloat env' x''' v
 
 simplRec :: SimplEnv -> [(InVar, InValue)] -> TopLevelFlag
          -> SimplM SimplEnv
@@ -344,7 +341,7 @@ simplCut env_v (Var x) env_k cont
   = case substId env_v x of
       DoneId x'
         -> do
-           val'_maybe <- callSiteInline env_v x cont
+           val'_maybe <- callSiteInline env_v x' cont
            case val'_maybe of
              Nothing
                -> simplCut2 env_v (Var x') env_k cont

@@ -143,12 +143,13 @@ enterScope :: SimplEnv -> InVar -> (SimplEnv, OutVar)
 enterScope env x
   = (env', x')
   where
-    SimplEnv { se_inScope = ins, se_idSubst = ids, se_tvSubst = tvs, se_cvSubst = cvs } = env
+    SimplEnv { se_idSubst = ids, se_tvSubst = tvs, se_cvSubst = cvs
+             , se_inScope = ins, se_defs    = defs } = env
     x1    = uniqAway ins x
     x'    = substIdType env x1
-    env'  | isTyVar x = env { se_tvSubst = tvs', se_inScope = ins' }
-          | isCoVar x = env { se_cvSubst = cvs', se_inScope = ins' }
-          | otherwise = env { se_idSubst = ids', se_inScope = ins' }
+    env'  | isTyVar x = env { se_tvSubst = tvs', se_inScope = ins', se_defs = defs' }
+          | isCoVar x = env { se_cvSubst = cvs', se_inScope = ins', se_defs = defs' }
+          | otherwise = env { se_idSubst = ids', se_inScope = ins', se_defs = defs' }
     ids'  | x' /= x   = extendVarEnv ids x (DoneId x')
           | otherwise = delVarEnv ids x
     tvs'  | x' /= x   = extendVarEnv tvs x (Type.mkTyVarTy x')
@@ -156,6 +157,7 @@ enterScope env x
     cvs'  | x' /= x   = extendVarEnv cvs x (Coercion.mkCoVarCo x')
           | otherwise = delVarEnv cvs x
     ins'  = extendInScopeSet ins x'
+    defs' = delVarEnv defs x'
 
 enterScopes :: SimplEnv -> [InVar] -> (SimplEnv, [OutVar])
 enterScopes env []
