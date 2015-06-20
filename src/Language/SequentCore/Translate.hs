@@ -179,24 +179,28 @@ fromCoreBind :: FromCoreEnv -> Maybe SeqCoreCont -> Core.CoreBind
                             -> FromCoreM (FromCoreEnv, SeqCoreBind)
 fromCoreBind env cont_maybe bind =
   case bind of
-    Core.NonRec b e |  Just (inTy, outTy) <- splitContFunTy_maybe (idType b)
+    Core.NonRec b e |  -- If it's a continuation function, try translating as a
+                       -- continuation
+                       Just (inTy, _) <- splitContFunTy_maybe (idType b)
+                       -- Make sure this isn't a top-level binding; if so, we can't
+                       -- keep it as a continuation
+                    ,  Just cont          <- cont_maybe
                     -> do
-                       let cont       = cont_maybe `orElse` panic "fromCoreBind"
-                           (env', b') = substBndr env (b `setIdType` mkContTy inTy)
+                       let (env', b') = substBndr env (b `setIdType` mkContTy inTy)
                        cont'_maybe <- fromCoreLamAsCont env' cont e
                        case cont'_maybe of
                          Just cont' -> return (env', NonRec b' (Cont cont'))
-                         Nothing    -> do
-                                       let (env', b')
-                                             = substBndr env
-                                               (b `setIdType` mkFunTy inTy outTy)
-                                       val <- fromCoreExprAsValue env' e mkLetContId
-                                       return (env', NonRec b' val)
+                         Nothing    -> asValue
                     |  otherwise
-                    -> do
-                       let (env', b') = substBndr env b
+                    -> asValue
+      where asValue =  do
+                       let b' | Just (inTy, outTy) <- splitContFunTy_maybe (idType b)
+                              = b `setIdType` mkFunTy inTy outTy
+                              | otherwise
+                              = b
+                       let (env', b'') = substBndr env b'
                        val <- fromCoreExprAsValue env' e mkLetContId
-                       return (env', NonRec b' val)
+                       return (env', NonRec b'' val)
     Core.Rec pairs  -> do
                        let (env', bs') = substRecBndrs env (map fst pairs)
                        vals' <- forM (map snd pairs) $ \e ->

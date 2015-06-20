@@ -34,7 +34,7 @@ lamContName, argContName, letContName, contArgName :: Name
 [lamContName, argContName, letContName, contArgName] =
   zipWith mkSystemVarName
     [lamContKey,    argContKey,    letContKey,    contArgKey]
-    [fsLit "*lamk", fsLit "*argk", fsLit "*letk", fsLit "*karg"]
+    [fsLit "*lamk", fsLit "*argk", fsLit "*letk", fsLit "karg"]
 
 contKindTyConName, contTyConName, contFunTyConName :: Name
 contKindTyConName = mkPrimTyConName (fsLit "ContKind") contKindKey    contKindTyCon
