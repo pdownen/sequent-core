@@ -877,12 +877,14 @@ splitDupableCont env cont
       -- exprIsConApp_maybe to find whether one is bound to a constructor).
       = return (env, Right (top, kk, cont))
 
-makeTrivial :: SimplEnv -> OutValue
+makeTrivial :: SimplEnv -> InValue
                         -> SimplM (SimplEnv, OutValue)
 makeTrivial env val
-  | isTrivialValue val
-  = return (env, val)
-  | otherwise
+  -- TODO Can't do this, since val is an InValue and may need to be simplified.
+  -- Maybe we should take an OutValue instead?
+  -- | isTrivialValue val
+  -- = return (env, val)
+  -- | otherwise
   = do
     (env', bndr) <- case val of
       Cont cont -> mkFreshContId env (fsLit "*k") (contType cont)
