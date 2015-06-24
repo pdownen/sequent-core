@@ -20,37 +20,24 @@
 
 \begin{center}
 \LARGE
-Sequent Core\footnote{This
+Dual System FC and Sequent Core\footnote{This
 document was originally prepared by Luke Maurer (\texttt{maurerl@cs.uoregon.edu})
 based on the System FC formalism by Richard Eisenberg (\texttt{eir@cis.upenn.edu}),
 but it should be maintained by anyone who edits the functions or data structures
 mentioned in this file. Please feel free to contact Richard for more information.}\\
-\Large 21 November, 2013
+\Large 22 June, 2015
 \end{center}
 
 \section{Introduction}
 
-This document presents the typing system of Sequent Core, very closely to how it is
-implemented in the GHC plugin library. Care is taken to include only those checks that are actually
-written in the library. It should be maintained along with any changes to this
-type system.
-
-Who will use this? Any library user who wants to understand more about the
-type system can look here to see the relationships among constructors and the
-different types used in the implementation of the type system. Note that the
-type system here is quite different from that of Haskell---these are the details
-of this internal language, only.
-
-At the end of this document is a \emph{hypothetical} operational semantics for Sequent Core.
-It is hypothetical because the library does not strictly implement a concrete operational
-semantics anywhere in its code. While all the typing rules can be traced back to
-lines of real code, the operational semantics do not, in general, have as clear
-a provenance.
-
-There are a number of details elided from this presentation. The goal of the
-formalism is to aid in reasoning about type safety, and checks that do not
-work toward this goal were omitted. For example, various scoping checks (other
-than basic context inclusion) appear in the library code but not here.
+System FC has proved to be a powerful system for expressing programs and their
+transformations in GHC's optimization passes. However, some operations are most
+naturally expressed in a language that makes control flow, and the related
+notion of an evaluation context, explicit. Different encodings such as the
+continuation-passing style exist to reify contexts; an elegant alternative is to
+restructure the representation from a lambda-calculus to a \emph{sequent calculus}.
+Dual System FC is such a calculus, and Sequent Core is a proposed intermediate
+representation refining Dual System FC for Haskell's particular needs.
 
 \section{Grammar}
 
@@ -71,8 +58,8 @@ and the judgment \coderef{coreSyn/CoreLint.lhs}{lintTyLit} (written $[[G |-tylit
 
 \subsection{Variables}
 
-GHC uses the same datatype to represent term-level variables and type-level
-variables:
+Sequent Core follows GHC's use of the same datatype to represent term-level
+variables and type-level variables:
 
 \gram{
 \ottz
@@ -84,390 +71,408 @@ variables:
 
 \subsection{Expressions}
 
-The datatypes that represent expressions:
+Being a sequent calculus, Dual System FC divides terms into the syntactic
+categories of \emph{values}, \emph{continuations}, and \emph{commands}. A
+command represents an act of computation in which a value interacts with a
+continuation; in particular, a value \emph{produces} data that a continuation
+\emph{consumes}.
+
+Values largely correspond to WHNF terms in Core:
 
 \gram{\ottv}
 
-\gram{\otte}
+Similarly to Core's \verb|Expr| type, types and coercions should only appear in
+values that are either function arguments (see the continuation syntax) or
+right-hand sides of $[[let]]$s (see the command syntax). Additionally,
+continuations as values should only appear as right-hand sides. None of these
+are first-class values.
 
-\gram{\ottc}
+There are three further novelties in \verb|Value|:
 
-There are a few key invariants about expressions:
 \begin{itemize}
-\item The right-hand sides of all top-level and recursive $[[let]]$s
-must be of lifted type.
-\item The right-hand side of a non-recursive $[[let]]$ and the argument
-of an application may be of unlifted type, but only if the expression
-is ok-for-speculation. See \verb|#let_app_invariant#| in \ghcfile{coreSyn/CoreSyn.lhs}.
-\item We allow a non-recursive $[[let]]$ to bind a type variable, coercion
-variable, or continuation variable.
-\item The $[[_]]$ case for a $[[case]]$ must come first.
-\item The list of case alternatives must be exhaustive.
-\item Types and coercions can only appear on the right-hand-side of an
-application or binding. Continuations can only appear on the right-hand-side of
-a binding.
+\item Each $\lambda$-abstraction binds both a value parameter and a continuation
+parameter.\footnote{In fact, in order to avoid generating inordinately many
+continuation variables, we allow a Sequent Core $\lambda$-abstraction to bind
+several values and one continuation, thus collapsing many abstractions into one.
+This compaction has little impact on typing, however.}
+\item We include fully-applied data constructors as a form of their own, rather
+than simply as function applications (or variables, in the case of nullary
+constructors). This is primarily to clarify the semantics of $[[case]]$: It
+consumes a value of precisely this form.
+\item The $[[compute]]$ form wraps a general computation as a value. It binds a
+continuation variable for the context in which the computation is to occur. (In
+the literature, this is usually written as a $\mu$-abstraction.)
 \end{itemize}
 
-Bindings for [[let]]s:
+Continuations represent strict Haskell contexts, only ``inside-out'':
+
+\gram{\otte}
+
+\gram{\ottalt}
+
+Each constructor (besides $[[ret]]$) in \verb|Cont| corresponds to a particular
+fragment of Core (Table \ref{tab:cont-vs-cont}).
+
+\begin{table}
+\centering
+\begin{tabular}{cc}
+Continuation & Context \\
+\hline
+\([[applyTo v ; e]]\) & \( e [ \square~v ] \) \\
+\([[|> g ; e ]]\) & \( e [ \square [[|>]] \gamma ] \) \\
+\([[{ tick } ; e]]\) & \( e [ \square_{\{\mathit{tick}\}} ] \) \\
+\([[case as n of </ alti // i />]]\) & \( \keyword{case}~\square~\keyword{as}~n~\keyword{of}~\overline{alt_i}^{\;i} \)
+\end{tabular}
+\caption{Continuations in Dual System FC and equivalent contexts in System FC.}
+\label{tab:cont-vs-cont}
+\end{table}
+
+Finally, a \verb|Command| describes the interaction between a value and its
+continuation; in addition, it may introduce bindings into the context:
+
+\gram{\ottc}
 
 \gram{\ottbindings}
 
 \gram{\ottbinding}
 
-Case alternatives:
+Some of the invariants in the Core datatypes carry over into Sequent Core:
+\begin{itemize}
+\item The right-hand sides of all top-level and recursive bindings
+must be of lifted type.
+\item The right-hand side of a non-recursive binding and the argument
+of an application may be of unlifted type, but only if the expression
+is ok-for-speculation. See \verb|#let_app_invariant#| in \ghcfile{coreSyn/CoreSyn.lhs}.
+\footnote{Allowing strict binds stretches the idea that Dual System FC makes the
+evaluation order explicit using commands; however, by design, a computation
+that's ok for speculation has negligible cost and always succeeds, and thus the
+``detour'' it causes is minor.}
+\item We allow a non-recursive binding to bind a type variable, coercion
+variable, or continuation variable.
+\end{itemize}
 
-\gram{\ottalt}
-
-Constructors as used in patterns:
-
-\gram{\ottKp}
-
-Notes that can be inserted into the AST. We leave these abstract:
-
-\gram{\otttick}
-
-A program is just a list of bindings:
+Finally, as in Core, a program is just a list of bindings:
 
 \gram{\ottprogram}
 
 \subsection{Types}
 
-\gram{\ottt}
+Types are unchanged from System FC, except that we introduce a type $[[Cont# t]]$
+for each type $[[t]]$ of kind $[[*]]$ or $[[#]]$. This is the type of a
+continuation expecting a $[[t]]$. Since continuations cannot be passed as
+arguments, continuation types can't parameterize polymorphic functions; thus we
+introduce the kinds $[[ContKind *]]$ and $[[ContKind #]]$ for $[[Cont# t]]$ when
+$[[t]]$ has kind $[[*]]$ or $[[#]]$, respectively.
 
-There are some invariants on types:
-\begin{itemize}
-\item The type $[[t1]]$ in the form $[[t1 t2]]$ must not be a type constructor
-$[[T]]$. It should be another application or a type variable.
-\item The form $[[T </ ti // i /> ]]$ (\texttt{TyConApp}) 
-does \emph{not} need to be saturated.
-\item A saturated application of $[[(->) t1 t2]]$ should be represented as 
-$[[t1 -> t2]]$. This is a different point in the grammar, not just pretty-printing.
-The constructor for a saturated $[[(->)]]$ is \texttt{FunTy}.
-\item A type-level literal is represented in GHC with a different datatype than
-a term-level literal, but we are ignoring this distinction here.
-\end{itemize}
+The type $[[Cont# t]]$ is only used when a computation is bound by a $[[let]]$;
+as a continuation used in a command, we write that its type is simply $[[t]]$.
 
-\subsection{Coercions}
-
-\gram{\ottg}
-
-Invariants on coercions:
-\begin{itemize}
-\item $[[<t1 t2>_R]]$ is used; never $[[<t1>_R <t2>_Nom]]$.
-\item If $[[<T>_R]]$ is applied to some coercions, at least one of which is not
-reflexive, use $[[T_R </ gi // i />]]$, never $[[<T>_R g1 g2]] \ldots$.
-\item The $[[T]]$ in $[[T_R </gi//i/>]]$ is never a type synonym, though it could
-be a type function.
-\end{itemize}
-
-Roles label what equality relation a coercion is a witness of. Nominal equality
-means that two types are identical (have the same name); representational equality
-means that two types have the same representation (introduced by newtypes); and
-phantom equality includes all types. See \url{http://ghc.haskell.org/trac/ghc/wiki/Roles}
-for more background.
-
-\gram{\ottR}
-
-Is it a left projection or a right projection?
-
-\gram{\ottLorR}
-
-Axioms:
-
-\gram{
-\ottC\ottinterrule
-\ottaxBranch
-}
-
-The definition for $[[axBranch]]$ above does not include the list of
-incompatible branches (field \texttt{cab\_incomps} of \texttt{CoAxBranch}),
-as that would unduly clutter this presentation. Instead, as the list
-of incompatible branches can be computed at any time, it is checked for
-in the judgment $[[no_conflict]]$. See Section~\ref{sec:no_conflict}.
-
-Axiom rules, produced by the type-nats solver:
-
-\gram{\ottmu}
-
-\label{sec:axiom_rules}
-An axiom rule $[[mu]] = [[M(I, role_list, R')]]$ is an axiom name $[[M]]$, with a
-type arity $[[I]]$, a list of roles $[[role_list]]$ for its coercion parameters,
-and an output role $[[R']]$. The definition within GHC also includes a field named
-$[[coaxrProves]]$ which computes the output coercion from a list of types and
-a list of coercions. This is elided in this presentation, as we simply identify
-axiom rules by their names $[[M]]$. See also \coderef{typecheck/TcTypeNats.lhs}{mkBinAxiom}
-and \coderef{typecheck/TcTypeNats.lhs}{mkAxiom1}.
-
-\subsection{Type constructors}
-
-Type constructors in GHC contain \emph{lots} of information. We leave most of it out
-for this formalism:
-
-\gram{\ottT}
-
-We include some representative primitive type constructors. There are many more in \ghcfile{prelude/TysPrim.lhs}.
-
-\gram{\ottH}
-
-\section{Contexts}
-
-The functions in \ghcfile{coreSyn/CoreLint.lhs} use the \texttt{LintM} monad.
-This monad contains a context with a set of bound variables $[[G]]$. The
-formalism treats $[[G]]$ as an ordered list, but GHC uses a set as its
-representation.
-
-\gram{
-\ottG
-}
-
-We assume the Barendregt variable convention that all new variables are
-fresh in the context. In the implementation, of course, some work is done
-to guarantee this freshness. In particular, adding a new type variable to
-the context sometimes requires creating a new, fresh variable name and then
-applying a substitution. We elide these details in this formalism, but
-see \coderef{types/Type.lhs}{substTyVarBndr} for details.
+%\section{Contexts}
+%
+%The functions in \ghcfile{coreSyn/CoreLint.lhs} use the \texttt{LintM} monad.
+%This monad contains a context with a set of bound variables $[[G]]$. The
+%formalism treats $[[G]]$ as an ordered list, but GHC uses a set as its
+%representation.
+%
+%\gram{
+%\ottG
+%}
+%
+%We assume the Barendregt variable convention that all new variables are
+%fresh in the context. In the implementation, of course, some work is done
+%to guarantee this freshness. In particular, adding a new type variable to
+%the context sometimes requires creating a new, fresh variable name and then
+%applying a substitution. We elide these details in this formalism, but
+%see \coderef{types/Type.lhs}{substTyVarBndr} for details.
 
 \section{Typing judgments}
 
-The following functions are used from GHC. Their names are descriptive, and they
-are not formalized here: \coderef{types/TyCon.lhs}{tyConKind},
-\coderef{types/TyCon.lhs}{tyConArity}, \coderef{basicTypes/DataCon.lhs}{dataConTyCon}, \coderef{types/TyCon.lhs}{isNewTyCon}, \coderef{basicTypes/DataCon.lhs}{dataConRepType}.
+Here we elide many gory details, such as binding consistency, to focus
+on the areas that are particular to Dual System FC. Other judgments are largely
+unchanged from Core.
 
-\subsection{Program consistency}
+%The following functions are used from GHC. Their names are descriptive, and they
+%are not formalized here: \coderef{types/TyCon.lhs}{tyConKind},
+%\coderef{types/TyCon.lhs}{tyConArity}, \coderef{basicTypes/DataCon.lhs}{dataConTyCon}, \coderef{types/TyCon.lhs}{isNewTyCon}, \coderef{basicTypes/DataCon.lhs}{dataConRepType}.
+%
+%\subsection{Program consistency}
+%
+%Check the entire bindings list in a context including the whole list. We extract
+%the actual variables (with their types/kinds) from the bindings, check for duplicates,
+%and then check each binding.
+%
+%\ottdefnlintCoreProgram{}
+%\ottdefnlintCoreBindings{}
+%
+%Here is the definition of $[[vars_of]]$, taken from \coderef{Syntax.hs}{bindersOf}:
+%
+%\[
+%\begin{array}{ll}
+%[[vars_of n = e]] &= [[n]] \\
+%[[vars_of rec </ ni = ei // i />]] &= [[</ ni // i />]]
+%\end{array}
+%\]
+%
+%\subsection{Binding consistency}
+%
+%\ottdefnlintXXbind{}
+%
+%\ottdefnlintSingleBinding{}
+%
+%\subsection{Expression typing}
 
-Check the entire bindings list in a context including the whole list. We extract
-the actual variables (with their types/kinds) from the bindings, check for duplicates,
-and then check each binding.
-
-\ottdefnlintCoreProgram{}
-\ottdefnlintCoreBindings{}
-
-Here is the definition of $[[vars_of]]$, taken from \coderef{coreSyn/CoreSyn.lhs}{bindersOf}:
-
-\[
-\begin{array}{ll}
-[[vars_of n = e]] &= [[n]] \\
-[[vars_of rec </ ni = ei // i />]] &= [[</ ni // i />]]
-\end{array}
-\]
-
-\subsection{Binding consistency}
-
-\ottdefnlintXXbind{}
-
-\ottdefnlintSingleBinding{}
-
-In the GHC source, this function contains a number of other checks, such
-as for strictness and exportability. See the source code for further information.
-
-\subsection{Expression typing}
+The typing judgments for values have no surprises:
 
 \ottdefnlintCoreValue{}
+
+Whereas a value has the type of the data it produces, a continuation has the
+type of the data it \emph{consumes}. Thus a function application supplies a
+value, but it always has a function type (whose argument type, of course, must
+match the type of the value).
+
 \ottdefnlintCoreCont{}
+
+A command does not in itself have a type, but each of its bindings must be
+well-typed, and its value's type must match its continuation's type:
+
 \ottdefnlintCoreCommand{}
 
-\begin{itemize}
-\item Some explication of \ottdrulename{Tm\_LetRec} is helpful: The idea behind the
-second premise ($[[</ G, G'i |-ty s'i : ki // i />]]$) is that we wish
-to check each substituted type $[[s'i]]$ in a context containing all the types
-that come before it in the list of bindings. The $[[G'i]]$ are contexts
-containing the names and kinds of all type variables (and term variables,
-for that matter) up to the $i$th binding. This logic is extracted from
-\coderef{coreSyn/CoreLint.lhs}{lintAndScopeIds}.
+%\begin{itemize}
+%\item There are two more case for $[[G |-vl e : t]]$, for type and continuation
+%expressions. These are included in the GHC code but are elided
+%here because they cases are never used in practice. Type expressions
+%can only appear in arguments to functions or as right-hand sides of bindings,
+%and these are handled in \ottdrulename{Tm\_AppType} and
+%\ottdrulename{SBinding\_TypeBinding}. Continuations can only as right-hand sides
+%of bindings, handled in \ottdrulename{SBinding\_ContBinding}.
+%
+%\item The GHC source code checks all arguments in an application expression
+%all at once using \coderef{coreSyn/CoreSyn.lhs}{collectArgs}
+%and \coderef{coreSyn/CoreLint.lhs}{lintCoreArgs}. The operation
+%has been unfolded for presentation here.
+%
+%\item If a $[[tick]]$ contains breakpoints, the GHC source performs additional
+%(scoping) checks.
+%
+%\item The rule for $[[case]]$ statements also checks to make sure that
+%the alternatives in the $[[case]]$ are well-formed with respect to the
+%invariants listed above. These invariants do not affect the type or
+%evaluation of the expression, so the check is omitted here.
+%
+%\item The GHC source code for \ottdrulename{Tm\_Var} contains checks for
+%a dead id and for one-tuples. These checks are omitted here.
+%\end{itemize}
+%
+%\subsection{Kinding}
+%
+%\ottdefnlintType{}
+%
+%\subsection{Kind validity}
+%
+%\ottdefnlintKind{}
+%
+%\subsection{Coercion typing}
+%
+%In the coercion typing judgment, the $\#$ marks are left off the equality
+%operators to reduce clutter. This is not actually inconsistent, because
+%the GHC function that implements this check, \texttt{lintCoercion}, actually
+%returns four separate values (the kind, the two types, and the role), not
+%a type with head $[[(~#)]]$ or $[[(~R#)]]$. Note that the difference between
+%these two forms of equality is interpreted in the rules \ottdrulename{Co\_CoVarCoNom}
+%and \ottdrulename{Co\_CoVarCoRepr}.
+%
+%\ottdefnlintCoercion{}
+%
+%In \ottdrulename{Co\_AxiomInstCo}, the use of $[[inits]]$ creates substitutions from
+%the first $i$ mappings in $[[ </ [ni |-> si] // i /> ]]$. This has the effect of 
+%folding the substitution over the kinds for kind-checking.
+%
+%See Section~\ref{sec:tyconroles} for more information about $[[tyConRolesX]]$, and
+%see Section~\ref{sec:axiom_rules} for more information about $[[coaxrProves]]$.
+%
+%\subsection{Name consistency}
+%
+%There are two very similar checks for names, one declared as a local function:
+%
+%\ottdefnlintSingleBindingXXlintBinder{}
+%
+%\ottdefnlintBinder{}
+%
+%\subsection{Substitution consistency}
+%
+%\ottdefncheckTyKind{}
+%
+%\subsection{Case alternative consistency}
+%
+%\ottdefnlintCoreAlt{}
+%
+%\subsection{Telescope substitution}
+%
+%\ottdefnapplyTys{}
+%
+%\subsection{Case alternative binding consistency}
+%
+%\ottdefnlintAltBinders{}
+%
+%\subsection{Arrow kinding}
+%
+%\ottdefnlintArrow{}
+%
+%\subsection{Type application kinding}
+%
+%\ottdefnlintXXapp{}
+%
+%\subsection{Sub-kinding}
+%
+%\ottdefnisSubKind{}
+%
+%\subsection{Roles}
+%\label{sec:tyconroles}
+%
+%During type-checking, role inference is carried out, assigning roles to the
+%arguments of every type constructor. The function $[[tyConRoles]]$ extracts these
+%roles. Also used in other judgments is $[[tyConRolesX]]$, which is the same as
+%$[[tyConRoles]]$, but with an arbitrary number of $[[Nom]]$ at the end, to account
+%for potential oversaturation.
+%
+%The checks encoded in the following
+%judgments are run from \coderef{typecheck/TcTyClsDecls.lhs}{checkValidTyCon}
+%when \texttt{-dcore-lint} is set.
+%
+%\ottdefncheckValidRoles{}
+%
+%\ottdefncheckXXdcXXroles{}
+%
+%In the following judgment, the role $[[R]]$ is an \emph{input}, not an output.
+%The metavariable $[[O]]$ denotes a \emph{role context}, as shown here:
+%
+%\gram{\ottO}
+%
+%\ottdefncheckXXtyXXroles{}
+%
+%These judgments depend on a sub-role relation:
+%
+%\ottdefnltRole{}
+%
+%\subsection{Branched axiom conflict checking}
+%\label{sec:no_conflict}
+%
+%The following judgment is used within \ottdrulename{Co\_AxiomInstCo} to make
+%sure that a type family application cannot unify with any previous branch
+%in the axiom. The actual code scans through only those branches that are
+%flagged as incompatible. These branches are stored directly in the
+%$[[axBranch]]$. However, it is cleaner in this presentation to simply
+%check for compatibility here.
+%
+%\ottdefncheckXXnoXXconflict{}
+%
+%The judgment $[[apart]]$ checks to see whether two lists of types are surely
+%apart. $[[apart( </ ti // i />, </ si // i /> )]]$, where $[[ </ ti // i />]]$ is a list of types and $[[ </ si // i /> ]]$ is a list of type
+%\emph{patterns} (as in a type family equation), first flattens the $[[ </ ti // i /> ]]$ using \coderef{types/FamInstEnv.lhs}{flattenTys} and then checks to
+%see if \coderef{types/Unify.lhs}{tcUnifyTysFG} returns \texttt{SurelyApart}.
+%Flattening takes all type family applications and replaces them with fresh variables,
+%taking care to map identical type family applications to the same fresh variable.
+%
+%The algorithm $[[unify]]$ is implemented in \coderef{types/Unify.lhs}{tcUnifyTys}.
+%It performs a standard unification, returning a substitution upon success.
 
-\item There are two more case for $[[G |-vl e : t]]$, for type and continuation
-expressions. These are included in the GHC code but are elided
-here because they cases are never used in practice. Type expressions
-can only appear in arguments to functions or as right-hand sides of bindings,
-and these are handled in \ottdrulename{Tm\_AppType} and
-\ottdrulename{SBinding\_TypeBinding}. Continuations can only as right-hands sides
-of bindings, handled in \ottdrulename{SBinding\_ContBinding}.
+\subsection{Linearity}
 
-\item The GHC source code checks all arguments in an application expression
-all at once using \coderef{coreSyn/CoreSyn.lhs}{collectArgs}
-and \coderef{coreSyn/CoreLint.lhs}{lintCoreArgs}. The operation
-has been unfolded for presentation here.
+There is an important condition that has not yet been mentioned, namely that of
+\emph{linearity}. Properly, any continuation parameter should have a linear
+type, and any bound continuation variable should have an affine type (since it
+may not be used in all branches). This is not checked explicitly by Lint.
+However, an equivalent condition is checked, and indeed is required, by the
+translation functions:
 
-\item If a $[[tick]]$ contains breakpoints, the GHC source performs additional
-(scoping) checks.
+\begin{quotation}
+At any point in the program besides a top-level value, there is a continuation
+that acts as ``the current continuation.'' Every $[[ret]]$ must invoke either:
+\begin{enumerate}
+\item
+the current continuation, or
+\item
+a $[[let]]$-bound continuation whose current continuation is the same as that of
+the $[[ret]]$.
+\end{enumerate}
+\end{quotation}
 
-\item The rule for $[[case]]$ statements also checks to make sure that
-the alternatives in the $[[case]]$ are well-formed with respect to the
-invariants listed above. These invariants do not affect the type or
-evaluation of the expression, so the check is omitted here.
+The current continuation is the one that represents the immediate context---in
+other words, $[[ret kappa_t]]$ represents the context $\square$ when $[[kappa_t]]$ is
+the current continuation. A bound continuation corresponds to a join point in
+Core (and indeed is translated as one by \verb|Translate.hs|); the requirement
+above that its current continuation is the same as the $[[ret]]$ that calls it
+means that the current continuation will always eventually be invoked ($\bot$
+notwithstanding).
 
-\item The GHC source code for \ottdrulename{Tm\_Var} contains checks for
-a dead id and for one-tuples. These checks are omitted here.
-\end{itemize}
+An alternative formulation can be given in terms of the operation of the type
+checker:
 
-\subsection{Kinding}
+\begin{quotation}
+The current continuation is the most recently bound continuation parameter. (By
+parameter we mean a variable arising as a bound identifier from a $[[compute]]$
+or a $\lambda$-abstraction.)  Whenever recursing underneath a continuation
+parameter, clear all other continuations from the context.
+\end{quotation}
 
-\ottdefnlintType{}
+Clearing bound continuations from the context frees us from explicitly
+restricting the argument to $[[ret]]$.
 
-\subsection{Kind validity}
-
-\ottdefnlintKind{}
-
-\subsection{Coercion typing}
-
-In the coercion typing judgment, the $\#$ marks are left off the equality
-operators to reduce clutter. This is not actually inconsistent, because
-the GHC function that implements this check, \texttt{lintCoercion}, actually
-returns four separate values (the kind, the two types, and the role), not
-a type with head $[[(~#)]]$ or $[[(~R#)]]$. Note that the difference between
-these two forms of equality is interpreted in the rules \ottdrulename{Co\_CoVarCoNom}
-and \ottdrulename{Co\_CoVarCoRepr}.
-
-\ottdefnlintCoercion{}
-
-In \ottdrulename{Co\_AxiomInstCo}, the use of $[[inits]]$ creates substitutions from
-the first $i$ mappings in $[[ </ [ni |-> si] // i /> ]]$. This has the effect of 
-folding the substitution over the kinds for kind-checking.
-
-See Section~\ref{sec:tyconroles} for more information about $[[tyConRolesX]]$, and
-see Section~\ref{sec:axiom_rules} for more information about $[[coaxrProves]]$.
-
-\subsection{Name consistency}
-
-There are two very similar checks for names, one declared as a local function:
-
-\ottdefnlintSingleBindingXXlintBinder{}
-
-\ottdefnlintBinder{}
-
-\subsection{Substitution consistency}
-
-\ottdefncheckTyKind{}
-
-\subsection{Case alternative consistency}
-
-\ottdefnlintCoreAlt{}
-
-\subsection{Telescope substitution}
-
-\ottdefnapplyTys{}
-
-\subsection{Case alternative binding consistency}
-
-\ottdefnlintAltBinders{}
-
-\subsection{Arrow kinding}
-
-\ottdefnlintArrow{}
-
-\subsection{Type application kinding}
-
-\ottdefnlintXXapp{}
-
-\subsection{Sub-kinding}
-
-\ottdefnisSubKind{}
-
-\subsection{Roles}
-\label{sec:tyconroles}
-
-During type-checking, role inference is carried out, assigning roles to the
-arguments of every type constructor. The function $[[tyConRoles]]$ extracts these
-roles. Also used in other judgments is $[[tyConRolesX]]$, which is the same as
-$[[tyConRoles]]$, but with an arbitrary number of $[[Nom]]$ at the end, to account
-for potential oversaturation.
-
-The checks encoded in the following
-judgments are run from \coderef{typecheck/TcTyClsDecls.lhs}{checkValidTyCon}
-when \texttt{-dcore-lint} is set.
-
-\ottdefncheckValidRoles{}
-
-\ottdefncheckXXdcXXroles{}
-
-In the following judgment, the role $[[R]]$ is an \emph{input}, not an output.
-The metavariable $[[O]]$ denotes a \emph{role context}, as shown here:
-
-\gram{\ottO}
-
-\ottdefncheckXXtyXXroles{}
-
-These judgments depend on a sub-role relation:
-
-\ottdefnltRole{}
-
-\subsection{Branched axiom conflict checking}
-\label{sec:no_conflict}
-
-The following judgment is used within \ottdrulename{Co\_AxiomInstCo} to make
-sure that a type family application cannot unify with any previous branch
-in the axiom. The actual code scans through only those branches that are
-flagged as incompatible. These branches are stored directly in the
-$[[axBranch]]$. However, it is cleaner in this presentation to simply
-check for compatibility here.
-
-\ottdefncheckXXnoXXconflict{}
-
-The judgment $[[apart]]$ checks to see whether two lists of types are surely
-apart. $[[apart( </ ti // i />, </ si // i /> )]]$, where $[[ </ ti // i />
-]]$ is a list of types and $[[ </ si // i /> ]]$ is a list of type
-\emph{patterns} (as in a type family equation), first flattens the $[[ </ ti
-    // i /> ]]$ using \coderef{types/FamInstEnv.lhs}{flattenTys} and then checks to
-see if \coderef{types/Unify.lhs}{tcUnifyTysFG} returns \texttt{SurelyApart}.
-Flattening takes all type family applications and replaces them with fresh variables,
-taking care to map identical type family applications to the same fresh variable.
-
-The algorithm $[[unify]]$ is implemented in \coderef{types/Unify.lhs}{tcUnifyTys}.
-It performs a standard unification, returning a substitution upon success.
+Subtle though it may seem, this rule is very important: Without it, Sequent Core
+would accidentally have added control operators to Haskell!
 
 \section{Operational semantics}
 
 \subsection{Disclaimer}
-GHC does not implement an operational semantics in any concrete form. Most
-of the rules below are implied by algorithms in, for example, the simplifier
-and optimizer. Yet, there is no one place in GHC that states these rules,
-analogously to \texttt{CoreLint.lhs}.
-Nevertheless, these rules are included in this document to help the reader
-understand System FC.
-
-\subsection{The context $[[S]]$}
-We use a context $[[S]]$ to keep track of the values of variables in a (mutually)
-recursive group. Its definition is as follows:
-\[
-[[S]] \quad ::= \quad [[ empty ]] \ |\ [[S]], [[ [n |-> v] ]]
-\]
-The presence of the context $[[S]]$ is solely to deal with recursion. If your
-use of FC does not require modeling recursion, you will not need to track $[[S]]$.
-
+The Sequent Core library does not implement an operational semantics in any
+concrete form. Most of the rules below are implied by algorithms in, for
+example, the simplifier and optimizer. Yet, there is no one place in the library
+that states these rules, analogously to \texttt{Lint.hs}. Nevertheless, these
+rules are included in this document to help the reader understand Dual System FC.
+%
+%\subsection{The context $[[S]]$}
+%We use a context $[[S]]$ to keep track of the values of variables in a (mutually)
+%recursive group. Its definition is as follows:
+%\[
+%[[S]] \quad ::= \quad [[ empty ]] \ |\ [[S]], [[ [n |-> v] ]]
+%\]
+%The presence of the context $[[S]]$ is solely to deal with recursion. If your
+%use of FC does not require modeling recursion, you will not need to track $[[S]]$.
+%
 \subsection{Operational semantics rules}
 
 \ottdefnstep{}
 
-\subsection{Notes}
-
-\begin{itemize}
-\item The \ottdrulename{S\_LetRec} and \ottdrulename{S\_LetRecReturn} rules
-implement recursion. \ottdrulename{S\_LetRec} adds to the context $[[S]]$ bindings
-for all of the mutually recursive equations. Then, after perhaps many steps,
-when the body of the $[[let]]\ [[rec]]$ contains no variables that are bound
-in the $[[let]]\ [[rec]]$, the context is popped.
-\item In the $[[case]]$ rules, a constructor $[[K]]$ is written taking three
-lists of arguments: two lists of types and a list of terms. The types passed
-in are the universally and, respectively, existentially quantified type variables
-to the constructor. The terms are the regular term arguments stored in an
-algebraic datatype. Coercions (say, in a GADT) are considered term arguments.
-\item The rule \ottdrulename{S\_CasePush} is the most complex rule.
-\begin{itemize}
-\item The logic in this rule is implemented in \coderef{coreSyn/CoreSubst.lhs}{exprIsConApp\_maybe}.
-\item The $[[coercionKind]]$ function (\coderef{types/Coercion.lhs}{coercionKind})
-extracts the two types (and their kind) from
-a coercion. It does not require a typing context, as it does not \emph{check} the
-coercion, just extracts its types.
-\item The $[[dataConRepType]]$ function (\coderef{basicTypes/DataCon.lhs}{dataConRepType}) extracts the full type of a data constructor. Following the notation for
-constructor expressions, the parameters to the constructor are broken into three
-groups: universally quantified types, existentially quantified types, and terms.
-\item The substitutions in the last premise to the rule are unusual: they replace
-\emph{type} variables with \emph{coercions}. This substitution is called lifting
-and is implemented in \coderef{types/Coercion.lhs}{liftCoSubst}. The notation is
-essentially a pun on the fact that types and coercions have such similar structure.
-\item Note that the types $[[ </ sbb // bb /> ]]$---the existentially quantified
-types---do not change during this step.
-\end{itemize}
-\end{itemize}
+%\subsection{Notes}
+%
+%\begin{itemize}
+%\item The \ottdrulename{S\_LetRec} and \ottdrulename{S\_LetRecReturn} rules
+%implement recursion. \ottdrulename{S\_LetRec} adds to the context $[[S]]$ bindings
+%for all of the mutually recursive equations. Then, after perhaps many steps,
+%when the body of the $[[let]]\ [[rec]]$ contains no variables that are bound
+%in the $[[let]]\ [[rec]]$, the context is popped.
+%\item In the $[[case]]$ rules, a constructor $[[K]]$ is written taking three
+%lists of arguments: two lists of types and a list of terms. The types passed
+%in are the universally and, respectively, existentially quantified type variables
+%to the constructor. The terms are the regular term arguments stored in an
+%algebraic datatype. Coercions (say, in a GADT) are considered term arguments.
+%\item The rule \ottdrulename{S\_CasePush} is the most complex rule.
+%\begin{itemize}
+%\item The logic in this rule is implemented in \coderef{coreSyn/CoreSubst.lhs}{exprIsConApp\_maybe}.
+%\item The $[[coercionKind]]$ function (\coderef{types/Coercion.lhs}{coercionKind})
+%extracts the two types (and their kind) from
+%a coercion. It does not require a typing context, as it does not \emph{check} the
+%coercion, just extracts its types.
+%\item The $[[dataConRepType]]$ function (\coderef{basicTypes/DataCon.lhs}{dataConRepType}) extracts the full type of a data constructor. Following the notation for
+%constructor expressions, the parameters to the constructor are broken into three
+%groups: universally quantified types, existentially quantified types, and terms.
+%\item The substitutions in the last premise to the rule are unusual: they replace
+%\emph{type} variables with \emph{coercions}. This substitution is called lifting
+%and is implemented in \coderef{types/Coercion.lhs}{liftCoSubst}. The notation is
+%essentially a pun on the fact that types and coercions have such similar structure.
+%\item Note that the types $[[ </ sbb // bb /> ]]$---the existentially quantified
+%types---do not change during this step.
+%\end{itemize}
+%\end{itemize}
 
 \end{document}

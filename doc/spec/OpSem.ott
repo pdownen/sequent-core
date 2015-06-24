@@ -28,7 +28,7 @@ S(n) = v
 S |- < n | e > --> < v | e >
 
 ----------------------------- :: Beta
-S |- < \ n n' . c | $ v ; e > --> (c) [ n |-> v ] [ n' |-> e ]
+S |- < \ n n' . c | applyTo v ; e > --> (c) [ n |-> v ] [ n' |-> e ]
 
 g0 = sym (nth 0 g)
 g1 = nth 1 g
@@ -36,16 +36,16 @@ not v2 is_a_type
 not v2 is_a_coercion
 t -> s = coercionKind g0
 ----------------------------------------------- :: Push
-S |- < v | |> g ; $ v2; e > --> < v | $ compute kappa_s . < v2 | |> g0 ; ret kappa_s > ; |> g1 ; e >
+S |- < v | |> g ; applyTo v2; e > --> < v | applyTo compute kappa_s . < v2 | |> g0 ; ret kappa_s > ; |> g1 ; e >
 
 ---------------------------------------- :: TPush
-S |- < v | |> g; $ t; e > --> < v | $ t; |> g t; e >
+S |- < v | |> g; applyTo t; e > --> < v | applyTo t; |> g t; e >
 
 g0 = nth 1 (nth 0 g)
 g1 = sym (nth 2 (nth 0 g))
 g2 = nth 1 g
 ------------------------------- :: CPush
-S |- < v | |> g; $ g'; e > --> < v | $ (g0 ;; g' ;; g1); |> g2; e >
+S |- < v | |> g; applyTo g'; e > --> < v | applyTo (g0 ;; g' ;; g1); |> g2; e >
 
 ------------------------------------------------------------ :: LetNonRec
 S |- let n = w in c --> c [n |-> w]
@@ -77,4 +77,4 @@ T </ taa // aa /> ~#k T </ t'aa // aa /> = coercionKind g
 forall </ alphaaa_kaa // aa />. forall </ betabb_k'bb // bb />. </ t1cc // cc /> @-> T </ alphaaa_kaa // aa /> = dataConRepType K
 </ v'cc = compute ncc . < ecc | |> (t1cc @ </ [alphaaa_kaa |-> nth aa g] // aa /> </ [betabb_k'bb |-> <sbb>_Nom] // bb />); ret ncc > // cc /> 
 --------------------------- :: CasePush
-S |- < K </ taa // aa /> </ sbb // bb /> </ ecc // cc /> | |> g; case as n of </ alti // i /> > --> < K </ t'aa // aa /> </ sbb // bb /> </ e'cc // cc /> | case as n of </ alti // i /> >
+S |- < K </ taa // aa /> </ sbb // bb /> </ vcc // cc /> | |> g; case as n of </ alti // i /> > --> < K </ t'aa // aa /> </ sbb // bb /> </ v'cc // cc /> | case as n of </ alti // i /> >

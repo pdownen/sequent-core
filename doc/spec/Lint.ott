@@ -76,7 +76,7 @@ G |-name kappa_t ok
 G |-sbind kappa_t <- e
 
 defn G  |- vl v : t ::  :: lintCoreValue :: 'Vl_'
-  {{ com Value typing, \coderef{Lint.hs}{lintCoreExpr} }}
+  {{ com Value typing, \coderef{Lint.hs}{lintCoreValue} }}
   {{ tex [[G]] \labeledjudge{vl} [[v]] : [[t]] }}
 by
 
@@ -133,13 +133,13 @@ G |-vl v : t
 not (v is_a_cont)
 G |-ct e : s
 ------------ :: ValApp
-G |-ct $ v ; e : t -> s
+G |-ct applyTo v ; e : t -> s
 
 G |-ty t : k
 G |-ki k ok
 G |-ct e : s[alpha_k |-> t]
 ------------------------- :: TyApp
-G |-ct $ t ; e : forall alpha_k . s
+G |-ct applyTo t ; e : forall alpha_k . s
 
 G |-ty t : k
 </ G, z_t; t |-altern alti // i />

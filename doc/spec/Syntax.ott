@@ -82,9 +82,11 @@ v, w :: 'Value_' ::= {{ com Values, \coderef{Syntax.hs}{Value} }}
   | S ( n )                                      :: M :: Lookup {{ com Lookup in the runtime store }}
 
 e :: 'Cont_' ::= {{ com Continuations, \coderef{Syntax.hs}{Cont} }}
-  | ret n                                        ::   :: Return {{ com Continuation Variable }}
-  | $ v ; e                                      ::   :: App  {{ com Application }}
+  | ret n                                        ::   :: Return {{ com Continuation variable }}
+  | applyTo v ; e                                ::   :: App  {{ com Application }}
+    {{ tex \$ \, [[v]] ; [[e]] }}
   | |> g ; e                                     ::   :: Cast {{ com Cast }}
+    {{ tex [[|>]] \, [[g]] ; [[e]] }}
   | { tick } ; e                                 ::   :: Tick {{ com Internal note }}
   | case as n of </ alti // | // i />            ::   :: Case {{ com Pattern match }}
   | e subst                                      :: M :: Subst {{ com Substitution }}
@@ -292,6 +294,7 @@ terminals :: 'terminals_' ::=
   | and          ::   :: key_and          {{ tex \keyword{and} }}
   | case         ::   :: case             {{ tex \keyword{case} }}
   | compute      ::   :: compute          {{ tex \keyword{compute} }}
+  | ret          ::   :: ret              {{ tex \keyword{ret} }}
   | of           ::   :: of               {{ tex \keyword{of} }}
   | ->           ::   :: arrow            {{ tex \to }}
   | |>           ::   :: cast             {{ tex \triangleright }}
