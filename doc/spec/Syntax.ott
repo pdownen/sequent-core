@@ -25,7 +25,7 @@ embed {{ tex-preamble
 %%  Metavariables  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-metavar x ::=   {{ com Value variable names }}
+metavar x ::=   {{ com Term variable names }}
 metavar kappa {{ tex k }} ::=
   {{ com Continuation variable names }}
 metavar alpha {{ tex \alpha }}, beta {{ tex \beta }} ::=
@@ -44,9 +44,9 @@ grammar
 
 lit {{ tex \textsf{lit} }} :: 'Literal_' ::= {{ com Literals }}
 
-z :: 'Name_' ::= {{ com Value, continuation, or type name }}
+z :: 'Name_' ::= {{ com Term, continuation, or type name }}
   | alpha           ::   :: Type    {{ com Type-level name }}
-  | x               ::   :: Value   {{ com Value name }}
+  | x               ::   :: Term    {{ com Term name }}
   | kappa           ::   :: Cont    {{ com Continuation name }}
 
 n, m :: 'Var_' ::= {{ com Variable names, \coderef{basicTypes/Var.lhs}{Var} }}
@@ -68,7 +68,7 @@ vars :: 'Vars_' ::= {{ com List of variables }}
   | vars1 \inter vars2       :: M :: intersection
     {{ tex [[vars1]] \cap [[vars2]] }}
 
-v, w :: 'Value_' ::= {{ com Values, \coderef{Syntax.hs}{Value} }}
+v, w :: 'Term_' ::= {{ com Terms, \coderef{Syntax.hs}{Term} }}
   | n                                            ::   :: Var  {{ com Variable }}
   | lit                                          ::   :: Lit  {{ com Literal }}
   | \ n n' . c                                   ::   :: Lam  {{ com Abstraction }}
@@ -78,7 +78,7 @@ v, w :: 'Value_' ::= {{ com Values, \coderef{Syntax.hs}{Value} }}
   | g                                            ::   :: Coercion {{ com Coercion }}
   | e                                            ::   :: Cont {{ com Continuation }}
   | v subst                                      :: M :: Subst {{ com Substitution }}
-  | ( v )                                        :: M :: Parens {{ com Parenthesized value }}
+  | ( v )                                        :: M :: Parens {{ com Parenthesized term }}
   | S ( n )                                      :: M :: Lookup {{ com Lookup in the runtime store }}
 
 e :: 'Cont_' ::= {{ com Continuations, \coderef{Syntax.hs}{Cont} }}
@@ -367,7 +367,7 @@ formula :: 'formula_' ::=
   | G1 = G2                            ::   :: context_rewrite
   | t1 = t2                            ::   :: type_rewrite
   | t1 /= t2                           ::   :: type_inequality
-  | v1 /=v v2                          ::   :: value_inequality
+  | v1 /=v v2                          ::   :: term_inequality
     {{ tex [[v1]] \neq [[v2]] }}
   | bindings1 = bindings2              ::   :: bindings_rewrite
   | 0 <= ind1 < ind2                   ::   :: in_bounds
@@ -452,9 +452,9 @@ Subst_ValMapping <= Type_TySubstListPost
 %Subst_ContMapping <= Command_SubstList
 Subst_List <= Command_SubstList
 
-Value_Type <= formula_v_rewrite
-Value_Coercion <= formula_v_rewrite
+Term_Type <= formula_v_rewrite
+Term_Coercion <= formula_v_rewrite
 
 Coercion_TyConAppCo <= Coercion_AppCo
 
-Value_Coercion <= Subst_ValMapping
+Term_Coercion <= Subst_ValMapping

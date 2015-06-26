@@ -10,10 +10,10 @@
 
 module Language.SequentCore.Translate (
   -- $txn
-  fromCoreModule, valueFromCoreExpr,
+  fromCoreModule, termFromCoreExpr,
   bindsToCore,
-  commandToCoreExpr, valueToCoreExpr, contToCoreExpr,
-  onCoreExpr, onSequentCoreValue
+  commandToCoreExpr, termToCoreExpr, contToCoreExpr,
+  onCoreExpr, onSequentCoreTerm
 ) where
 
 import Language.SequentCore.Subst
@@ -52,10 +52,10 @@ import System.IO.Unsafe (unsafePerformIO)
 fromCoreModule :: [Core.CoreBind] -> [SeqCoreBind]
 fromCoreModule binds = runFromCoreM $ fromCoreBinds emptySubst binds
 
--- | Translates a single Core expression as a Sequent Core value.
-valueFromCoreExpr :: Core.CoreExpr -> SeqCoreValue
-valueFromCoreExpr expr
-  = runFromCoreM $ fromCoreExprAsValue freeVarSet expr mkLetContId
+-- | Translates a single Core expression as a Sequent Core term.
+termFromCoreExpr :: Core.CoreExpr -> SeqCoreTerm
+termFromCoreExpr expr
+  = runFromCoreM $ fromCoreExprAsTerm freeVarSet expr mkLetContId
   where
     freeVarSet = mkSubst (mkInScopeSet (Core.exprFreeVars expr))
                    emptyVarEnv emptyVarEnv emptyVarEnv
@@ -90,7 +90,7 @@ fromCoreExpr env expr cont = go [] env expr cont
       Core.App (Core.Var k) e | Var k' <- lookupIdSubst (text "fromCoreExpr") env k, isContId k'
                          -> go binds env e (Return k')
       Core.App e1 e2     ->
-        do e2' <- fromCoreExprAsValue env e2 mkArgContId
+        do e2' <- fromCoreExprAsTerm env e2 mkArgContId
            go binds env e1 (App e2' cont)
       Core.Lam x e       -> done =<< fromCoreLams env x e
       Core.Let bs e      ->
@@ -113,10 +113,10 @@ fromCoreExpr env expr cont = go [] env expr cont
       Core.Cast e co     -> go binds env e (Cast (substCo env co) cont)
       Core.Tick ti e     -> go binds env e (Tick (substTickish env ti) cont)
       Core.Type t        -> done $ Type (substTy env t)
-      where done value = return $ mkCommand (reverse binds) value cont
+      where done term = return $ mkCommand (reverse binds) term cont
 
 fromCoreLams :: FromCoreEnv -> Core.CoreBndr -> Core.CoreExpr
-                            -> FromCoreM SeqCoreValue
+                            -> FromCoreM SeqCoreTerm
 fromCoreLams env x expr
   = Lam xs' kid <$> fromCoreExpr env' body (Return kid)
   where
@@ -125,9 +125,9 @@ fromCoreLams env x expr
     kid = mkLamContId ty
     ty  = substTy env' (Core.exprType body)
 
-fromCoreExprAsValue :: FromCoreEnv -> Core.CoreExpr -> (Type -> ContId)
-                                   -> FromCoreM SeqCoreValue
-fromCoreExprAsValue env expr mkId
+fromCoreExprAsTerm :: FromCoreEnv -> Core.CoreExpr -> (Type -> ContId)
+                                   -> FromCoreM SeqCoreTerm
+fromCoreExprAsTerm env expr mkId
   = do
     comm <- fromCoreExpr env' expr (Return k)
     return $ mkCompute k comm
@@ -158,7 +158,7 @@ fromCoreLamAsCont env cont (Core.Lam b e)
                                     , x' == b'
                                     = return (Just k)
       inner (Core.App e1 e2) k      = do
-                                      e2' <- fromCoreExprAsValue env' e2 mkArgContId
+                                      e2' <- fromCoreExprAsTerm env' e2 mkArgContId
                                       inner e1 (App e2' k)
       inner (Core.Cast e co) k      = inner e (Cast co k)
       inner (Core.Tick ti e) k      = inner e (Tick ti k)
@@ -190,21 +190,21 @@ fromCoreBind env cont_maybe bind =
                        cont'_maybe <- fromCoreLamAsCont env' cont e
                        case cont'_maybe of
                          Just cont' -> return (env', NonRec b' (Cont cont'))
-                         Nothing    -> asValue
+                         Nothing    -> asTerm
                     |  otherwise
-                    -> asValue
-      where asValue =  do
+                    -> asTerm
+      where asTerm  =  do
                        let b' | Just (inTy, outTy) <- splitContFunTy_maybe (idType b)
                               = b `setIdType` mkFunTy inTy outTy
                               | otherwise
                               = b
                        let (env', b'') = substBndr env b'
-                       val <- fromCoreExprAsValue env' e mkLetContId
+                       val <- fromCoreExprAsTerm env' e mkLetContId
                        return (env', NonRec b'' val)
     Core.Rec pairs  -> do
                        let (env', bs') = substRecBndrs env (map fst pairs)
                        vals' <- forM (map snd pairs) $ \e ->
-                         fromCoreExprAsValue env' e mkLetContId
+                         fromCoreExprAsTerm env' e mkLetContId
                        return (env', Rec (zip bs' vals'))
 
 fromCoreBinds :: FromCoreEnv -> [Core.CoreBind] -> FromCoreM [SeqCoreBind]
@@ -216,20 +216,20 @@ commandToCoreExpr :: ContId -> SeqCoreCommand -> Core.CoreExpr
 commandToCoreExpr retId cmd = foldr addLet baseExpr (cmdLet cmd)
   where
   addLet b e = Core.mkCoreLet (bindToCore (Just retId) b) e
-  baseExpr = contToCoreExpr retId (cmdCont cmd) (valueToCoreExpr (cmdValue cmd))
+  baseExpr = contToCoreExpr retId (cmdCont cmd) (termToCoreExpr (cmdTerm cmd))
 
--- | Translates a value into Core.
-valueToCoreExpr :: SeqCoreValue -> Core.CoreExpr
-valueToCoreExpr val =
+-- | Translates a term into Core.
+termToCoreExpr :: SeqCoreTerm -> Core.CoreExpr
+termToCoreExpr val =
   case val of
     Lit l        -> Core.Lit l
     Var x        -> Core.Var x
     Lam xs kb c  -> Core.mkCoreLams xs (commandToCoreExpr kb c)
-    Cons ct as   -> Core.mkCoreApps (Core.Var (dataConWorkId ct)) $ map valueToCoreExpr as
+    Cons ct as   -> Core.mkCoreApps (Core.Var (dataConWorkId ct)) $ map termToCoreExpr as
     Type t       -> Core.Type t
     Coercion co  -> Core.Coercion co
     Compute kb c -> commandToCoreExpr kb c
-    Cont _       -> pprPanic "valueToCoreExpr" (ppr val)
+    Cont _       -> pprPanic "termToCoreExpr" (ppr val)
 
 -- | Translates a continuation into a function that will wrap a Core expression
 -- with a fragment of context (an argument to apply to, a case expression to
@@ -237,7 +237,7 @@ valueToCoreExpr val =
 contToCoreExpr :: ContId -> SeqCoreCont -> (Core.CoreExpr -> Core.CoreExpr)
 contToCoreExpr retId k e =
   case k of
-    App  {- expr -} v k'      -> contToCoreExpr retId k' $ Core.mkCoreApp e (valueToCoreExpr v)
+    App  {- expr -} v k'      -> contToCoreExpr retId k' $ Core.mkCoreApp e (termToCoreExpr v)
     Case {- expr -} b as      -> Core.Case e b (contTyArg (idType retId)) (map (altToCore retId) as)
     Cast {- expr -} co k'     -> contToCoreExpr retId k' $ Core.Cast e co
     Tick ti {- expr -} k'     -> contToCoreExpr retId k' $ Core.Tick ti e
@@ -264,8 +264,8 @@ bindToCore retId_maybe bind =
         k'    = contToCoreExpr retId k
         argTy = isContTy_maybe (idType b) `orElse` pprPanic "bindToCore" (pprBndr LetBind b)
         retId = retId_maybe `orElse` panic "bindToCore: top-level cont"
-    NonRec b v        -> Core.NonRec b (valueToCoreExpr v)
-    Rec bs            -> Core.Rec [ (b, valueToCoreExpr v) | (b,v) <- bs ]
+    NonRec b v        -> Core.NonRec b (termToCoreExpr v)
+    Rec bs            -> Core.Rec [ (b, termToCoreExpr v) | (b,v) <- bs ]
 
 -- | Translates a list of top-level bindings into Core.
 bindsToCore :: [SeqCoreBind] -> [Core.CoreBind]
@@ -276,10 +276,10 @@ altToCore retId (Alt ac bs c) = (ac, bs, commandToCoreExpr retId c)
 
 -- Public interface for operations going in both directions
 
--- | Take an operation on Sequent Core values and perform it on Core expressions
-onCoreExpr :: (SeqCoreValue -> SeqCoreValue) -> (Core.CoreExpr -> Core.CoreExpr)
-onCoreExpr f = valueToCoreExpr . f . valueFromCoreExpr
+-- | Take an operation on Sequent Core terms and perform it on Core expressions
+onCoreExpr :: (SeqCoreTerm -> SeqCoreTerm) -> (Core.CoreExpr -> Core.CoreExpr)
+onCoreExpr f = termToCoreExpr . f . termFromCoreExpr
 
--- | Take an operation on Core expressions and perform it on Sequent Core values
-onSequentCoreValue :: (Core.CoreExpr -> Core.CoreExpr) -> (SeqCoreValue -> SeqCoreValue)
-onSequentCoreValue f = valueFromCoreExpr . f . valueToCoreExpr
+-- | Take an operation on Core expressions and perform it on Sequent Core terms
+onSequentCoreTerm :: (Core.CoreExpr -> Core.CoreExpr) -> (SeqCoreTerm -> SeqCoreTerm)
+onSequentCoreTerm f = termFromCoreExpr . f . termToCoreExpr

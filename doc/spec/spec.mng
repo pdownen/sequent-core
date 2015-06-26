@@ -72,22 +72,22 @@ variables and type-level variables:
 \subsection{Expressions}
 
 Being a sequent calculus, Dual System FC divides terms into the syntactic
-categories of \emph{values}, \emph{continuations}, and \emph{commands}. A
+categories of \emph{terms}, \emph{continuations}, and \emph{commands}. A
 command represents an act of computation in which a value interacts with a
-continuation; in particular, a value \emph{produces} data that a continuation
+continuation; in particular, a term \emph{produces} data that a continuation
 \emph{consumes}.
 
-Values largely correspond to WHNF terms in Core:
+Terms largely correspond to WHNF terms in Core:
 
 \gram{\ottv}
 
 Similarly to Core's \verb|Expr| type, types and coercions should only appear in
-values that are either function arguments (see the continuation syntax) or
+terms that are either function arguments (see the continuation syntax) or
 right-hand sides of $[[let]]$s (see the command syntax). Additionally,
-continuations as values should only appear as right-hand sides. None of these
+continuations as terms should only appear as right-hand sides. None of these
 are first-class values.
 
-There are three further novelties in \verb|Value|:
+There are three further novelties in \verb|Term|:
 
 \begin{itemize}
 \item Each $\lambda$-abstraction binds both a value parameter and a continuation
@@ -99,7 +99,7 @@ This compaction has little impact on typing, however.}
 than simply as function applications (or variables, in the case of nullary
 constructors). This is primarily to clarify the semantics of $[[case]]$: It
 consumes a value of precisely this form.
-\item The $[[compute]]$ form wraps a general computation as a value. It binds a
+\item The $[[compute]]$ form wraps a general computation as a term. It binds a
 continuation variable for the context in which the computation is to occur. (In
 the literature, this is usually written as a $\mu$-abstraction.)
 \end{itemize}
@@ -221,19 +221,19 @@ unchanged from Core.
 %
 %\subsection{Expression typing}
 
-The typing judgments for values have no surprises:
+The typing judgments for terms have no surprises:
 
-\ottdefnlintCoreValue{}
+\ottdefnlintCoreTerm{}
 
-Whereas a value has the type of the data it produces, a continuation has the
+Whereas a term has the type of the data it produces, a continuation has the
 type of the data it \emph{consumes}. Thus a function application supplies a
-value, but it always has a function type (whose argument type, of course, must
-match the type of the value).
+term, but it always has a function type (whose argument type, of course, must
+match the type of the term).
 
 \ottdefnlintCoreCont{}
 
 A command does not in itself have a type, but each of its bindings must be
-well-typed, and its value's type must match its continuation's type:
+well-typed, and its term's type must match its continuation's type:
 
 \ottdefnlintCoreCommand{}
 
@@ -386,7 +386,7 @@ However, an equivalent condition is checked, and indeed is required, by the
 translation functions:
 
 \begin{quotation}
-At any point in the program besides a top-level value, there is a continuation
+At any point in the program besides a top-level term, there is a continuation
 that acts as ``the current continuation.'' Every $[[ret]]$ must invoke either:
 \begin{enumerate}
 \item

@@ -1,4 +1,4 @@
-module Language.SequentCore.Lint ( lintCoreBindings, lintValue ) where
+module Language.SequentCore.Lint ( lintCoreBindings, lintTerm ) where
 
 import Language.SequentCore.Syntax
 import Language.SequentCore.WiredIn
@@ -26,8 +26,8 @@ eitherToMaybe (Right _) = Nothing
 lintCoreBindings :: [SeqCoreBind] -> Maybe SDoc
 lintCoreBindings binds = eitherToMaybe $ foldM lintCoreBind emptyTvSubst binds
 
-lintValue :: TvSubst -> SeqCoreValue -> Maybe SDoc
-lintValue env val = eitherToMaybe $ lintCoreValue env val 
+lintTerm :: TvSubst -> SeqCoreTerm -> Maybe SDoc
+lintTerm env term = eitherToMaybe $ lintCoreTerm env term 
 
 lintCoreBind :: LintEnv -> SeqCoreBind -> LintM LintEnv
 lintCoreBind env (NonRec bndr rhs)
@@ -41,7 +41,7 @@ lintCoreBind env (NonRec bndr rhs)
                    lintCoreCont (text "in RHS for cont id" <+> ppr bndr)
                                 env' contTy cont
       _         -> do
-                   rhsTy <- lintCoreValue env' rhs
+                   rhsTy <- lintCoreTerm env' rhs
                    checkRhsType bndr bndrTy rhsTy
     return env'
 lintCoreBind env (Rec pairs)
@@ -50,13 +50,13 @@ lintCoreBind env (Rec pairs)
         bndrTys = map (substTy env . idType) bndrs
         bndrs'  = zipWith setIdType bndrs bndrTys
         env'    = extendTvInScopeList env bndrs'
-    rhsTys <- mapM (lintCoreValue env' . snd) pairs
+    rhsTys <- mapM (lintCoreTerm env' . snd) pairs
     forM_ (zip3 bndrs bndrTys rhsTys) $ \(bndr, bndrTy, rhsTy) ->
       checkRhsType bndr bndrTy rhsTy
     return env'
 
-lintCoreValue :: LintEnv -> SeqCoreValue -> LintM Type
-lintCoreValue env (Var x)
+lintCoreTerm :: LintEnv -> SeqCoreTerm -> LintM Type
+lintCoreTerm env (Var x)
   | not (isLocalId x)
   = return (idType x)
   | Just x' <- lookupInScope (getTvInScope env) x
@@ -67,7 +67,7 @@ lintCoreValue env (Var x)
   | otherwise
   = Left $ text "not found in context:" <+> pprBndr LetBind x
 
-lintCoreValue env (Lam xs k comm)
+lintCoreTerm env (Lam xs k comm)
   = do
     let (env', xs') = mapAccumL lintBind env xs
         (env'', k') = lintBind env' k
@@ -84,7 +84,7 @@ lintCoreValue env (Lam xs k comm)
         x' = substTyInId env x
         env' = extendTvInScope env x'
 
-lintCoreValue env (Cons dc args)
+lintCoreTerm env (Cons dc args)
   = do
     let (tyVars, monoTy)  = splitForAllTys $ dataConRepType dc
         (argTys, resTy)   = splitFunTys monoTy
@@ -107,11 +107,11 @@ lintCoreValue env (Cons dc args)
     let doArg argTy arg
           = do
             let argTy' = substTy env' argTy
-            checkingType (ppr arg) argTy' $ lintCoreValue env' arg
+            checkingType (ppr arg) argTy' $ lintCoreTerm env' arg
     zipWithM_ doArg argTys valArgs
     return $ substTy env' resTy
 
-lintCoreValue env (Compute bndr comm)
+lintCoreTerm env (Compute bndr comm)
   = do
     ty <- contIdTyOrError env bndr
     lintCoreCommand env' comm
@@ -119,29 +119,29 @@ lintCoreValue env (Compute bndr comm)
   where
     env' = extendTvInScopeSubsted env bndr
 
-lintCoreValue _env (Lit lit)
+lintCoreTerm _env (Lit lit)
   = return $ literalType lit
 
-lintCoreValue env (Type ty)
+lintCoreTerm env (Type ty)
   = return $ typeKind (substTy env ty)
 
-lintCoreValue env (Coercion co)
+lintCoreTerm env (Coercion co)
   = return $ substTy env (coercionType co)
 
-lintCoreValue _env (Cont cont)
-  = Left $ text "unexpected continuation as value:" <+> ppr cont
+lintCoreTerm _env (Cont cont)
+  = Left $ text "unexpected continuation as term:" <+> ppr cont
 
 lintCoreCommand :: LintEnv -> SeqCoreCommand -> LintM ()
-lintCoreCommand env (Command { cmdLet = binds, cmdValue = val, cmdCont = cont })
+lintCoreCommand env (Command { cmdLet = binds, cmdTerm = term, cmdCont = cont })
   = do
     env' <- foldM lintCoreBind env binds
-    lintCoreCut env' val cont
+    lintCoreCut env' term cont
 
-lintCoreCut :: LintEnv -> SeqCoreValue -> SeqCoreCont -> LintM ()
-lintCoreCut env val cont
+lintCoreCut :: LintEnv -> SeqCoreTerm -> SeqCoreCont -> LintM ()
+lintCoreCut env term cont
   = do
-    ty <- lintCoreValue env val
-    lintCoreCont (text "in continuation of" <+> ppr val) env ty cont
+    ty <- lintCoreTerm env term
+    lintCoreCont (text "in continuation of" <+> ppr term) env ty cont
 
 lintCoreCont :: SDoc -> LintEnv -> Type -> SeqCoreCont -> LintM ()
 lintCoreCont desc env ty (Return k)
@@ -169,7 +169,7 @@ lintCoreCont desc env ty (App (Type tyArg) cont)
 lintCoreCont desc env ty (App arg cont)
   | Just (argTy, resTy) <- splitFunTy_maybe (substTy env ty)
   = do
-    void $ checkingType (desc <> colon <+> ppr arg) argTy $ lintCoreValue env arg
+    void $ checkingType (desc <> colon <+> ppr arg) argTy $ lintCoreTerm env arg
     lintCoreCont desc env resTy cont
   | otherwise
   = Left $ desc <> colon <+> text "not a function type:" <+> ppr ty

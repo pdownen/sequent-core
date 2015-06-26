@@ -75,8 +75,8 @@ G |-name kappa_t ok
 ------------------- :: ContBinding
 G |-sbind kappa_t <- e
 
-defn G  |- vl v : t ::  :: lintCoreValue :: 'Vl_'
-  {{ com Value typing, \coderef{Lint.hs}{lintCoreValue} }}
+defn G  |- vl v : t ::  :: lintCoreTerm :: 'Vl_'
+  {{ com Term typing, \coderef{Lint.hs}{lintCoreTerm} }}
   {{ tex [[G]] \labeledjudge{vl} [[v]] : [[t]] }}
 by
 

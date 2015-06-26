@@ -43,14 +43,14 @@ ppr_binds binds = ppr_binds_with "{" ";" "}" binds
 ppr_binds_with :: OutputableBndr b => String -> String -> String -> [Bind b] -> SDoc
 ppr_binds_with open mid close binds = vcat $ intersperse space $ ppr_block open mid close (map ppr_bind binds)
 
-ppr_binding :: OutputableBndr b => (b, Value b) -> SDoc
+ppr_binding :: OutputableBndr b => (b, Term b) -> SDoc
 ppr_binding (val_bdr, expr)
   = pprBndr LetBind val_bdr $$
-    hang (ppr val_bdr <+> equals) 2 (pprCoreValue expr)
+    hang (ppr val_bdr <+> equals) 2 (pprCoreTerm expr)
 
 ppr_comm :: OutputableBndr b => (SDoc -> SDoc) -> Command b -> SDoc
 ppr_comm add_par comm
-  = maybe_add_par $ ppr_let <+> cut (cmdValue comm) (cmdCont comm)
+  = maybe_add_par $ ppr_let <+> cut (cmdTerm comm) (cmdCont comm)
   where
     ppr_let
       = case cmdLet comm of
@@ -58,31 +58,31 @@ ppr_comm add_par comm
           binds -> hang (text "let") 2 (ppr_binds binds) $$ text "in"
     maybe_add_par = if null (cmdLet comm) then noParens else add_par
     cut val cont
-      = cat [text "<" <> pprCoreValue val, vcat $ ppr_block "|" ";" ">" $ ppr_cont_frames cont]
+      = cat [text "<" <> pprCoreTerm val, vcat $ ppr_block "|" ";" ">" $ ppr_cont_frames cont]
 
-ppr_value :: OutputableBndr b => (SDoc -> SDoc) -> Value b -> SDoc
-ppr_value _ (Var name) = ppr name
-ppr_value add_par (Type ty) = add_par $ char '@' <+> ppr ty
-ppr_value _ (Coercion _) = text "CO ..."
-ppr_value add_par (Lit lit) = GHC.pprLiteral add_par lit
-ppr_value add_par (Lam bndrs kbndr body)
+ppr_term :: OutputableBndr b => (SDoc -> SDoc) -> Term b -> SDoc
+ppr_term _ (Var name) = ppr name
+ppr_term add_par (Type ty) = add_par $ char '@' <+> ppr ty
+ppr_term _ (Coercion _) = text "CO ..."
+ppr_term add_par (Lit lit) = GHC.pprLiteral add_par lit
+ppr_term add_par (Lam bndrs kbndr body)
   = add_par $
       hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs ++
                                 [char '|', pprBndr LambdaBind kbndr]) <+> arrow)
         2 (pprCoreComm body)
-ppr_value add_par (Cons ctor args)
+ppr_term add_par (Cons ctor args)
   = add_par $
-    hang (ppr ctor) 2 (sep (map (ppr_value parens) args))
-ppr_value add_par (Compute kbndr comm)
+    hang (ppr ctor) 2 (sep (map (ppr_term parens) args))
+ppr_term add_par (Compute kbndr comm)
   = add_par $
       hang (text "compute" <+> pprBndr LambdaBind kbndr)
         2 (pprCoreComm comm)
-ppr_value add_par (Cont k)
+ppr_term add_par (Cont k)
   = ppr_cont add_par k
 
 ppr_cont_frames :: OutputableBndr b => Cont b -> [SDoc]
 ppr_cont_frames (App v k)
-  = char '$' <+> ppr_value noParens v : ppr_cont_frames k
+  = char '$' <+> ppr_term noParens v : ppr_cont_frames k
 ppr_cont_frames (Case var alts)
   = [hang (text "case as" <+> pprBndr LetBind var <+> text "of") 2 $
       vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)]
@@ -114,8 +114,8 @@ ppr_case_pat con args
 pprCoreComm :: OutputableBndr b => Command b -> SDoc
 pprCoreComm comm = ppr_comm noParens comm
 
-pprCoreValue :: OutputableBndr b => Value b -> SDoc
-pprCoreValue val = ppr_value noParens val
+pprCoreTerm :: OutputableBndr b => Term b -> SDoc
+pprCoreTerm val = ppr_term noParens val
 
 noParens :: SDoc -> SDoc
 noParens pp = pp
@@ -123,8 +123,8 @@ noParens pp = pp
 instance OutputableBndr b => Outputable (Bind b) where
   ppr = ppr_bind
 
-instance OutputableBndr b => Outputable (Value b) where
-  ppr = ppr_value noParens
+instance OutputableBndr b => Outputable (Term b) where
+  ppr = ppr_term noParens
 
 instance OutputableBndr b => Outputable (Command b) where
   ppr = ppr_comm noParens

@@ -1,11 +1,11 @@
 module Language.SequentCore.Translate (
-    valueFromCoreExpr, valueToCoreExpr, onCoreExpr
+    termFromCoreExpr, termToCoreExpr, onCoreExpr
 ) where
 
 import Language.SequentCore.Syntax
 
 import qualified CoreSyn as Core
 
-valueFromCoreExpr :: Core.CoreExpr -> SeqCoreValue
-valueToCoreExpr :: SeqCoreValue -> Core.CoreExpr
-onCoreExpr :: (SeqCoreValue -> SeqCoreValue) -> (Core.CoreExpr -> Core.CoreExpr)
+termFromCoreExpr :: Core.CoreExpr -> SeqCoreTerm
+termToCoreExpr :: SeqCoreTerm -> Core.CoreExpr
+onCoreExpr :: (SeqCoreTerm -> SeqCoreTerm) -> (Core.CoreExpr -> Core.CoreExpr)

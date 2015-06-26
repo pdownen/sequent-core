@@ -62,20 +62,20 @@ inspectSequentCore rawOpts bs = do
   if null unknownOpts
     then do
       forM_ bs $ \bind -> case bind of
-        NonRec x val -> showBind opts x val
-        Rec pairs -> forM_ pairs $ \(x, val) -> showBind opts x val
+        NonRec x term -> showBind opts x term
+        Rec pairs -> forM_ pairs $ \(x, term) -> showBind opts x term
     else do
       errorMsg $ text "Unrecognized option(s): " <+>
                    sep (punctuate comma $ map text unknownOpts)
   return bs
 
-showBind :: Options -> Var -> SeqCoreValue -> CoreM ()
-showBind opts x val
+showBind :: Options -> Var -> SeqCoreTerm -> CoreM ()
+showBind opts x term
   = do
     dflags <- getDynFlags
     let idPart = ppr x
         cap = ufCreationThreshold dflags
-        sizePart | optShowSizes opts = ppr (valueSize dflags cap val)
+        sizePart | optShowSizes opts = ppr (termSize dflags cap term)
                  | otherwise         = empty
     putMsg $ sep [ idPart, sizePart ]
   where

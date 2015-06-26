@@ -1,5 +1,5 @@
 module Language.SequentCore.Simpl.ExprSize (
-  ExprSize(..), valueSize, contSize, commandSize
+  ExprSize(..), termSize, contSize, commandSize
 ) where
 
 import Language.SequentCore.Syntax
@@ -74,7 +74,7 @@ mkBodySize cap b as r
   | cap < b - r = TooBig
   | otherwise   = BodySize { bsBase = b, bsArgDiscs = as, bsResultDisc = r }
 
-valueSize   :: DynFlags -> Int -> SeqCoreValue   -> Maybe ExprSize
+termSize    :: DynFlags -> Int -> SeqCoreTerm    -> Maybe ExprSize
 contSize    :: DynFlags -> Int -> SeqCoreCont    -> Maybe ExprSize
 commandSize :: DynFlags -> Int -> SeqCoreCommand -> Maybe ExprSize
 
@@ -84,11 +84,11 @@ commandSize :: DynFlags -> Int -> SeqCoreCommand -> Maybe ExprSize
 
 bodySize :: DynFlags -> Int -> [Id] -> SeqCoreExpr -> BodySize
 
-valueSize dflags cap (Lam xs _k body)
+termSize dflags cap (Lam xs _k body)
   = let valBinders = filter isId xs
     in body2ExprSize valBinders $ bodySize dflags cap valBinders (C body)
-valueSize dflags cap val
-  = body2ExprSize [] $ bodySize dflags cap [] (V val)
+termSize dflags cap term
+  = body2ExprSize [] $ bodySize dflags cap [] (T term)
 
 commandSize dflags cap comm
   = body2ExprSize [] $ bodySize dflags cap [] (C comm)
@@ -98,16 +98,16 @@ contSize dflags cap cont = body2ExprSize [] $ bodySize dflags cap [] (K cont)
 bodySize dflags cap topArgs expr
   = cap `seq` size expr -- use seq to unbox cap now; we will use it often
   where
-    size (V (Type _))       = sizeZero
-    size (V (Coercion _))   = sizeZero
-    size (V (Var _))        = sizeZero -- invariant: not a nullary constructor
-    size (V (Compute _ comm)) = size (C comm)
-    size (V (Cont cont))    = size (K cont)
-    size (V (Lit lit))      = sizeN (litSize lit)
-    size (V (Cons dc args)) = sizeArgs args `addSizeNSD`
+    size (T (Type _))       = sizeZero
+    size (T (Coercion _))   = sizeZero
+    size (T (Var _))        = sizeZero -- invariant: not a nullary constructor
+    size (T (Compute _ comm)) = size (C comm)
+    size (T (Cont cont))    = size (K cont)
+    size (T (Lit lit))      = sizeN (litSize lit)
+    size (T (Cons dc args)) = sizeArgs args `addSizeNSD`
                               sizeCall (dataConWorkId dc) args voids
-      where voids           = count isRealWorldValue args
-    size (V (Lam xs _ comm))| erased    = size (C comm)
+      where voids           = count isRealWorldTerm args
+    size (T (Lam xs _ comm))| erased    = size (C comm)
                             | otherwise = lamScrutDiscount dflags (size (C comm))
       where erased          = all (\x -> not (isId x) || isRealWorldId x) xs
     
@@ -118,15 +118,15 @@ bodySize dflags cap topArgs expr
     size (K (Case _ alts))  = sizeAlts alts
 
     size (C comm)           = sizeLets (cmdLet comm) `addSizeNSD`
-                              sizeCut (cmdValue comm) (cmdCont comm)
+                              sizeCut (cmdTerm comm) (cmdCont comm)
     
-    sizeCut :: SeqCoreValue -> SeqCoreCont -> BodySize
+    sizeCut :: SeqCoreTerm -> SeqCoreCont -> BodySize
     -- Compare this clause to size_up_app in CoreUnfold; already having the
     -- function and arguments at hand avoids some acrobatics
     sizeCut (Var f) cont@(App {})
       = let (args, cont') = collectArgs cont
-            realArgs      = filter (not . isErasedValue) args
-            voids         = count isRealWorldValue realArgs
+            realArgs      = filter (not . isErasedTerm) args
+            voids         = count isRealWorldTerm realArgs
         in sizeArgs realArgs `addSizeNSD` sizeCall f realArgs voids
                              `addSizeOfCont` cont'
     sizeCut (Var x) (Case _b alts)
@@ -145,17 +145,17 @@ bodySize dflags cap topArgs expr
                      totResDisc
         combineSizes tot _ = tot -- must be TooBig
 
-    sizeCut val cont
-      = size (V val) `addSizeOfCont` cont
+    sizeCut term cont
+      = size (T term) `addSizeOfCont` cont
 
-    sizeArg :: SeqCoreValue -> BodySize
-    sizeArg arg = size (V arg)
+    sizeArg :: SeqCoreTerm -> BodySize
+    sizeArg arg = size (T arg)
 
-    sizeArgs :: [SeqCoreValue] -> BodySize
+    sizeArgs :: [SeqCoreTerm] -> BodySize
     sizeArgs args = foldr (addSizeNSD . sizeArg) sizeZero args
 
     -- Lifted from CoreUnfold
-    sizeCall :: Id -> [SeqCoreValue] -> Int -> BodySize
+    sizeCall :: Id -> [SeqCoreTerm] -> Int -> BodySize
     sizeCall fun valArgs voids
        = case idDetails fun of
            FCallId _        -> sizeN (10 * (1 + length valArgs))
@@ -172,7 +172,7 @@ bodySize dflags cap topArgs expr
 
     sizeBind :: SeqCoreBind -> BodySize
     sizeBind (NonRec x rhs)
-      = size (V rhs) `addSizeN` allocSize
+      = size (T rhs) `addSizeN` allocSize
       where
         allocSize
           -- An unlifted type has no heap allocation
@@ -183,7 +183,7 @@ bodySize dflags cap topArgs expr
       = foldr (addSizeNSD . pairSize) (sizeN allocSize) pairs
       where
         allocSize                     = 10 * length pairs
-        pairSize (_x, rhs)            = size (V rhs)
+        pairSize (_x, rhs)            = size (T rhs)
 
     sizeLets :: [SeqCoreBind] -> BodySize
     sizeLets binds = foldr (addSizeNSD . sizeBind) sizeZero binds
@@ -216,7 +216,7 @@ bodySize dflags cap topArgs expr
     isPassThroughCont (Return _)     = True
     isPassThroughCont (Tick _ cont)  = isPassThroughCont cont
     isPassThroughCont (Cast _ cont)  = isPassThroughCont cont
-    isPassThroughCont (App arg cont) = isErasedValue arg
+    isPassThroughCont (App arg cont) = isErasedTerm arg
                                          && isPassThroughCont cont
     isPassThroughCont _              = False
 
@@ -234,7 +234,7 @@ litSize _other = 0    -- Must match size of nullary constructors
                       --     	    (eg via case binding)
 
 -- Lifted from CoreUnfold
-classOpSize :: DynFlags -> [Id] -> [SeqCoreValue] -> BodySize
+classOpSize :: DynFlags -> [Id] -> [SeqCoreTerm] -> BodySize
 -- See Note [Conlike is interesting]
 classOpSize _ _ []
   = sizeZero
@@ -323,8 +323,8 @@ lamScrutDiscount dflags (BodySize b as _)
 isRealWorldId :: Id -> Bool
 isRealWorldId id = idType id `eqType` realWorldStatePrimTy
 
-isRealWorldValue :: Value b -> Bool
+isRealWorldTerm :: Term b -> Bool
 -- an expression of type State# RealWorld must be a variable
-isRealWorldValue (Var id) = isRealWorldId id
-isRealWorldValue _        = False
+isRealWorldTerm (Var id) = isRealWorldId id
+isRealWorldTerm _        = False
 

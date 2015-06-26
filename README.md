@@ -77,16 +77,16 @@ Syntax
 ### Commands
 
 The essential term in Sequent Core is the *command*. It encompasses:
-  1. A *value*—usually a variable or a lambda
-  1. A *continuation*—the context of the value, i.e. the operations being
+  1. A *term*—usually a variable or a lambda
+  1. A *continuation*—the context of the term, i.e. the operations being
      performed on it
   1. A list of *bindings* in scope, each naming a suspended computation
 
-The general syntax we use to represent a command looks like this, where `v` is
-a value, `e` is a continuation, and `bs` is a series of bindings (some of
+The general syntax we use to represent a command looks like this, where `t` is
+a term, `e` is a continuation, and `bs` is a series of bindings (some of
 which may be mutually recursive blocks):
 
-    let bs in <v | e>
+    let bs in <t | e>
 
 If there are no bindings, we leave off the `let ... in`.
 
@@ -98,9 +98,9 @@ this continuation thus determines the result of the function call.
 
 ### Application
 
-Applying a function to a value is accomplished with an `App` continuation, which
-specifies an argument for the computed function. We use the notation `$ v; e`,
-where `v` is some argument and `e` is the outer continuation. Thus, if the 
+Applying a function to an argument is accomplished with an `App` continuation, which
+specifies an argument for the computed function. We use the notation `$ t; e`,
+where `t` is some argument and `e` is the outer continuation. Thus, if the 
 context is `k`, then
 
     f x y
@@ -112,7 +112,7 @@ is expressed as:
 This can be read as “Take `f` and apply it to `x`, then apply that to `y`, then
 return that to `k`.”
 
-The argument specified is some value. However, a value can be a `Compute` form, 
+The argument specified is some term. However, a term can be a `Compute` form, 
 which wraps a *command*. Since our semantics is call-by-name, this command will
 remain unevaluated until forced.
 
@@ -142,7 +142,7 @@ would look something like (eliding type arguments):
 
 Not only is this ugly, but the reduction of a case expression would then mostly
 be an interaction between parts of a continuation, rather than an interaction 
-between a value and its continuation. Also, to make an application into a value,
+between a value and its continuation. Also, to make an application into a term,
 we have to use a `compute` abstraction even though there is no actual 
 computation being done. Hence we write `[True, False]` as
 
@@ -150,7 +150,7 @@ computation being done. Hence we write `[True, False]` as
 
 much as in Core. Concretely, a data value is `Cons dc args`, where `dc` is the
 `DataCon` representing the data constructor and `args` is a list of types and 
-values.
+Terms.
 
 ### Case Analysis
 
@@ -179,7 +179,7 @@ A command describes an interaction between a value and a continuation. It is an
 action *in progress.* Of course, usually a Haskell program has a number of
 *suspended* computations as well, waiting to be activated on demand. Since these
 `let`-bound computations are not taking part, we don't include them in the
-value or computation part of the command; instead, each command carries a list
+Term or computation part of the command; instead, each command carries a list
 of bindings with it. Hence:
 
     let x = f y in g x z
@@ -200,16 +200,16 @@ since we aim to translate back and forth faithfully:
     For simpler data structures, Core includes types as expressions.
     This allows, for instance, type abstraction and application to use the same
     `Lam` and `App` constructors as for terms. Thus we include `Type` as a
-    constructor for values; it acts the same way it does in Core.
+    constructor for Terms; it acts the same way it does in Core.
 *   **Coercions**  
     Similarly, Core includes coercion terms for doing type-safe
-    casts, so they are values in Sequent Core as well.
+    casts, so they are Terms in Sequent Core as well.
 *   **Casts**  
-    Coercions are used by `cast` expressions: The expression
+    Coercions are used by `cast` expressions: The Core expression
     <code>e \`cast\` γ</code> is operationally the
     same as `e`, but its type is altered according to `γ`. We express a cast
-    using a continuation, so if `v` is a value, `compute k. <v | cast γ; ret k>`
-    is the Sequent Core form of <code>v \`cast\` γ</code>.
+    using a continuation, so if `t` is a term, `compute k. <t | cast γ; ret k>`
+    is the Sequent Core form of <code>t \`cast\` γ</code>.
 *   **Ticks**  
     Finally, Core includes *ticks*, which are essentially markers for
     bookkeeping in the profiler. These wrap expressions, so we include them as
@@ -218,24 +218,24 @@ since we aim to translate back and forth faithfully:
 ### Summary
 
 Our data types divide the constructors of the `Core` datatype into the three 
-types, `Value`, `Cont`, and `Command`. Thus
+types, `Term`, `Cont`, and `Command`. Thus
 the Sequent Core syntax is closely related to Core, making the translation
 relatively simple. Here are all the constructors of the original `Core` type,
 showing where we put each one:
 
-| Constructor |       |      |         |
-| :---------- | :---- | :--- | :------ |
-| Var         | Value |      |         |
-| Lit         | Value |      |         |
-| App         | Value | Cont |         |
-| Let         |       |      | Command |
-| Case        |       | Cont |         |
-| Cast        |       | Cont |         |
-| Tick        |       | Cont |         |
-| Type        | Value |      |         |
-| Coercion    | Value |      |         | |
+| Constructor |      |      |         |
+| :---------- | :--- | :--- | :------ |
+| Var         | Term |      |         |
+| Lit         | Term |      |         |
+| App         | Term | Cont |         |
+| Let         |      |      | Command |
+| Case        |      | Cont |         |
+| Cast        |      | Cont |         |
+| Tick        |      | Cont |         |
+| Type        | Term |      |         |
+| Coercion    | Term |      |         | |
 
-(As noted above, an application will be a simple Value if the function is a data
+(As noted above, an application will be a simple Term if the function is a data
 constructor and there are enough arguments to saturate it.)
 
 An Example

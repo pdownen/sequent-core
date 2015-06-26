@@ -1,21 +1,21 @@
 {-# LANGUAGE KindSignatures #-}
 
 module Language.SequentCore.Syntax (
-  Value, Cont, Command, Bind, Alt,
-  SeqCoreValue, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreAlt,
+  Term, Cont, Command, Bind, Alt,
+  SeqCoreTerm, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreAlt,
 
   mkCommand
 ) where
 
 import Var ( Var )
 
-data Value (b :: *)
+data Term (b :: *)
 data Cont (b :: *)
 data Command (b :: *)
 data Bind (b :: *)
 data Alt (b :: *)
 
-type SeqCoreValue   = Value   Var
+type SeqCoreTerm    = Term    Var
 type SeqCoreCont    = Cont    Var
 type SeqCoreCommand = Command Var
 type SeqCoreBind    = Bind    Var
@@ -23,4 +23,4 @@ type SeqCoreAlt     = Alt     Var
 
 class HasId b
 
-mkCommand :: HasId b => [Bind b] -> Value b -> Cont b -> Command b
+mkCommand :: HasId b => [Bind b] -> Term b -> Cont b -> Command b

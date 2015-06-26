@@ -5,7 +5,7 @@ module Language.SequentCore.Subst (
 
         -- ** Substituting into expressions and related types
         deShadowBinds, substSpec, substRulesForImportedIds,
-        substTy, substCo, substValue, substBind, substBindSC,
+        substTy, substCo, substTerm, substBind, substBindSC,
         substUnfolding, substUnfoldingSC,
         lookupIdSubst, lookupTvSubst, lookupCvSubst, substIdOcc,
         substTickish, substVarSet,
@@ -104,17 +104,17 @@ For Ids, we have a different invariant
 
 In consequence:
 
-* If the TvSubstEnv and IdSubstEnv are both empty, substValue would be a
-  no-op, so substValueSC ("short cut") does nothing.
+* If the TvSubstEnv and IdSubstEnv are both empty, substTerm would be a
+  no-op, so substTermSC ("short cut") does nothing.
 
-  However, substValue still goes ahead and substitutes.  Reason: we may
+  However, substTerm still goes ahead and substitutes.  Reason: we may
   want to replace existing Ids with new ones from the in-scope set, to
   avoid space leaks.
 
 * In substIdBndr, we extend the IdSubstEnv only when the unique changes
 
 * If the CvSubstEnv, TvSubstEnv and IdSubstEnv are all empty,
-  substValue does nothing (Note that the above rule for substIdBndr
+  substTerm does nothing (Note that the above rule for substIdBndr
   maintains this property.  If the incoming envts are both empty, then
   substituting the type and IdInfo can't change anything.)
 
@@ -147,7 +147,7 @@ TvSubstEnv and CvSubstEnv?
 -}
 
 -- | An environment for substituting for 'Id's
-type IdSubstEnv = IdEnv SeqCoreValue
+type IdSubstEnv = IdEnv SeqCoreTerm
 
 ----------------------------
 isEmptySubst :: Subst -> Bool
@@ -174,12 +174,12 @@ zapSubstEnv (Subst in_scope _ _ _) = Subst in_scope emptyVarEnv emptyVarEnv empt
 
 -- | Add a substitution for an 'Id' to the 'Subst': you must ensure that the in-scope set is
 -- such that the "CoreSubst#in_scope_invariant" is true after extending the substitution like this
-extendIdSubst :: Subst -> Id -> SeqCoreValue -> Subst
+extendIdSubst :: Subst -> Id -> SeqCoreTerm -> Subst
 -- ToDo: add an ASSERT that fvs(subst-result) is already in the in-scope set
 extendIdSubst (Subst in_scope ids tvs cvs) v r = Subst in_scope (extendVarEnv ids v r) tvs cvs
 
 -- | Adds multiple 'Id' substitutions to the 'Subst': see also 'extendIdSubst'
-extendIdSubstList :: Subst -> [(Id, SeqCoreValue)] -> Subst
+extendIdSubstList :: Subst -> [(Id, SeqCoreTerm)] -> Subst
 extendIdSubstList (Subst in_scope ids tvs cvs) prs = Subst in_scope (extendVarEnvList ids prs) tvs cvs
 
 -- | Add a substitution for a 'TyVar' to the 'Subst': you must ensure that the in-scope set is
@@ -204,7 +204,7 @@ extendCvSubstList (Subst in_scope ids tvs cvs) prs = Subst in_scope ids tvs (ext
 -- | Add a substitution appropriate to the thing being substituted
 --   (whether an expression, type, or coercion). See also
 --   'extendIdSubst', 'extendTvSubst', and 'extendCvSubst'.
-extendSubst :: Subst -> Var -> SeqCoreValue -> Subst
+extendSubst :: Subst -> Var -> SeqCoreTerm -> Subst
 extendSubst subst var arg
   = case arg of
       Type ty     -> assert (isTyVar var) $ extendTvSubst subst var ty
@@ -220,12 +220,12 @@ extendSubstWithVar subst v1 v2
 -- | Add a substitution as appropriate to each of the terms being
 --   substituted (whether expressions, types, or coercions). See also
 --   'extendSubst'.
-extendSubstList :: Subst -> [(Var,SeqCoreValue)] -> Subst
+extendSubstList :: Subst -> [(Var,SeqCoreTerm)] -> Subst
 extendSubstList subst []              = subst
 extendSubstList subst ((var,rhs):prs) = extendSubstList (extendSubst subst var rhs) prs
 
 -- | Find the substitution for an 'Id' in the 'Subst'
-lookupIdSubst :: SDoc -> Subst -> Id -> SeqCoreValue
+lookupIdSubst :: SDoc -> Subst -> Id -> SeqCoreTerm
 lookupIdSubst doc (Subst in_scope ids _ _) v
   | not (isLocalId v) = Var v
   | Just e  <- lookupVarEnv ids       v = e
@@ -258,7 +258,7 @@ delBndrs (Subst in_scope ids tvs cvs) vs
 --   No left-right shadowing
 --   ie the substitution for   (\x \y. e) a1 a2
 --      so neither x nor y scope over a1 a2
-mkOpenSubst :: InScopeSet -> [(Var,SeqCoreValue)] -> Subst
+mkOpenSubst :: InScopeSet -> [(Var,SeqCoreTerm)] -> Subst
 mkOpenSubst in_scope pairs = Subst in_scope
                                    (mkVarEnv [(id,e)  | (id, e) <- pairs, isId id])
                                    (mkVarEnv [(tv,ty) | (tv, Type ty) <- pairs])
@@ -318,7 +318,7 @@ instance Outputable Subst where
 -}
 
 toCoreIdSubstEnv :: IdSubstEnv -> CoreSubst.IdSubstEnv
-toCoreIdSubstEnv = mapVarEnv valueToCoreExpr
+toCoreIdSubstEnv = mapVarEnv termToCoreExpr
 
 toCoreSubst :: Subst -> CoreSubst.Subst
 toCoreSubst (Subst ins ids tvs cvs)
@@ -332,13 +332,13 @@ toCoreSubst (Subst ins ids tvs cvs)
 %************************************************************************
 -}
 
-substValue :: SDoc -> Subst -> SeqCoreValue -> SeqCoreValue
-substValue _doc subst orig_val = unV $ subst_expr subst (V orig_val)
+substTerm :: SDoc -> Subst -> SeqCoreTerm -> SeqCoreTerm
+substTerm _doc subst orig_term = unT $ subst_expr subst (T orig_term)
 
-subst_value :: Subst -> SeqCoreValue   -> SeqCoreValue
-subst_comm  :: Subst -> SeqCoreCommand -> SeqCoreCommand
-subst_cont  :: Subst -> SeqCoreCont    -> SeqCoreCont
-subst_value subst = unV . subst_expr subst . V
+subst_term :: Subst -> SeqCoreTerm    -> SeqCoreTerm
+subst_comm :: Subst -> SeqCoreCommand -> SeqCoreCommand
+subst_cont :: Subst -> SeqCoreCont    -> SeqCoreCont
+subst_term subst = unT . subst_expr subst . T
 subst_comm subst = unC . subst_expr subst . C
 subst_cont subst = unK . subst_expr subst . K
 
@@ -346,11 +346,11 @@ subst_expr :: Subst -> SeqCoreExpr   -> SeqCoreExpr
 subst_expr subst expr
   = go expr
   where
-    go (V val)  = V (goV val)
+    go (T term) = T (goV term)
     go (C comm) = C (goC comm)
     go (K cont) = K (goK cont)
   
-    goV (Var v)         = lookupIdSubst (text "subst_value") subst v 
+    goV (Var v)         = lookupIdSubst (text "subst_term") subst v 
     goV (Type ty)       = Type (substTy subst ty)
     goV (Coercion co)   = Coercion (substCo subst co)
     goV (Cont cont)     = Cont (goK cont)
@@ -381,7 +381,7 @@ subst_expr subst expr
                              Cont cont -> cont
                              other     -> pprPanic "subst_expr::goK" (ppr other)
 
-    goC (Command binds val cont) = Command binds' (subst_value subst' val)
+    goC (Command binds term cont) = Command binds' (subst_term subst' term)
                                                   (subst_cont subst' cont)
                       where
                         (subst', binds') = mapAccumL substBind subst binds
@@ -407,9 +407,9 @@ substBindSC subst bind    -- Short-cut if the substitution is empty
             (bndrs, rhss)    = unzip pairs
             (subst', bndrs') = substRecBndrs subst bndrs
             rhss' | isEmptySubst subst' = rhss
-                  | otherwise           = map (subst_value subst') rhss
+                  | otherwise           = map (subst_term subst') rhss
 
-substBind subst (NonRec bndr rhs) = (subst', NonRec bndr' (subst_value subst rhs))
+substBind subst (NonRec bndr rhs) = (subst', NonRec bndr' (subst_term subst rhs))
                                   where
                                     (subst', bndr') = substBndr subst bndr
 
@@ -417,7 +417,7 @@ substBind subst (Rec pairs) = (subst', Rec (bndrs' `zip` rhss'))
                             where
                                 (bndrs, rhss)    = unzip pairs
                                 (subst', bndrs') = substRecBndrs subst bndrs
-                                rhss' = map (subst_value subst') rhss
+                                rhss' = map (subst_term subst') rhss
 
 -- | De-shadowing the program is sometimes a useful pre-pass. It can be done simply
 -- by running over the bindings with an empty substitution, because substitution
@@ -638,7 +638,7 @@ substUnfolding subst df@(DFunUnfolding { df_bndrs = bndrs, df_args = args })
   = df { df_bndrs = bndrs', df_args = args' }
   where
     (subst',bndrs') = substBndrs subst bndrs
-    args'           = map (onCoreExpr (substValue (text "subst-unf:dfun") subst'))
+    args'           = map (onCoreExpr (substTerm (text "subst-unf:dfun") subst'))
                         args
 
 substUnfolding subst unf@(CoreUnfolding { uf_tmpl = tmpl, uf_src = src })
@@ -649,7 +649,7 @@ substUnfolding subst unf@(CoreUnfolding { uf_tmpl = tmpl, uf_src = src })
   = seqExpr new_tmpl `seq`
     unf { uf_tmpl = new_tmpl }
   where
-    new_tmpl = onCoreExpr (substValue (text "subst-unf") subst) tmpl
+    new_tmpl = onCoreExpr (substTerm (text "subst-unf") subst) tmpl
 
 substUnfolding _ unf = unf      -- NoUnfolding, OtherCon
 
@@ -694,7 +694,7 @@ substRule subst subst_ru_fn rule@(Rule { ru_bndrs = bndrs, ru_args = args
            ru_fn    = if is_local 
                         then subst_ru_fn fn_name 
                         else fn_name,
-           ru_args  = map (onCoreExpr (substValue (text "subst-rule" <+> ppr fn_name) subst')) args,
+           ru_args  = map (onCoreExpr (substTerm (text "subst-rule" <+> ppr fn_name) subst')) args,
            ru_rhs   = simpleOptExprWith (toCoreSubst subst') rhs }
            -- Do simple optimisation on RHS, in case substitution lets
            -- you improve it.  The real simplifier never gets to look at it.
@@ -707,7 +707,7 @@ substVarSet subst fvs
   = foldVarSet (unionVarSet . subst_fv subst) emptyVarSet fvs
   where
     subst_fv subst fv 
-        | isId fv   = exprFreeVars (valueToCoreExpr (lookupIdSubst (text "substVarSet") subst fv))
+        | isId fv   = exprFreeVars (termToCoreExpr (lookupIdSubst (text "substVarSet") subst fv))
         | otherwise = Type.tyVarsOfType (lookupTvSubst subst fv)
 
 ------------------
