@@ -57,18 +57,19 @@ patterns in the code often require substantial ad-hoc bookkeeping.
 
 We would prefer to write the above code like this:
 
-    <f | $ x
-       ; $ y
-       ; case of
-           True -> <g | $ x>
-           False -> y>>
+    compute k. <f | $ x
+                  ; $ y
+                  ; case of
+                      True -> <g | $ x; ret k >
+                      False -> <y | ret k>>
 
-We will explicate this syntax shortly, but the basic idea is apparent: The top
+We will explicate this syntax shortly, but the basic idea is apparent: We
+perform a computation in some context we call `k`. The top
 of the term says what to do first, namely evaluate `f`. Next, we apply that
 value to `x`, and then apply *that* value to `y`. Then, we perform a case
 analysis on that result. In the `True` case, we evaluate `g`, apply `x` to it,
-then return; in the `False` case, we evaluate y and return it directly. (By
-“return,” we mean give as the value for the whole expression.)
+then return; in the `False` case, we evaluate y and return it directly. In
+either case, the return sends the returned value to the context `k`.
 
 Syntax
 ------
@@ -79,39 +80,41 @@ The essential term in Sequent Core is the *command*. It encompasses:
   1. A *value*—usually a variable or a lambda
   1. A *continuation*—the context of the value, i.e. the operations being
      performed on it
-  1. A list of *bindings* in scope, tracking suspended computations
-
-In turn, a continuation is represented as a list of *frames*, each of which is
-some atomic operation such as “apply to this argument” or “perform this case
-analysis.”
+  1. A list of *bindings* in scope, each naming a suspended computation
 
 The general syntax we use to represent a command looks like this, where `v` is
-a value, `f1` and so on are frames, and `bs` is a series of bindings (some of
+a value, `e` is a continuation, and `bs` is a series of bindings (some of
 which may be mutually recursive blocks):
 
-    let bs in <v | f1; f2; f3>
+    let bs in <v | e>
 
-If there are no bindings, we leave off the `let ... in`, and if there are no
-frames, we leave off the punctuation, writing `x` for `<x|>`.
+If there are no bindings, we leave off the `let ... in`.
+
+### Functions
+
+Just as with CPS, each λ-abstraction has an extra argument to bind a 
+continuation---the context in which the function is called. Passing a value to
+this continuation thus determines the result of the function call.
 
 ### Application
 
-Applying a function to a value is accomplished with an `App` frame, which
-specifies an argument for the computed function. We use the notation `_ $ c`,
-where `c` is some argument; the intuition is that the `_` stands for the value,
-so this frame is a function application missing the function part. Thus:
+Applying a function to a value is accomplished with an `App` continuation, which
+specifies an argument for the computed function. We use the notation `$ v; e`,
+where `v` is some argument and `e` is the outer continuation. Thus, if the 
+context is `k`, then
 
     f x y
 
 is expressed as:
 
-    <f | $ x; $ y>
+    <f | $ x; $ y; ret k>.
 
-This can be read as “Take `f` and apply it to `x`, then apply that to `y`.”
+This can be read as “Take `f` and apply it to `x`, then apply that to `y`, then
+return that to `k`.”
 
-In fact, the argument specified can in general be a *command*. This makes the
-lazy evaluation apparent, as a command appearing as an argument represents a
-suspended computation.
+The argument specified is some value. However, a value can be a `Compute` form, 
+which wraps a *command*. Since our semantics is call-by-name, this command will
+remain unevaluated until forced.
 
 So a slightly more complicated example would be:
 
@@ -119,15 +122,42 @@ So a slightly more complicated example would be:
 
 which becomes:
 
-    <f | $ <g | $ x>
-       ; $ <h | $ y>>
+    <f | $ compute k'. <g | $ x; ret k'>
+       ; $ compute k'. <h | $ y; ret k'>
+       ; ret k>
+
+### WHNFs
+
+In Core, a saturated data constructor application is irreducible---even though 
+it is represented as a fully-applied function, it remains inert unless it's the 
+scrutinee of a case. If we wrote Sequent Core this way, then `[True,False]`
+would look something like (eliding type arguments):
+
+    compute k. <: | $ compute k1. <: | $ True
+                                     ; $ compute k2. <: | $ False
+                                                        ; $ []
+                                                        ;  ret k2>
+                                     ; ret k1>
+                  ; ret k>.
+
+Not only is this ugly, but the reduction of a case expression would then mostly
+be an interaction between parts of a continuation, rather than an interaction 
+between a value and its continuation. Also, to make an application into a value,
+we have to use a `compute` abstraction even though there is no actual 
+computation being done. Hence we write `[True, False]` as
+
+     (:) True ((:) False []),
+
+much as in Core. Concretely, a data value is `Cons dc args`, where `dc` is the
+`DataCon` representing the data constructor and `args` is a list of types and 
+values.
 
 ### Case Analysis
 
 To use a value of a data type, one performs a case analysis. In Sequent Core, we
-represent this by a `Case` frame. Just as an `App` frame is an application
-missing the function, a `Case` frame is a case expression missing the scrutinee.
-The right-hand side of each case is a command.
+represent this by a `Case` continuation. Just as an `App` is an application
+missing the function, a `Case` is a case expression missing the scrutinee. The 
+right-hand side of each case is a command.
 
     case f x of
       Left  y -> g y
@@ -137,8 +167,8 @@ becomes:
 
     <f | $ x
        ; case of
-           Left  y -> <g | $ y>
-           Right z -> <h | $ z>>
+           Left  y -> <g | $ y; ret k>
+           Right z -> <h | $ z; ret k>>
 
 As before, Sequent Core emphasizes the execution order by putting the first
 action, the application of `f` to `x`, on top.
@@ -157,10 +187,9 @@ of bindings with it. Hence:
 becomes:
 
     let
-      x = <f | $ y>
+      x = compute k'. <f | $ y; ret k'>
     in
-      <g | $ x
-         ; $ z>
+      <g | $ x; $ z; ret k>
 
 ### Miscellany
 
@@ -177,19 +206,19 @@ since we aim to translate back and forth faithfully:
     casts, so they are values in Sequent Core as well.
 *   **Casts**  
     Coercions are used by `cast` expressions: The expression
-    <code>e \`cast\` c</code> is operationally the
-    same as `e`, but its type is altered according to `c`. We express a cast
-    using a frame, so if `v` is a value, `<v | cast c>` is the Sequent Core form
-    of <code>v \`cast\` c</code>.
+    <code>e \`cast\` γ</code> is operationally the
+    same as `e`, but its type is altered according to `γ`. We express a cast
+    using a continuation, so if `v` is a value, `compute k. <v | cast γ; ret k>`
+    is the Sequent Core form of <code>v \`cast\` γ</code>.
 *   **Ticks**  
     Finally, Core includes *ticks*, which are essentially markers for
     bookkeeping in the profiler. These wrap expressions, so we include them as
-    frames in a similar manner to casts.
+    continuations in a similar manner to casts.
 
 ### Summary
 
-In a sense, our data types do little more than divide the constructors of the
-`Core` datatype into three types, called `Value`, `Cont`, and `Command`. Thus
+Our data types divide the constructors of the `Core` datatype into the three 
+types, `Value`, `Cont`, and `Command`. Thus
 the Sequent Core syntax is closely related to Core, making the translation
 relatively simple. Here are all the constructors of the original `Core` type,
 showing where we put each one:
@@ -198,13 +227,16 @@ showing where we put each one:
 | :---------- | :---- | :--- | :------ |
 | Var         | Value |      |         |
 | Lit         | Value |      |         |
-| App         |       | Cont |         |
+| App         | Value | Cont |         |
 | Let         |       |      | Command |
 | Case        |       | Cont |         |
 | Cast        |       | Cont |         |
 | Tick        |       | Cont |         |
 | Type        | Value |      |         |
 | Coercion    | Value |      |         | |
+
+(As noted above, an application will be a simple Value if the function is a data
+constructor and there are enough arguments to saturate it.)
 
 An Example
 ----------
@@ -232,7 +264,7 @@ more gory details, use GHC's `-ddump-ds` option):
               : x xs ->
                 sum' (+ @Int $fNumInt a x) xs
             }; } in
-      sum' (I# 0)
+      sum' (I# 0#)
 
 Largely the structure remains intact, though Core rewrites `while` as `let`,
 makes recursive bindings explicit, etc. Also note that `(+)` is called with
@@ -247,20 +279,23 @@ Now for the Sequent Core version:
          {
              sum' :: Int -> [Int] -> Int
              sum' =
-               \ (a :: Int) (ds :: [Int]) ->
+               \ (a :: Int) (ds :: [Int]) | (k :: Cont# Int) ->
                  <ds
-                 | case of _
-                     [] -> a
+                 | case as _ of
+                     [] -> <a | ret k>
                      x : xs ->
                          <sum'
-                         | $ <+
-                             | $ @Int
-                             ; $ $fNumInt
-                             ; $ a
-                             ; $ x>
-                         ; $ xs>>
+                         | $ compute (k' :: Cont# Int).
+                               <+
+                               | $ @Int
+                               ; $ $fNumInt
+                               ; $ a
+                               ; $ x
+                               ; ret k'>
+                         ; $ xs
+                         ; ret k>>
          }
-       in <sum' | $ <I# | $ 0>>
+       in compute (k :: Cont# (Int -> Int)). <sum' | $ I# 0#; ret k>>
 
 The Plugin Library
 ------------------
