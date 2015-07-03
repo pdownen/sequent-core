@@ -5,7 +5,7 @@ module Language.SequentCore.WiredIn (
   mkContFunTy, isContFunTy, splitContFunTy_maybe,
   sequentCoreTag, sequentCoreWiredInTag,
   
-  mkLamContId, mkLetContId, mkArgContId, mkContArgId
+  mkLamContId, mkLetContId, mkArgContId, mkCaseContId, mkContArgId
 ) where
 
 import FastString
@@ -25,26 +25,26 @@ sequentCoreTag        = 'Q'
 sequentCoreWiredInTag = 'q'
 
 contKindKey, contTypeKey, contFunTypeKey,
-  lamContKey, argContKey, letContKey, contArgKey :: Unique
+  lamContKey, argContKey, letContKey, caseContKey, contArgKey :: Unique
 [ contKindKey, contTypeKey, contFunTypeKey,
-  lamContKey, argContKey, letContKey, contArgKey ]
-  = map (mkUnique sequentCoreWiredInTag) [1..7]
+  lamContKey, argContKey, letContKey, caseContKey, contArgKey ]
+  = map (mkUnique sequentCoreWiredInTag) [1..8]
 
-lamContName, argContName, letContName, contArgName :: Name
-[lamContName, argContName, letContName, contArgName] =
+lamContName, argContName, letContName, caseContName, contArgName :: Name
+[lamContName, argContName, letContName, caseContName, contArgName] =
   zipWith mkSystemVarName
-    [lamContKey,    argContKey,    letContKey,    contArgKey]
-    [fsLit "*lamk", fsLit "*argk", fsLit "*letk", fsLit "karg"]
+    [lamContKey,    argContKey,    letContKey,    caseContKey,    contArgKey]
+    [fsLit "*lamk", fsLit "*argk", fsLit "*letk", fsLit "*casek", fsLit "karg"]
 
 contKindTyConName, contTyConName, contFunTyConName :: Name
 contKindTyConName = mkPrimTyConName (fsLit "ContKind") contKindKey    contKindTyCon
 contTyConName     = mkPrimTyConName (fsLit "Cont#")    contTypeKey    contTyCon
 contFunTyConName  = mkPrimTyConName (fsLit "ContFun")  contFunTypeKey contFunTyCon
 
-mkLamContId, mkArgContId, mkLetContId :: Type -> Var
-[mkLamContId, mkArgContId, mkLetContId]
+mkLamContId, mkArgContId, mkLetContId, mkCaseContId :: Type -> Var
+[mkLamContId, mkArgContId, mkLetContId, mkCaseContId]
   = map (\name ty -> mkLocalId name (mkContTy ty))
-      [lamContName, argContName, letContName]
+      [lamContName, argContName, letContName, caseContName]
 
 mkContArgId :: Type -> Id
 mkContArgId ty = mkLocalId contArgName ty

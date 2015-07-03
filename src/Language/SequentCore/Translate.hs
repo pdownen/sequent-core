@@ -105,10 +105,10 @@ fromCoreExpr env expr cont = go [] env expr cont
           -- Translating a case naively can duplicate lots of code. Rather than
           -- copy the continuation for each branch, we stuff it into a let
           -- binding and copy only a Return to that binding.
-          do (env', k) <- freshContId env (contType cont) (fsLit "*casek")
-             let (env_rhs, x') = substBndr env' x
+          do let k = mkCaseContId (contType cont)
+                 (env_rhs, x') = substBndr env x
              as' <- mapM (fromCoreAlt env_rhs (Return k)) as
-             go (NonRec k (Cont cont) : binds) env' e $ Case x' as'
+             go (NonRec k (Cont cont) : binds) env e $ Case x' as'
       Core.Coercion co   -> done $ Coercion (substCo env co)
       Core.Cast e co     -> go binds env e (Cast (substCo env co) cont)
       Core.Tick ti e     -> go binds env e (Tick (substTickish env ti) cont)
