@@ -266,7 +266,7 @@ wrapFloatsAroundCont env cont
   -- Remember, most nontrivial continuations are strict contexts. Therefore it's
   -- okay to rewrite
   --   E ==> case of [ a -> <a | E> ]
-  -- *except* when E is a Return or (less commonly) some Casts or Ticks before a
+  --  *except* when E is a Return or (less commonly) some Casts or Ticks before a
   -- Return. However, we only call this when something's being floated from a
   -- continuation, and it seems unlikely we'd be floating a let from a Return.
   = do
@@ -882,9 +882,9 @@ makeTrivial :: SimplEnv -> InTerm
 makeTrivial env term
   -- TODO Can't do this, since term is an InTerm and may need to be simplified.
   -- Maybe we should take an OutTerm instead?
-  -- | isTrivialTerm term
-  -- = return (env, term)
-  -- | otherwise
+  --  | isTrivialTerm term
+  --  = return (env, term)
+  --  | otherwise
   = do
     (env', bndr) <- case term of
       Cont cont -> mkFreshContId env (fsLit "*k") (contType cont)
