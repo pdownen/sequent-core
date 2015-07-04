@@ -70,9 +70,6 @@ ppr_term add_par (Lam bndrs kbndr body)
       hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs ++
                                 [char '|', pprBndr LambdaBind kbndr]) <+> arrow)
         2 (pprCoreComm body)
-ppr_term add_par (Cons ctor args)
-  = add_par $
-    hang (ppr ctor) 2 (sep (map (ppr_term parens) args))
 ppr_term add_par (Compute kbndr comm)
   = add_par $
       hang (text "compute" <+> pprBndr LambdaBind kbndr)

@@ -22,7 +22,6 @@ import Language.SequentCore.WiredIn
 
 import qualified CoreSyn as Core
 import qualified CoreUtils as Core
-import DataCon
 import FastString
 import qualified CoreFVs as Core
 import Id
@@ -225,7 +224,6 @@ termToCoreExpr val =
     Lit l        -> Core.Lit l
     Var x        -> Core.Var x
     Lam xs kb c  -> Core.mkCoreLams xs (commandToCoreExpr kb c)
-    Cons ct as   -> Core.mkCoreApps (Core.Var (dataConWorkId ct)) $ map termToCoreExpr as
     Type t       -> Core.Type t
     Coercion co  -> Core.Coercion co
     Compute kb c -> commandToCoreExpr kb c

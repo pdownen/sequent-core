@@ -12,12 +12,13 @@ module Language.SequentCore.Syntax (
   SeqCoreTerm, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreBndr,
     SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
-  mkCommand, mkCompute, addLets, addNonRec,
+  mkCommand, mkCompute, mkAppTerm, mkConstruction, addLets, addNonRec,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
   partitionTypes, isLambda,
   isValueArg, isTypeTerm, isCoTerm, isErasedTerm, isRuntimeTerm, isProperTerm,
   isTrivial, isTrivialTerm, isTrivialCont, isReturnCont,
+  termIsConstruction, termAsConstruction, splitConstruction,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
   flattenBind, flattenBinds, bindersOf, bindersOfBinds,
   -- * Calculations
@@ -40,7 +41,8 @@ import Language.SequentCore.WiredIn
 import Coercion  ( Coercion, coercionType, coercionKind )
 import CoreSyn   ( AltCon(..), Tickish, tickishCounts, isRuntimeVar
                  , isEvaldUnfolding )
-import DataCon   ( DataCon, dataConRepType, dataConTyCon )
+import DataCon   ( DataCon, dataConTyCon, dataConRepArity
+                 , dataConUnivTyVars, dataConExTyVars, dataConWorkId )
 import Id        ( Id, isDataConWorkId, isDataConWorkId_maybe, isConLikeId
                  , idArity, idType, idDetails, idUnfolding 
                  , setIdType, isBottomingId )
@@ -75,9 +77,6 @@ data Term b     = Lit Literal       -- ^ A primitive literal value.
                 | Lam [b] b (Command b)
                                     -- ^ A function. Binds some arguments and
                                     -- a continuation. The body is a command.
-                | Cons DataCon [Term b]
-                                    -- ^ A value formed by a saturated
-                                    -- constructor application.
                 | Compute b (Command b)
                                     -- ^ A value produced by a computation.
                                     -- Binds a continuation.
@@ -164,24 +163,9 @@ type SeqCoreProgram = Program Var
 
 -- | Constructs a command, given @let@ bindings, a term, and a continuation.
 --
--- This smart constructor enforces the invariant that a saturated constructor
--- invocation is represented as a 'Cons' value rather than using 'App' frames.
+-- A smart constructor. If the term happens to be a Compute, may fold its
+-- command into the result.
 mkCommand :: HasId b => [Bind b] -> Term b -> Cont b -> Command b
-mkCommand binds (Var f) cont
-  | Just ctor <- isDataConWorkId_maybe f
-  , Just (args, cont') <- ctorCall
-  = mkCommand binds (Cons ctor args) cont'
-  where
-    (tyVars, monoTy) = Type.splitForAllTys (idType f)
-    (argTys, _)      = Type.splitFunTys monoTy
-    argsNeeded       = length tyVars + length argTys
-    ctorCall
-      | let (args, cont') = collectArgsUpTo argsNeeded cont
-      , length args == argsNeeded
-      = Just (args, cont')
-      | otherwise
-      = Nothing
-
 mkCommand binds (Compute kbndr (Command { cmdLet = binds'
                                         , cmdTerm = term'
                                         , cmdCont = Return kid })) cont
@@ -202,6 +186,17 @@ mkCompute k comm
   = Compute k comm
   where
     kid = identifier k
+  
+mkAppTerm :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreTerm
+mkAppTerm fun args = mkCompute k (mkCommand [] fun (foldr App (Return k) args))
+  where
+    k = mkArgContId retTy
+    (tyArgs, _) = partitionTypes args
+    (_, retTy) = Type.splitFunTys $ Type.applyTys (termType fun) tyArgs
+
+mkConstruction :: DataCon -> [Type] -> [SeqCoreTerm] -> SeqCoreTerm
+mkConstruction dc tyArgs valArgs
+  = mkAppTerm (Var (dataConWorkId dc)) (map Type tyArgs ++ valArgs)
 
 -- | Adds the given bindings outside those in the given command.
 addLets :: [Bind b] -> Command b -> Command b
@@ -330,7 +325,6 @@ isTrivial c
 isTrivialTerm :: HasId b => Term b -> Bool
 isTrivialTerm (Lit l)     = litIsTrivial l
 isTrivialTerm (Lam xs _ c)= not (any (isRuntimeVar . identifier) xs) && isTrivial c
-isTrivialTerm (Cons _ as) = all isErasedTerm as
 isTrivialTerm (Compute _ c) = isTrivial c
 isTrivialTerm (Cont cont) = isTrivialCont cont
 isTrivialTerm _           = True
@@ -359,7 +353,38 @@ commandAsSaturatedCall c
   = do
     let term = cmdTerm c
     (args, cont) <- asSaturatedCall term (cmdCont c)
-    return $ (term, args, cont)
+    return (term, args, cont)
+
+termIsConstruction :: HasId b => Term b -> Bool
+termIsConstruction = isJust . termAsConstruction
+
+termAsConstruction :: HasId b => Term b -> Maybe (DataCon, [Type], [Term b])
+termAsConstruction (Var id)      | Just dc <- isDataConWorkId_maybe id
+                                 , dataConRepArity dc == 0
+                                 , null (dataConUnivTyVars dc)
+                                 , null (dataConExTyVars dc)
+                                 = Just (dc, [], [])
+termAsConstruction (Compute k c) = commandAsConstruction (identifier k) c
+termAsConstruction _             = Nothing
+
+splitConstruction :: Term b -> Cont b -> Maybe (DataCon, [Type], [Term b], Cont b)
+splitConstruction (Var fid) cont
+  | Just dataCon <- isDataConWorkId_maybe fid
+  , length valArgs == dataConRepArity dataCon
+  = Just (dataCon, tyArgs, valArgs, cont')
+  where
+    (tyArgs, valArgs, cont') = collectTypeAndOtherArgs cont
+splitConstruction _ _
+  = Nothing
+
+commandAsConstruction :: ContId -> Command b
+                      -> Maybe (DataCon, [Type], [Term b])
+commandAsConstruction retId (Command { cmdLet = [], cmdTerm = term, cmdCont = cont })
+  | Just (dc, tyArgs, valArgs, Return retId') <- splitConstruction term cont
+  , retId == retId'
+  = Just (dc, tyArgs, valArgs)
+commandAsConstruction _ _
+  = Nothing
 
 -- | If the given term is a function, and the given continuation would provide
 -- enough arguments to saturate it, returns the arguments and the remainder of
@@ -406,10 +431,6 @@ termType :: HasId b => Term b -> Type
 termType (Lit l)        = literalType l
 termType (Var x)        = idType x
 termType (Lam xs k _)   = Type.mkPiTypes (map identifier xs) (contTyArg (idType (identifier k)))
-termType (Cons con as)  = res_ty
-  where
-    (tys, _) = partitionTypes as
-    (_, res_ty) = Type.splitFunTys (dataConRepType con `Type.applyTys` tys)
 termType (Compute k _)  = contTyArg (idType (identifier k))
 -- see exprType in GHC CoreUtils
 termType _other         = alphaTy
@@ -553,7 +574,6 @@ termCheap _        (Lit _)      = True
 termCheap _        (Var _)      = True
 termCheap _        (Type _)     = True
 termCheap _        (Coercion _) = True
-termCheap _        (Cons _ _)   = True
 termCheap appCheap (Lam xs _ c) = any (isRuntimeVar . identifier) xs
                                || commCheap appCheap c
 termCheap appCheap (Compute _ c)= commCheap appCheap c

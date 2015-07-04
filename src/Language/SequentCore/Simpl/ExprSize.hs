@@ -104,9 +104,6 @@ bodySize dflags cap topArgs expr
     size (T (Compute _ comm)) = size (C comm)
     size (T (Cont cont))    = size (K cont)
     size (T (Lit lit))      = sizeN (litSize lit)
-    size (T (Cons dc args)) = sizeArgs args `addSizeNSD`
-                              sizeCall (dataConWorkId dc) args voids
-      where voids           = count isRealWorldTerm args
     size (T (Lam xs _ comm))| erased    = size (C comm)
                             | otherwise = lamScrutDiscount dflags (size (C comm))
       where erased          = all (\x -> not (isId x) || isRealWorldId x) xs

@@ -4,7 +4,6 @@ import Language.SequentCore.Syntax
 import Language.SequentCore.WiredIn
 
 import Coercion     ( coercionKind, coercionType )
-import DataCon
 import Id
 import Kind
 import Literal
@@ -83,33 +82,6 @@ lintCoreTerm env (Lam xs k comm)
       where
         x' = substTyInId env x
         env' = extendTvInScope env x'
-
-lintCoreTerm env (Cons dc args)
-  = do
-    let (tyVars, monoTy)  = splitForAllTys $ dataConRepType dc
-        (argTys, resTy)   = splitFunTys monoTy
-        (tyArgs, valArgs) = partitionTypes args
-    unless (length valArgs == dataConRepArity dc) $
-      Left (text "wrong number of args for" <+> ppr dc $$ ppr args)
-    unless (length tyVars == length tyArgs) $
-      Left (text "wrong number of type args for" <+> ppr dc $$ ppr args)
-    let augment env' (tyVar, ty)
-          = do
-            let tyVarTy = substTy env' (idType tyVar)
-                kind    = substTy env' (typeKind ty)
-            unless (tyVarTy `eqType` kind) $
-              mkError (text "kind of arg" <+> ppr ty <+> text "for" <+> ppr tyVar)
-                (ppr tyVarTy) (ppr kind)
-            let tyVar' = tyVar `setIdType` tyVarTy
-                ty'    = substTy env' ty
-            return $ extendTvSubst env' tyVar' ty' `extendTvInScope` tyVar'
-    env' <- foldM augment env (zip tyVars tyArgs)
-    let doArg argTy arg
-          = do
-            let argTy' = substTy env' argTy
-            checkingType (ppr arg) argTy' $ lintCoreTerm env' arg
-    zipWithM_ doArg argTys valArgs
-    return $ substTy env' resTy
 
 lintCoreTerm env (Compute bndr comm)
   = do

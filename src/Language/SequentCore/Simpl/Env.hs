@@ -484,7 +484,6 @@ guidanceToUnfGuidance (Sometimes { guSize = size, guArgDiscounts = args, guResul
 
 termIsHNF :: SimplEnv -> SeqCoreTerm -> Bool
 termIsHNF _   (Lit {})  = True
-termIsHNF _   (Cons {}) = True
 termIsHNF env (Var id)
   = case lookupVarEnv (se_defs env) id of
       Just (NotAmong {})      -> True
@@ -496,7 +495,9 @@ termIsHNF _   _        = False
 commandIsHNF :: SimplEnv -> SeqCoreCommand -> Bool
 commandIsHNF _env (Command [] (Var fid) cont)
   | let (args, _) = collectArgs cont
-  , length args < idArity fid
+  , let nargs = length args
+  , isDataConWorkId fid && nargs <= idArity fid
+  || nargs < idArity fid
   = True
 commandIsHNF _env (Command _ (Compute {}) _)
   = False

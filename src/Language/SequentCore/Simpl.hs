@@ -35,11 +35,11 @@ import DynFlags    ( gopt, GeneralFlag(..), ufKeenessFactor, ufUseThreshold )
 import FastString
 import Id
 import HscTypes    ( ModGuts(..) )
+import Literal     ( Literal )
 import MkCore      ( mkWildValBinder )
-import MonadUtils  ( mapAccumLM )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
-import Type        ( applyTys, isUnLiftedType, mkTyVarTy, splitFunTys )
+import Type        ( Type, applyTys, isUnLiftedType, mkTyVarTy, splitFunTys )
 import Var
 import VarEnv
 import VarSet
@@ -395,18 +395,14 @@ simplCut2 env_v (Lam xs k c) env_k cont
     c' <- simplCommandNoFloats (env_v'' `setCont` k') c
     simplContWith (env_v'' `setStaticPart` env_k) (Lam xs' k' c') cont
 simplCut2 env_v term env_k cont
-  | isManifestTerm term
-  , Just (env_k', x, alts) <- contIsCase_maybe (env_v `setStaticPart` env_k) cont
-  , Just (pairs, body) <- matchCase env_v term alts
+  | Just (value, cont') <- splitValue term cont
+  , Just (env_k', x, alts) <- contIsCase_maybe (env_v `setStaticPart` env_k) cont'
+  , Just (pairs, body) <- matchCase env_v value alts
   = do
     tick (KnownBranch x)
-    env' <- foldM doPair (env_v `setStaticPart` env_k') ((x, term) : pairs)
+    env' <- foldM doPair (env_v `setStaticPart` env_k') ((x, valueToTerm value) : pairs)
     simplCommand env' body
   where
-    isManifestTerm (Lit {})  = True
-    isManifestTerm (Cons {}) = True
-    isManifestTerm _         = False
-    
     doPair env (x, v)
       = simplNonRec env x (staticPart env_v) v NotTopLevel
 
@@ -473,10 +469,6 @@ simplCut2 env_v term env_k (Case case_bndr [Alt _ bndrs rhs])
       -- Could allow for let bindings,
       -- but the original code in Simplify suggests doing so would be expensive
 
-simplCut2 env_v (Cons ctor args) env_k cont
-  = do
-    (env_v', args') <- mapAccumLM simplTerm env_v args
-    simplContWith (env_v' `setStaticPart` env_k) (Cons ctor args') cont
 simplCut2 env_v (Compute k c) env_k cont
   = (env_v,) <$> simplCommandNoFloats (bindContAs env_v k env_k cont) c
 simplCut2 env_v term@(Lit {}) env_k cont
@@ -485,7 +477,7 @@ simplCut2 env_v term@(Var {}) env_k cont
   = simplContWith (env_v `setStaticPart` env_k) term cont
 
 -- TODO Somehow handle updating Definitions with NotAmong values?
-matchCase :: SimplEnv -> InTerm -> [InAlt]
+matchCase :: SimplEnv -> InValue -> [InAlt]
           -> Maybe ([(InVar, InTerm)], InCommand)
 -- Note that we assume that any variable whose definition is a case-able value
 -- has already been inlined by callSiteInline. So we don't check variables at
@@ -494,24 +486,19 @@ matchCase :: SimplEnv -> InTerm -> [InAlt]
 -- decides it's *always* a good idea to inline a known constructor being cased,
 -- code size be damned, which seems pretty defensible given how these things
 -- tend to cascade.
-matchCase _env_v (Lit lit) (Alt (LitAlt lit') xs body : _alts)
+matchCase _env_v (LitVal lit) (Alt (LitAlt lit') xs body : _alts)
   | assert (null xs) True
   , lit == lit'
   = Just ([], body)
-matchCase _env_v (Cons ctor args) (Alt (DataAlt ctor') xs body : _alts)
+matchCase _env_v (ConsVal ctor _tyArgs valArgs) (Alt (DataAlt ctor') xs body : _alts)
   | ctor == ctor'
   , assert (length valArgs == length xs) True
   = Just (zip xs valArgs, body)
-  where
-    -- TODO Check that this is the Right Thing even in the face of GADTs and
-    -- other shenanigans.
-    valArgs = filter (not . isTypeTerm) args
-matchCase env_v term (Alt DEFAULT xs body : alts)
+matchCase env_v value (Alt DEFAULT xs body : alts)
   | assert (null xs) True
-  , termIsHNF env_v term -- case is strict; don't match if not evaluated
-  = Just $ matchCase env_v term alts `orElse` ([], body)
-matchCase env_v term (_ : alts)
-  = matchCase env_v term alts
+  = Just $ matchCase env_v value alts `orElse` ([], body)
+matchCase env_v value (_ : alts)
+  = matchCase env_v value alts
 matchCase _ _ []
   = Nothing
 
@@ -711,7 +698,7 @@ shouldInline env rhs occ level guid cont
 
 someBenefit :: SimplEnv -> OutTerm -> TopLevelFlag -> InCont -> Bool
 someBenefit env rhs level cont
-  | Cons {} <- rhs, contIsCase env cont
+  | termIsConstruction rhs, contIsCase env cont
   = True
   | Lit {} <- rhs, contIsCase env cont
   = True
@@ -737,9 +724,8 @@ someBenefit env rhs level cont
     knownVar _       = False
 
 whnfOrBot :: SimplEnv -> OutTerm -> Bool
-whnfOrBot _ (Cons {}) = True
 whnfOrBot _ (Lam {})  = True
-whnfOrBot _ term      = isTrivialTerm term || termIsBottom term
+whnfOrBot _ term      = any ($ term) [isTrivialTerm, termIsBottom, termIsConstruction]
 
 inlineMulti :: SimplEnv -> OutTerm -> TopLevelFlag -> Guidance -> InCont -> Bool
 inlineMulti env rhs level guid cont
@@ -797,7 +783,7 @@ inlineDFun env bndrs con conArgs cont
     enoughArgs    = length args == length bndrs
     term | null bndrs = bodyTerm
          | otherwise  = Lam bndrs k (Command [] bodyTerm (Return k))
-    bodyTerm      = Cons con conArgs
+    bodyTerm      = mkAppTerm (Var (dataConWorkId con)) conArgs
     k             = mkLamContId ty
     (_, ty)       = splitFunTys (applyTys (dataConRepType con) (map mkTyVarTy tyBndrs))
     tyBndrs       = takeWhile isTyVar bndrs
@@ -912,3 +898,29 @@ contIsCase_maybe env (Return k)
       SuspTerm stat (Cont cont)          -> contIsCase_maybe (stat `inDynamicScope` env) cont
       _                                  -> panic "contIsCase_maybe"
 contIsCase_maybe _ _ = Nothing
+
+-- TODO This might be generally useful; move to Syntax.hs?
+data Value b
+  = LitVal Literal
+  | LamVal [b] b (Command b)
+  | ConsVal DataCon [Type] [Term b]
+  
+type SeqCoreValue = Value SeqCoreBndr
+type InValue = SeqCoreValue
+type OutValue = SeqCoreValue
+  
+splitValue :: Term b -> Cont b -> Maybe (Value b, Cont b)
+splitValue (Lit lit) cont    = Just (LitVal lit, cont)
+splitValue (Lam xs k c) cont = Just (LamVal xs k c, cont)
+splitValue (Var fid) cont
+  | Just dc <- isDataConWorkId_maybe fid
+  , length valArgs == dataConRepArity dc
+  = Just (ConsVal dc tyArgs valArgs, cont')
+  where
+    (tyArgs, valArgs, cont') = collectTypeAndOtherArgs cont
+splitValue _ _               = Nothing
+
+valueToTerm :: SeqCoreValue -> SeqCoreTerm
+valueToTerm (LitVal lit)          = Lit lit
+valueToTerm (LamVal xs k c)       = Lam xs k c
+valueToTerm (ConsVal dc tys vals) = mkConstruction dc tys vals

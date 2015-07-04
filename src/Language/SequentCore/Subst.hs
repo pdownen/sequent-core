@@ -346,25 +346,24 @@ subst_expr :: Subst -> SeqCoreExpr   -> SeqCoreExpr
 subst_expr subst expr
   = go expr
   where
-    go (T term) = T (goV term)
+    go (T term) = T (goT term)
     go (C comm) = C (goC comm)
     go (K cont) = K (goK cont)
   
-    goV (Var v)         = lookupIdSubst (text "subst_term") subst v 
-    goV (Type ty)       = Type (substTy subst ty)
-    goV (Coercion co)   = Coercion (substCo subst co)
-    goV (Cont cont)     = Cont (goK cont)
-    goV (Lit lit)       = Lit lit
-    goV (Cons con args) = Cons con (map goV args)
-    goV (Compute k comm)= Compute k' (subst_comm subst' comm)
+    goT (Var v)         = lookupIdSubst (text "subst_term") subst v 
+    goT (Type ty)       = Type (substTy subst ty)
+    goT (Coercion co)   = Coercion (substCo subst co)
+    goT (Cont cont)     = Cont (goK cont)
+    goT (Lit lit)       = Lit lit
+    goT (Compute k comm)= Compute k' (subst_comm subst' comm)
                       where
                         (subst', k')  = substBndr subst k
-    goV (Lam xs k body) = Lam xs' k' (subst_comm subst'' body)
+    goT (Lam xs k body) = Lam xs' k' (subst_comm subst'' body)
                       where
                         (subst', xs') = mapAccumL substBndr subst xs
                         (subst'', k') = substBndr subst' k
     
-    goK (App arg cont)  = App (goV arg) (goK cont)
+    goK (App arg cont)  = App (goT arg) (goK cont)
     goK (Tick tickish cont) = Tick (substTickish subst tickish) (goK cont)
     goK (Cast co cont)      = Cast (substCo subst co) (goK cont)
        -- Do not optimise even identity coercions

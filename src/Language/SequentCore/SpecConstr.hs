@@ -385,10 +385,8 @@ specialize env (ScUsage calls used) (x, v)
     shouldSpec args
       = or $ zipWith qualifyingArg binders args
       where
-        qualifyingArg x' (Cons {})
-          = x' `elemVarSet` used
-        qualifyingArg _ _
-          = False
+        qualifyingArg x' term
+          = termIsConstruction term && x' `elemVarSet` used
 
     -- | Create a specialization for a call pattern.
     specCall :: CallPat -> CoreM Spec
@@ -410,14 +408,14 @@ specialize env (ScUsage calls used) (x, v)
     -- call pattern. This produces some number of pattern variables and one
     -- argument.
     argToSubpat :: Var -> SeqCoreTerm -> CoreM ([Var], SeqCoreTerm)
-    argToSubpat _ (Cons ctor args)
+    argToSubpat _ term
+      | Just (dc, tyArgs, valArgs) <- termAsConstruction term
       -- This is a saturated constructor application, so abstract over its
       -- arguments to produce the subpattern
       = do
-        -- Abstract over *term* arguments only
-        let (tyArgs, tmArgs) = span isErasedTerm args
-        tmVars <- mapM (mkSysLocalM (fsLit "scsca") . termType) tmArgs
-        let val = Cons ctor $ tyArgs ++ map Var tmVars
+        -- Abstract over *value* arguments only
+        tmVars <- mapM (mkSysLocalM (fsLit "scsca") . termType) valArgs
+        let val = mkConstruction dc tyArgs (map Var tmVars)
         return (tmVars, val)
     argToSubpat var _
       -- Just abstract over the whole argument; it's either a variable or
