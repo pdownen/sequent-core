@@ -358,10 +358,9 @@ subst_expr subst expr
     goT (Compute k comm)= Compute k' (subst_comm subst' comm)
                       where
                         (subst', k')  = substBndr subst k
-    goT (Lam xs k body) = Lam xs' k' (subst_comm subst'' body)
+    goT (Lam x body)    = Lam x' (subst_term subst' body)
                       where
-                        (subst', xs') = mapAccumL substBndr subst xs
-                        (subst'', k') = substBndr subst' k
+                        (subst', x') = substBndr subst x
     
     goK (App arg cont)  = App (goT arg) (goK cont)
     goK (Tick tickish cont) = Tick (substTickish subst tickish) (goK cont)

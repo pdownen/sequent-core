@@ -20,7 +20,6 @@ import Language.SequentCore.Simpl.Monad
 import Language.SequentCore.Syntax
 import Language.SequentCore.Translate
 import Language.SequentCore.Util
-import Language.SequentCore.WiredIn
 
 import BasicTypes
 import Coercion    ( Coercion, isCoVar )
@@ -39,7 +38,7 @@ import Literal     ( Literal )
 import MkCore      ( mkWildValBinder )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
-import Type        ( Type, applyTys, isUnLiftedType, mkTyVarTy, splitFunTys )
+import Type        ( Type, isUnLiftedType )
 import Var
 import VarEnv
 import VarSet
@@ -374,26 +373,16 @@ simplCut2 env_v (Coercion co) _env_k cont
     in return (env_v, Command [] (Coercion co') cont)
 simplCut2 _env_v (Cont {}) _env_k cont
   = pprPanic "simplCut of cont" (ppr cont)
-simplCut2 env_v (Lam xs k c) env_k cont@(App {})
+simplCut2 env_v (Lam x body) env_k (App arg cont)
   = do
-    -- Need to address three cases: More args than xs; more xs than args; equal
-    let n = length xs
-        (args, cont') = collectArgsUpTo n cont -- force xs >= args by ignoring
-                                               -- extra args
-    mapM_ (tick . BetaReduction) (take (length args) xs)
-    env_v' <- foldM (\env (x, arg) -> simplNonRec env x env_k arg NotTopLevel)
-                env_v (zip xs args)
-    if n == length args
-      -- No more args (xs == args)
-      then simplCommand (bindContAs env_v' k env_k cont') c
-      -- Still more args (xs > args)
-      else simplCut env_v' (Lam (drop (length args) xs) k c) env_k cont'
-simplCut2 env_v (Lam xs k c) env_k cont
+    tick (BetaReduction x)
+    env_v' <- simplNonRec env_v x env_k arg NotTopLevel
+    simplCut env_v' body env_k cont
+simplCut2 env_v (Lam x body) env_k cont
   = do
-    let (env_v', xs') = enterScopes env_v xs
-        (env_v'', k') = enterScope env_v' k
-    c' <- simplCommandNoFloats (env_v'' `setCont` k') c
-    simplContWith (env_v'' `setStaticPart` env_k) (Lam xs' k' c') cont
+    let (env_v', x') = enterScope env_v x
+    body' <- simplTermNoFloats env_v' body
+    simplContWith (env_v' `setStaticPart` env_k) (Lam x' body') cont
 simplCut2 env_v term env_k cont
   | Just (value, cont') <- splitValue term cont
   , Just (env_k', x, alts) <- contIsCase_maybe (env_v `setStaticPart` env_k) cont'
@@ -623,8 +612,8 @@ preInlineUnconditionally _env_x x _env_rhs rhs level
           | Just v <- asValueCommand k c = canInlineTermInLam v
           | otherwise                    = False
         canInlineTermInLam (Lit _)       = True
-        canInlineTermInLam (Lam xs k c)  = any isRuntimeVar xs
-                                         || canInlineInLam k c
+        canInlineTermInLam (Lam x t)     = isRuntimeVar x
+                                         || canInlineTermInLam t
         canInlineTermInLam (Compute k c) = canInlineInLam k c
         canInlineTermInLam _             = False
         early_phase = case sm_phase mode of
@@ -702,11 +691,12 @@ someBenefit env rhs level cont
   = True
   | Lit {} <- rhs, contIsCase env cont
   = True
-  | Lam xs _ _ <- rhs
+  | Lam {} <- rhs
   = consider xs args
   | otherwise
   = False
   where
+    (xs, _)       = lambdas rhs
     (args, cont') = collectArgs cont
 
     -- See Secrets, section 7.2, for the someBenefit criteria
@@ -781,12 +771,8 @@ inlineDFun env bndrs con conArgs cont
   where
     (args, cont') = collectArgsUpTo (length bndrs) cont
     enoughArgs    = length args == length bndrs
-    term | null bndrs = bodyTerm
-         | otherwise  = Lam bndrs k (Command [] bodyTerm (Return k))
+    term          = mkLambdas bndrs bodyTerm
     bodyTerm      = mkAppTerm (Var (dataConWorkId con)) conArgs
-    k             = mkLamContId ty
-    (_, ty)       = splitFunTys (applyTys (dataConRepType con) (map mkTyVarTy tyBndrs))
-    tyBndrs       = takeWhile isTyVar bndrs
 
 data ContSplitting
   = DupeAll OutCont
@@ -902,7 +888,7 @@ contIsCase_maybe _ _ = Nothing
 -- TODO This might be generally useful; move to Syntax.hs?
 data Value b
   = LitVal Literal
-  | LamVal [b] b (Command b)
+  | LamVal [b] (Term b)
   | ConsVal DataCon [Type] [Term b]
   
 type SeqCoreValue = Value SeqCoreBndr
@@ -910,8 +896,8 @@ type InValue = SeqCoreValue
 type OutValue = SeqCoreValue
   
 splitValue :: Term b -> Cont b -> Maybe (Value b, Cont b)
-splitValue (Lit lit) cont    = Just (LitVal lit, cont)
-splitValue (Lam xs k c) cont = Just (LamVal xs k c, cont)
+splitValue (Lit lit) cont = Just (LitVal lit, cont)
+splitValue term@(Lam {}) cont = Just (uncurry LamVal (lambdas term), cont)
 splitValue (Var fid) cont
   | Just dc <- isDataConWorkId_maybe fid
   , length valArgs == dataConRepArity dc
@@ -922,5 +908,5 @@ splitValue _ _               = Nothing
 
 valueToTerm :: SeqCoreValue -> SeqCoreTerm
 valueToTerm (LitVal lit)          = Lit lit
-valueToTerm (LamVal xs k c)       = Lam xs k c
+valueToTerm (LamVal xs t)         = mkLambdas xs t
 valueToTerm (ConsVal dc tys vals) = mkConstruction dc tys vals

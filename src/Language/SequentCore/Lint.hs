@@ -13,7 +13,6 @@ import Type
 import VarEnv
 
 import Control.Monad
-import Data.List    ( mapAccumL )
 
 type LintM = Either SDoc
 type LintEnv = TvSubst
@@ -66,13 +65,11 @@ lintCoreTerm env (Var x)
   | otherwise
   = Left $ text "not found in context:" <+> pprBndr LetBind x
 
-lintCoreTerm env (Lam xs k comm)
+lintCoreTerm env (Lam x body)
   = do
-    let (env', xs') = mapAccumL lintBind env xs
-        (env'', k') = lintBind env' k
-    lintCoreCommand env'' comm
-    retTy <- contIdTyOrError env' k'
-    return $ mkPiTypes xs' retTy
+    let (env', x') = lintBind env x
+    retTy <- lintCoreTerm env' body
+    return $ mkPiType x' retTy
   where
     lintBind env x
       | isTyVar x

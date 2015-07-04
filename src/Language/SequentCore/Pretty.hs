@@ -65,11 +65,18 @@ ppr_term _ (Var name) = ppr name
 ppr_term add_par (Type ty) = add_par $ char '@' <+> ppr ty
 ppr_term _ (Coercion _) = text "CO ..."
 ppr_term add_par (Lit lit) = GHC.pprLiteral add_par lit
-ppr_term add_par (Lam bndrs kbndr body)
+ppr_term add_par term@(Lam {})
+  | Compute kbndr comm <- body
   = add_par $
       hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs ++
                                 [char '|', pprBndr LambdaBind kbndr]) <+> arrow)
-        2 (pprCoreComm body)
+        2 (pprCoreComm comm)
+  | otherwise
+  = add_par $
+      hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs) <+> arrow)
+        2 (pprCoreTerm body)
+  where
+    (bndrs, body) = lambdas term
 ppr_term add_par (Compute kbndr comm)
   = add_par $
       hang (text "compute" <+> pprBndr LambdaBind kbndr)

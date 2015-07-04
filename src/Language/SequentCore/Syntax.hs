@@ -12,7 +12,8 @@ module Language.SequentCore.Syntax (
   SeqCoreTerm, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreBndr,
     SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
-  mkCommand, mkCompute, mkAppTerm, mkConstruction, addLets, addNonRec,
+  mkCommand, mkLambdas, mkCompute, mkAppTerm, mkConstruction, addLets,
+  addLetsToTerm, addNonRec,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
   partitionTypes, isLambda,
@@ -74,8 +75,7 @@ import Data.Maybe
 data Term b     = Lit Literal       -- ^ A primitive literal value.
                 | Var Id            -- ^ A term variable. Must /not/ be a
                                     -- nullary constructor; use 'Cons' for this.
-                | Lam [b] b (Command b)
-                                    -- ^ A function. Binds some arguments and
+                | Lam b (Term b)    -- ^ A function. Binds some arguments and
                                     -- a continuation. The body is a command.
                 | Compute b (Command b)
                                     -- ^ A value produced by a computation.
@@ -175,6 +175,9 @@ mkCommand binds (Compute kbndr (Command { cmdLet = binds'
 mkCommand binds term cont
   = Command { cmdLet = binds, cmdTerm = term, cmdCont = cont }
 
+mkLambdas :: [b] -> Term b -> Term b
+mkLambdas = flip (foldr Lam)
+
 mkCompute :: HasId b => b -> Command b -> Term b
 -- | Wraps a command that returns to the given continuation id in a term using
 -- 'Compute'. If the command is a value command (see 'asValueCommand'), unwraps
@@ -211,14 +214,20 @@ addNonRec bndr rhs comm
   = mkCommand [] rhs (Case bndr [Alt DEFAULT [] comm])
   | otherwise
   = addLets [NonRec bndr rhs] comm
+  
+addLetsToTerm :: [SeqCoreBind] -> SeqCoreTerm -> SeqCoreTerm
+addLetsToTerm [] term = term
+addLetsToTerm binds term = mkCompute k (mkCommand binds term (Return k))
+  where k = mkLetContId (termType term)
 
 --------------------------------------------------------------------------------
 -- Deconstructors
 --------------------------------------------------------------------------------
 
-lambdas :: Term b -> ([b], Maybe (b, Command b))
-lambdas (Lam xs k body) = (xs, Just (k, body))
-lambdas _               = ([], Nothing)
+lambdas :: Term b -> ([b], Term b)
+lambdas (Lam x body) = (x : xs, body')
+  where (xs, body')  = lambdas body
+lambdas term         = ([], term)
 
 -- | Divide a continuation into a sequence of arguments and an outer
 -- continuation. If @k@ is not an application continuation, then
@@ -324,7 +333,7 @@ isTrivial c
 -- body is non-trivial is also non-trivial.
 isTrivialTerm :: HasId b => Term b -> Bool
 isTrivialTerm (Lit l)     = litIsTrivial l
-isTrivialTerm (Lam xs _ c)= not (any (isRuntimeVar . identifier) xs) && isTrivial c
+isTrivialTerm (Lam x t)   = not (isRuntimeVar (identifier x)) && isTrivialTerm t
 isTrivialTerm (Compute _ c) = isTrivial c
 isTrivialTerm (Cont cont) = isTrivialCont cont
 isTrivialTerm _           = True
@@ -430,7 +439,7 @@ bindersOfBinds = concatMap bindersOf
 termType :: HasId b => Term b -> Type
 termType (Lit l)        = literalType l
 termType (Var x)        = idType x
-termType (Lam xs k _)   = Type.mkPiTypes (map identifier xs) (contTyArg (idType (identifier k)))
+termType (Lam x t)      = Type.mkPiType (identifier x) (termType t)
 termType (Compute k _)  = contTyArg (idType (identifier k))
 -- see exprType in GHC CoreUtils
 termType _other         = alphaTy
@@ -449,8 +458,8 @@ contType (Tick _ k)   = contType k
 termArity :: HasId b => Term b -> Int
 termArity (Var x)
   | isId x = idArity x
-termArity (Lam bndrs _kbndr _)
-  = length bndrs
+termArity (Lam _ t)
+  = 1 + termArity t
 termArity _
   = 0
 
@@ -574,8 +583,8 @@ termCheap _        (Lit _)      = True
 termCheap _        (Var _)      = True
 termCheap _        (Type _)     = True
 termCheap _        (Coercion _) = True
-termCheap appCheap (Lam xs _ c) = any (isRuntimeVar . identifier) xs
-                               || commCheap appCheap c
+termCheap appCheap (Lam x t)    = isRuntimeVar (identifier x)
+                               || termCheap appCheap t
 termCheap appCheap (Compute _ c)= commCheap appCheap c
 termCheap appCheap (Cont cont)  = contCheap appCheap cont
 
@@ -694,9 +703,8 @@ emptyAlphaEnv = mkRnEnv2 emptyInScopeSet
 instance HasId b => AlphaEq (Term b) where
   aeqIn _ (Lit l1) (Lit l2)
     = l1 == l2
-  aeqIn env (Lam bs1 k1 c1) (Lam bs2 k2 c2)
-    = aeqIn (rnBndrs2 env' (map identifier bs1) (map identifier bs2)) c1 c2
-    where env' = rnBndr2 env (identifier k1) (identifier k2)
+  aeqIn env (Lam b1 t1) (Lam b2 t2)
+    = aeqIn (rnBndr2 env (identifier b1) (identifier b2)) t1 t2
   aeqIn env (Type t1) (Type t2)
     = aeqIn env t1 t2
   aeqIn env (Coercion co1) (Coercion co2)

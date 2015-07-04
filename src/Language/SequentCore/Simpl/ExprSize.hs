@@ -84,9 +84,10 @@ commandSize :: DynFlags -> Int -> SeqCoreCommand -> Maybe ExprSize
 
 bodySize :: DynFlags -> Int -> [Id] -> SeqCoreExpr -> BodySize
 
-termSize dflags cap (Lam xs _k body)
-  = let valBinders = filter isId xs
-    in body2ExprSize valBinders $ bodySize dflags cap valBinders (C body)
+termSize dflags cap term@(Lam {})
+  = let (xs, body) = lambdas term
+        valBinders = filter isId xs
+    in body2ExprSize valBinders $ bodySize dflags cap valBinders (T body)
 termSize dflags cap term
   = body2ExprSize [] $ bodySize dflags cap [] (T term)
 
@@ -104,9 +105,11 @@ bodySize dflags cap topArgs expr
     size (T (Compute _ comm)) = size (C comm)
     size (T (Cont cont))    = size (K cont)
     size (T (Lit lit))      = sizeN (litSize lit)
-    size (T (Lam xs _ comm))| erased    = size (C comm)
-                            | otherwise = lamScrutDiscount dflags (size (C comm))
-      where erased          = all (\x -> not (isId x) || isRealWorldId x) xs
+    size (T term@(Lam {}))  | erased    = size (T body)
+                            | otherwise = lamScrutDiscount dflags (size (T body))
+      where 
+        (xs, body)          = lambdas term
+        erased              = all (\x -> not (isId x) || isRealWorldId x) xs
     
     size (K (Return _))     = sizeZero
     size (K (Cast _ cont))  = size (K cont)

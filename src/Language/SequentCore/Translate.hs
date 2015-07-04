@@ -22,7 +22,6 @@ import Language.SequentCore.WiredIn
 
 import qualified CoreSyn as Core
 import qualified CoreUtils as Core
-import FastString
 import qualified CoreFVs as Core
 import Id
 import Maybes
@@ -65,13 +64,6 @@ type FromCoreEnv = Subst
 {-# NOINLINE uniqSupply #-}
 uniqSupply :: UniqSupply
 uniqSupply = unsafePerformIO (mkSplitUniqSupply sequentCoreTag)
-
-freshContId :: MonadUnique m => FromCoreEnv -> Type -> FastString -> m (FromCoreEnv, ContId)
-freshContId env inTy name
-  = do
-    tryVar <- asContId `liftM` mkSysLocalM name inTy
-    let var = uniqAway (substInScope env) tryVar
-    return (extendInScope env var, var)
 
 type FromCoreM a = UniqSM a
 
@@ -117,15 +109,16 @@ fromCoreExpr env expr cont = go [] env expr cont
 fromCoreLams :: FromCoreEnv -> Core.CoreBndr -> Core.CoreExpr
                             -> FromCoreM SeqCoreTerm
 fromCoreLams env x expr
-  = Lam xs' kid <$> fromCoreExpr env' body (Return kid)
+  = mkLambdas xs' <$> body'
   where
     (xs, body) = Core.collectBinders expr
+    body' = mkCompute kid <$> fromCoreExpr env' body (Return kid)
     (env', xs') = substBndrs env (x : xs)
     kid = mkLamContId ty
     ty  = substTy env' (Core.exprType body)
 
 fromCoreExprAsTerm :: FromCoreEnv -> Core.CoreExpr -> (Type -> ContId)
-                                   -> FromCoreM SeqCoreTerm
+                                  -> FromCoreM SeqCoreTerm
 fromCoreExprAsTerm env expr mkId
   = do
     comm <- fromCoreExpr env' expr (Return k)
@@ -223,7 +216,7 @@ termToCoreExpr val =
   case val of
     Lit l        -> Core.Lit l
     Var x        -> Core.Var x
-    Lam xs kb c  -> Core.mkCoreLams xs (commandToCoreExpr kb c)
+    Lam x t      -> Core.Lam x (termToCoreExpr t)
     Type t       -> Core.Type t
     Coercion co  -> Core.Coercion co
     Compute kb c -> commandToCoreExpr kb c

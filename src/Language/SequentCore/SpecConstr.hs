@@ -191,12 +191,12 @@ instance Monoid ScUsage where
     = ScUsage (plusVarEnv_C (++) calls1 calls2) (used1 `unionVarSet` used2)
 
 specInTerm :: ScEnv -> SeqCoreTerm -> CoreM (ScUsage, SeqCoreTerm)
-specInTerm env (Lam xs kb c)
+specInTerm env (Lam x t)
   = do
-    (usage, c') <- specInCommand env' c
-    return (usage, Lam xs kb c')
+    (usage, t') <- specInTerm env' t
+    return (usage, Lam x t')
   where
-    env' = env { sc_how_bound = extendVarEnvList hb (zip xs (repeat SpecArg)) }
+    env' = env { sc_how_bound = extendVarEnv hb x SpecArg }
     hb   = sc_how_bound env
 specInTerm env (Compute kb c)
   = do
@@ -353,18 +353,15 @@ specialize env (ScUsage calls used) (x, v)
          = True -- H1 fails
          | Just sz <- sc_size env
          -- TODO Implement couldBeSmallEnoughToInline for ourselves
-         , let coreExpr = commandToCoreExpr retId body
+         , let coreExpr = termToCoreExpr body
          , not $ couldBeSmallEnoughToInline (sc_dflags env) sz coreExpr
          = True -- H2 fails
          | otherwise
          = False
 
     binders :: [Var] -- ^ Binders for the bound function. Empty if not a function.
-    retId :: ContId -- ^ Identifier of the continuation parameter to the function.
-    body :: SeqCoreCommand -- ^ Body of the bound function after all lambdas.
-    (binders, retId, body)
-      | Lam xs k body <- v = (xs, k, body)
-      | otherwise          = ([], undefined, undefined)
+    body :: SeqCoreTerm -- ^ Body of the bound function after all lambdas.
+    (binders, body) = lambdas v
 
     -- Create the specializations for the binding @let x = c@.
     mkSpecs :: CoreM [Spec]
@@ -392,8 +389,7 @@ specialize env (ScUsage calls used) (x, v)
     specCall :: CallPat -> CoreM Spec
     specCall pat@(vars :-> vals)
       = do
-        let v' = Lam vars retId $
-                  addLets (zipWith NonRec binders vals) body
+        let v' = mkLambdas vars $ addLetsToTerm (zipWith NonRec binders vals) body
         x' <- mkSysLocalM (fsLit "scsc") (termType v')
         return $ Spec { spec_pat = pat, spec_id = x', spec_defn = v' }
 
@@ -444,9 +440,7 @@ specialize env (ScUsage calls used) (x, v)
         fn    = idName x
         bndrs = patVars
         args  = map termToCoreExpr patArgs
-        rhs   = commandToCoreExpr retId $
-                  Command [] (Var x') (
-                    foldr (\x k -> App (Var x) k) (Return retId) patVars)
+        rhs   = termToCoreExpr $ mkAppTerm (Var x') (map Var patVars)
           
 infix 4 `samePat`
 
