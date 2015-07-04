@@ -26,14 +26,11 @@ import qualified CoreFVs as Core
 import Id
 import Maybes
 import qualified MkCore as Core
-import MonadUtils
 import Outputable
 import Type        hiding ( substTy )
-import UniqSupply
 import VarEnv
 
-import Control.Monad
-import System.IO.Unsafe (unsafePerformIO)
+import Data.List
 
 -- $txn
 -- The translations to and from Sequent Core are /not/ guaranteed to be perfect
@@ -48,31 +45,21 @@ import System.IO.Unsafe (unsafePerformIO)
 
 -- | Translates a list of Core bindings into Sequent Core.
 fromCoreModule :: [Core.CoreBind] -> [SeqCoreBind]
-fromCoreModule binds = runFromCoreM $ fromCoreBinds emptySubst binds
+fromCoreModule binds = fromCoreBinds emptySubst binds
 
 -- | Translates a single Core expression as a Sequent Core term.
 termFromCoreExpr :: Core.CoreExpr -> SeqCoreTerm
 termFromCoreExpr expr
-  = runFromCoreM $ fromCoreExprAsTerm freeVarSet expr mkLetContId
+  = fromCoreExprAsTerm freeVarSet expr mkLetContId
   where
     freeVarSet = mkSubst (mkInScopeSet (Core.exprFreeVars expr))
                    emptyVarEnv emptyVarEnv emptyVarEnv
 
 type FromCoreEnv = Subst
 
--- FIXME Try and work around the apparent need for unsafePerformIO here.
-{-# NOINLINE uniqSupply #-}
-uniqSupply :: UniqSupply
-uniqSupply = unsafePerformIO (mkSplitUniqSupply sequentCoreTag)
-
-type FromCoreM a = UniqSM a
-
-runFromCoreM :: FromCoreM a -> a
-runFromCoreM m = initUs_ uniqSupply m
-
 -- | Translates a Core expression into Sequent Core.
 fromCoreExpr :: FromCoreEnv -> Core.CoreExpr -> SeqCoreCont
-                            -> FromCoreM SeqCoreCommand
+                            -> SeqCoreCommand
 fromCoreExpr env expr cont = go [] env expr cont
   where
     go binds env expr cont = case expr of
@@ -81,94 +68,88 @@ fromCoreExpr env expr cont = go [] env expr cont
       Core.App (Core.Var k) e | Var k' <- lookupIdSubst (text "fromCoreExpr") env k, isContId k'
                          -> go binds env e (Return k')
       Core.App e1 e2     ->
-        do e2' <- fromCoreExprAsTerm env e2 mkArgContId
-           go binds env e1 (App e2' cont)
-      Core.Lam x e       -> done =<< fromCoreLams env x e
+        let e2' = fromCoreExprAsTerm env e2 mkArgContId
+        in go binds env e1 (App e2' cont)
+      Core.Lam x e       -> done $ fromCoreLams env x e
       Core.Let bs e      ->
-        do (env', bs') <- fromCoreBind env (Just cont) bs
-           go (bs' : binds) env' e cont
+        let (env', bs') = fromCoreBind env (Just cont) bs
+        in go (bs' : binds) env' e cont
       Core.Case e x _ as
-        | Return _ <- cont ->
-          do let (env_rhs, x') = substBndr env x
-             as' <- mapM (fromCoreAlt env_rhs cont) as
-             go binds env e $ Case x' as'
+        | Return _ <- cont -> let (env_rhs, x') = substBndr env x
+                                  as' = map (fromCoreAlt env_rhs cont) as
+                              in go binds env e $ Case x' as'
         | otherwise ->
           -- Translating a case naively can duplicate lots of code. Rather than
           -- copy the continuation for each branch, we stuff it into a let
           -- binding and copy only a Return to that binding.
-          do let k = mkCaseContId (contType cont)
-                 (env_rhs, x') = substBndr env x
-             as' <- mapM (fromCoreAlt env_rhs (Return k)) as
-             go (NonRec k (Cont cont) : binds) env e $ Case x' as'
+          let k = mkCaseContId (contType cont)
+              (env_rhs, x') = substBndr env x
+              as' = map (fromCoreAlt env_rhs (Return k)) as
+          in go (NonRec k (Cont cont) : binds) env e $ Case x' as'
       Core.Coercion co   -> done $ Coercion (substCo env co)
       Core.Cast e co     -> go binds env e (Cast (substCo env co) cont)
       Core.Tick ti e     -> go binds env e (Tick (substTickish env ti) cont)
       Core.Type t        -> done $ Type (substTy env t)
-      where done term = return $ mkCommand (reverse binds) term cont
+      where done term = mkCommand (reverse binds) term cont
 
 fromCoreLams :: FromCoreEnv -> Core.CoreBndr -> Core.CoreExpr
-                            -> FromCoreM SeqCoreTerm
+                            -> SeqCoreTerm
 fromCoreLams env x expr
-  = mkLambdas xs' <$> body'
+  = mkLambdas xs' $ body'
   where
     (xs, body) = Core.collectBinders expr
-    body' = mkCompute kid <$> fromCoreExpr env' body (Return kid)
+    body' = mkCompute kid $ fromCoreExpr env' body (Return kid)
     (env', xs') = substBndrs env (x : xs)
     kid = mkLamContId ty
     ty  = substTy env' (Core.exprType body)
 
 fromCoreExprAsTerm :: FromCoreEnv -> Core.CoreExpr -> (Type -> ContId)
-                                  -> FromCoreM SeqCoreTerm
+                                  -> SeqCoreTerm
 fromCoreExprAsTerm env expr mkId
-  = do
-    comm <- fromCoreExpr env' expr (Return k)
-    return $ mkCompute k comm
+  = mkCompute k $ fromCoreExpr env' expr (Return k)
   where
     k  = asContId $ uniqAway (substInScope env) (mkId ty)
     ty = substTy env (Core.exprType expr)
     env' = extendInScope env k
 
-fromCoreLamAsCont :: FromCoreEnv -> SeqCoreCont -> Core.CoreExpr -> FromCoreM (Maybe SeqCoreCont)
+fromCoreLamAsCont :: FromCoreEnv -> SeqCoreCont -> Core.CoreExpr -> Maybe SeqCoreCont
 fromCoreLamAsCont env cont (Core.Lam b e)
   = outer e
     where
       (env', b') = substBndr env b
       
-      outer :: Core.CoreExpr -> FromCoreM (Maybe SeqCoreCont)
+      outer :: Core.CoreExpr -> Maybe SeqCoreCont
       outer (Core.App (Core.Var k) e)
                                   | Var k' <- lookupIdSubst (text "fromCoreLamAsCont::outer") env k
                                   , isContTy (idType k')
                                   = inner e (Return k')
-      outer (Core.Case e b _ as)  = do
-                                    let (env'', b') = substBndr env' b
-                                    cont' <- Case b' <$> mapM (fromCoreAlt env'' cont) as
-                                    inner e cont'
+      outer (Core.Case e b _ as)  = let (env'', b') = substBndr env' b
+                                        cont' = Case b' $ map (fromCoreAlt env'' cont) as
+                                    in inner e cont'
       outer body                  = inner body cont
     
-      inner :: Core.CoreExpr -> SeqCoreCont -> FromCoreM (Maybe SeqCoreCont)
+      inner :: Core.CoreExpr -> SeqCoreCont -> Maybe SeqCoreCont
       inner (Core.Var x) k          | Var x' <- lookupIdSubst (text "fromCoreLamAsCont::inner") env' x
                                     , x' == b'
-                                    = return (Just k)
-      inner (Core.App e1 e2) k      = do
-                                      e2' <- fromCoreExprAsTerm env' e2 mkArgContId
-                                      inner e1 (App e2' k)
+                                    = Just k
+      inner (Core.App e1 e2) k      = let e2' = fromCoreExprAsTerm env' e2 mkArgContId
+                                      in inner e1 (App e2' k)
       inner (Core.Cast e co) k      = inner e (Cast co k)
       inner (Core.Tick ti e) k      = inner e (Tick ti k)
-      inner _                _      = return Nothing
+      inner _                _      = Nothing
 fromCoreLamAsCont _env _cont other
   = pprPanic "fromCoreLamAsCont" (ppr other)
 
 -- | Translates a Core case alternative into Sequent Core.
-fromCoreAlt :: FromCoreEnv -> SeqCoreCont -> Core.CoreAlt -> FromCoreM SeqCoreAlt
+fromCoreAlt :: FromCoreEnv -> SeqCoreCont -> Core.CoreAlt -> SeqCoreAlt
 fromCoreAlt env cont (ac, bs, e)
-  = do
-    let (env', bs') = substBndrs env bs
-    e' <- fromCoreExpr env' e cont
-    return $ Alt ac bs' e'
+  = let (env', bs') = substBndrs env bs
+        e' = fromCoreExpr env' e cont
+    in Alt ac bs' e'
 
 -- | Translates a Core binding into Sequent Core.
 fromCoreBind :: FromCoreEnv -> Maybe SeqCoreCont -> Core.CoreBind
-                            -> FromCoreM (FromCoreEnv, SeqCoreBind)
+                            -> (FromCoreEnv, SeqCoreBind)
 fromCoreBind env cont_maybe bind =
   case bind of
     Core.NonRec b e |  -- If it's a continuation function, try translating as a
@@ -176,32 +157,26 @@ fromCoreBind env cont_maybe bind =
                        Just (inTy, _) <- splitContFunTy_maybe (idType b)
                        -- Make sure this isn't a top-level binding; if so, we can't
                        -- keep it as a continuation
-                    ,  Just cont          <- cont_maybe
-                    -> do
-                       let (env', b') = substBndr env (b `setIdType` mkContTy inTy)
-                       cont'_maybe <- fromCoreLamAsCont env' cont e
-                       case cont'_maybe of
-                         Just cont' -> return (env', NonRec b' (Cont cont'))
-                         Nothing    -> asTerm
+                    ,  Just cont      <- cont_maybe
+                    ,  let (env', b') = substBndr env (b `setIdType` mkContTy inTy)
+                    ,  Just cont'     <- fromCoreLamAsCont env' cont e
+                    -> (env', NonRec b' (Cont cont'))
                     |  otherwise
-                    -> asTerm
-      where asTerm  =  do
-                       let b' | Just (inTy, outTy) <- splitContFunTy_maybe (idType b)
+                    -> let b' | Just (inTy, outTy) <- splitContFunTy_maybe (idType b)
                               = b `setIdType` mkFunTy inTy outTy
                               | otherwise
                               = b
-                       let (env', b'') = substBndr env b'
-                       val <- fromCoreExprAsTerm env' e mkLetContId
-                       return (env', NonRec b'' val)
-    Core.Rec pairs  -> do
-                       let (env', bs') = substRecBndrs env (map fst pairs)
-                       vals' <- forM (map snd pairs) $ \e ->
-                         fromCoreExprAsTerm env' e mkLetContId
-                       return (env', Rec (zip bs' vals'))
+                           (env', b'') = substBndr env b'
+                           val = fromCoreExprAsTerm env' e mkLetContId
+                       in (env', NonRec b'' val)
+    Core.Rec pairs  -> let (env', bs') = substRecBndrs env (map fst pairs)
+                           vals'       = [fromCoreExprAsTerm env' e mkLetContId
+                                           | (_, e) <- pairs]
+                       in (env', Rec (zip bs' vals'))
 
-fromCoreBinds :: FromCoreEnv -> [Core.CoreBind] -> FromCoreM [SeqCoreBind]
+fromCoreBinds :: FromCoreEnv -> [Core.CoreBind] -> [SeqCoreBind]
 fromCoreBinds env binds
-  = snd <$> mapAccumLM (\env' -> fromCoreBind env' Nothing) env binds
+  = snd $ mapAccumL (\env' -> fromCoreBind env' Nothing) env binds
 
 -- | Translates a command into Core.
 commandToCoreExpr :: ContId -> SeqCoreCommand -> Core.CoreExpr
