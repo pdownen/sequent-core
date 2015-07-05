@@ -71,8 +71,7 @@ vars :: 'Vars_' ::= {{ com List of variables }}
 v, w :: 'Term_' ::= {{ com Terms, \coderef{Syntax.hs}{Term} }}
   | n                                            ::   :: Var  {{ com Variable }}
   | lit                                          ::   :: Lit  {{ com Literal }}
-  | \ n n' . c                                   ::   :: Lam  {{ com Abstraction }}
-  | K </ vi // i />                              ::   :: Cons {{ com Construction }}
+  | \ n . v                                      ::   :: Lam  {{ com Abstraction }}
   | compute n . c                                ::   :: Compute {{ com Computation }}
   | t                                            ::   :: Type {{ com Type }}
   | g                                            ::   :: Coercion {{ com Coercion }}
@@ -90,6 +89,7 @@ e :: 'Cont_' ::= {{ com Continuations, \coderef{Syntax.hs}{Cont} }}
   | { tick } ; e                                 ::   :: Tick {{ com Internal note }}
   | case as n of </ alti // | // i />            ::   :: Case {{ com Pattern match }}
   | e subst                                      :: M :: Subst {{ com Substitution }}
+  | applyToAll </ vi // i /> ; e                 :: M :: AppAll {{ com Multiple applications }}
 
 c :: 'Command_' ::= {{ com Commands, \coderef{Syntax.hs}{Command} }}
   | let bindings in < v | e >                    ::   :: Command {{ com Command }} 
@@ -420,7 +420,6 @@ formula :: 'formula_' ::=
   | t = coercionKind g                 ::   :: coercionKind
   | Just ( t1 , t2 ) = coaxrProves mu </ si // i /> </ ( s'j , s''j ) // j />
                                        ::   :: coaxrProves
-                          
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%  Subrules and Parsing  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

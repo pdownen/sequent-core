@@ -87,22 +87,10 @@ right-hand sides of $[[let]]$s (see the command syntax). Additionally,
 continuations as terms should only appear as right-hand sides. None of these
 are first-class values.
 
-There are three further novelties in \verb|Term|:
-
-\begin{itemize}
-\item Each $\lambda$-abstraction binds both a value parameter and a continuation
-parameter.\footnote{In fact, in order to avoid generating inordinately many
-continuation variables, we allow a Sequent Core $\lambda$-abstraction to bind
-several values and one continuation, thus collapsing many abstractions into one.
-This compaction has little impact on typing, however.}
-\item We include fully-applied data constructors as a form of their own, rather
-than simply as function applications (or variables, in the case of nullary
-constructors). This is primarily to clarify the semantics of $[[case]]$: It
-consumes a value of precisely this form.
-\item The $[[compute]]$ form wraps a general computation as a term. It binds a
+There is one major novelty in \verb|Term|:
+The $[[compute]]$ form wraps a general computation as a term. It binds a
 continuation variable for the context in which the computation is to occur. (In
 the literature, this is usually written as a $\mu$-abstraction.)
-\end{itemize}
 
 Continuations represent strict Haskell contexts, only ``inside-out'':
 

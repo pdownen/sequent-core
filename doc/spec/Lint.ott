@@ -91,26 +91,19 @@ G |-vl lit : t
 
 G |-ty t : k1
 G |-ty s : k2
-G, x_t, kappa_s |-cm c
+G, x_t |-vl v : s
 ---------------------- :: LamId
-G |-vl \ x_t kappa_s . c : t -> s
+G |-vl \ x_t . v : t -> s
 
 G |-ki k ok
-G, alpha_k, kappa_s |-cm c
+G, alpha_k |-vl v : s
 --------------------------- :: LamTy
-G |-vl \ alpha_k kappa_s . c : forall alpha_k. s
+G |-vl \ alpha_k . v : forall alpha_k . s
 
 G |-ty t : k
 G, kappa_t |-cm c
 ----------------- :: Compute
 G |-vl compute kappa_t . c : t
-
-forall </ alphai_ki // i /> . </ tj // j /> @ -> t = dataConRepType K
-G' = G, </ alphai_ki // i />
-</ G' |-ty si : ki // i />
-</ G' |-vl vj : tj // j />
--------------------------- :: Cons
-G |-vl K </ si // i /> </ vj // j /> : t </ [ alphai_ki |-> si ] // i />
 
 G |-co g : t1 ~Nom k t2
 -------------------- :: CoercionNom
