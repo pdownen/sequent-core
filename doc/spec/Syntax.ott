@@ -80,6 +80,9 @@ v, w :: 'Term_' ::= {{ com Terms, \coderef{Syntax.hs}{Term} }}
   | ( v )                                        :: M :: Parens {{ com Parenthesized term }}
   | S ( n )                                      :: M :: Lookup {{ com Lookup in the runtime store }}
 
+vs :: 'TermList_' ::= {{ com Term lists }}
+  | </ vi // i />                                ::   :: Terms
+
 e :: 'Cont_' ::= {{ com Continuations, \coderef{Syntax.hs}{Cont} }}
   | ret n                                        ::   :: Return {{ com Continuation variable }}
   | applyTo v ; e                                ::   :: App  {{ com Application }}
@@ -89,7 +92,8 @@ e :: 'Cont_' ::= {{ com Continuations, \coderef{Syntax.hs}{Cont} }}
   | { tick } ; e                                 ::   :: Tick {{ com Internal note }}
   | case as n of </ alti // | // i />            ::   :: Case {{ com Pattern match }}
   | e subst                                      :: M :: Subst {{ com Substitution }}
-  | applyToAll </ vi // i /> ; e                 :: M :: AppAll {{ com Multiple applications }}
+  | applyToAll vs ; e                            :: M :: AppAll {{ com Multiple applications }}
+                                                                {{ tex \$ \, [[vs]] ; [[e]]] }}
 
 c :: 'Command_' ::= {{ com Commands, \coderef{Syntax.hs}{Command} }}
   | let bindings in < v | e >                    ::   :: Command {{ com Command }} 
