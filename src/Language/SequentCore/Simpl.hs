@@ -35,7 +35,6 @@ import FastString
 import Id
 import HscTypes    ( ModGuts(..) )
 import Literal     ( Literal )
-import MkCore      ( mkWildValBinder )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
 import Type        ( Type, isUnLiftedType )
@@ -154,15 +153,21 @@ simplTermNoFloats env term
 simplTerm :: SimplEnv -> InTerm -> SimplM (SimplEnv, OutTerm)
 simplTerm _env (Cont {})
   = panic "simplTerm"
-simplTerm env (Compute k (Command [] term (Return k')))
-  | k == k'
-  = simplTerm env term
+simplTerm env (Type ty)
+  = return (env, Type (substTy env ty))
+simplTerm env (Coercion co)
+  = return (env, Coercion (substCo env co))
+simplTerm env (Compute k comm)
+  = do
+    let (env', k') = enterScope env k
+    comm' <- simplCommandNoFloats (setCont env' k) comm
+    return (env, mkCompute k' comm')
 simplTerm env v
   = do
     (env', k) <- mkFreshContId env (fsLit "*termk") ty
     let env'' = zapFloats $ setCont env' k
     (env''', comm) <- simplCut env'' v (staticPart env'') (Return k)
-    return (env `addFloats` env''', mkCompute k comm)
+    return (env, mkCompute k (wrapFloats env''' comm))
   where ty = substTy env (termType v)
 
 simplBinds :: SimplEnv -> [InBind] -> TopLevelFlag
@@ -192,7 +197,8 @@ simplLazyBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InTerm -> TopLevelF
               -> RecFlag -> SimplM SimplEnv
 simplLazyBind env_x x x' env_v v level isRec
   | tracing
-  , pprTraceShort "simplLazyBind" (ppr x <+> darrow <+> ppr x' <+> ppr level <+> ppr isRec) False
+  , pprTraceShort "simplLazyBind" ((if x == x' then ppr x else ppr x <+> darrow <+> ppr x')
+                                      <+> ppr level <+> ppr isRec $$ ppr v) False
   = undefined
   | isTyVar x
   , Type ty <- assert (isTypeTerm v) v
@@ -224,22 +230,27 @@ simplLazyBind env_x x x' env_v v level isRec
              (env_v'', split) <- splitDupableCont env_v' cont
              case split of
                DupeAll dup -> do
-                 tick (PostInlineUnconditionally x)
+                 -- TODO We can't tick here because often this is simply canceling
+                 -- a continuation parameter that we added, say, to simplify a
+                 -- term. But it seems like we *should* be ticking here sometimes?
+                 -- tick (PostInlineUnconditionally x)
                  return $ extendIdSubst (env_x `addFloats` env_v'') x (DoneTerm (Cont dup))
                DupeNone -> do
                  (env_v''', cont') <- simplCont env_v'' cont
                  finish x x' env_v''' (Cont cont')
                DupeSome dupk nodup -> do
-                 (env_v''', nodup') <- simplCont env_v'' nodup
-                 (env_v'''', new_x) <-
+                 (env_v''', nodup') <- simplCont (zapFloats env_v'') nodup
+                 (env_v'''', nodup_x) <-
                    mkFreshContId env_v''' (fsLit "*nodup") (contType nodup')
-                 env_x' <- finish new_x new_x env_v'''' (Cont nodup')
+                 env_x' <- finish nodup_x nodup_x env_v'''' (Cont nodup')
                  tick (PostInlineUnconditionally x)
                  -- Trickily, nodup may have been duped after all if it's
-                 -- post-inlined. Thus check before assembling dup.
-                 term_new_x <- simplContId env_x' new_x
-                 let dup = dupk term_new_x
-                 return $ extendIdSubst env_x' x (DoneTerm (Cont dup))
+                 -- post-inlined. Thus assemble dup from the final value of
+                 -- nodup.
+                 (env_x'', value_nodup_x) <- simplCont env_x' (Return nodup_x)
+                 let dup = dupk value_nodup_x
+                     env_x''' = env_x'' `addFloats` env_v''
+                 return $ extendIdSubst env_x''' x (DoneTerm (Cont dup))
         _ -> do
              -- TODO Handle floating type lambdas
              let env_v' = zapFloats (env_v `inDynamicScope` env_x)
@@ -272,7 +283,7 @@ wrapFloatsAroundCont env cont
     let ty = contType cont
     (env', x) <- mkFreshVar env (fsLit "$in") ty
     let comm = wrapFloats env' (mkCommand [] (Var x) cont)
-    return $ Case (mkWildValBinder ty) [Alt DEFAULT [] comm]
+    return $ Case x [Alt DEFAULT [] comm]
     
 wrapFloatsAroundTerm :: SimplEnv -> OutTerm -> SimplM OutTerm
 wrapFloatsAroundTerm env (Cont cont)
@@ -307,6 +318,10 @@ completeBind env x x' v level
         -- TODO Eta-expansion goes here
         dflags <- getDynFlags
         let x''   = x' `setIdInfo` idInfo x
+            -- FIXME Be smarter about this! Sometimes we want a BoundToDFun!
+            -- Currently this is causing a lot of dictionaries to fail to inline
+            -- at obviously desirable times.
+            -- See simplUnfolding in Simplify
             def   = mkBoundTo dflags v level
             (env', x''') = setDef env x'' def
         when tracing $ liftCoreM $ putMsg (text "defined" <+> ppr x''' <+> equals <+> ppr def)
@@ -459,7 +474,9 @@ simplCut2 env_v term env_k (Case case_bndr [Alt _ bndrs rhs])
       -- but the original code in Simplify suggests doing so would be expensive
 
 simplCut2 env_v (Compute k c) env_k cont
-  = (env_v,) <$> simplCommandNoFloats (bindContAs env_v k env_k cont) c
+  = do
+    env_v' <- simplNonRec env_v k env_k (Cont cont) NotTopLevel
+    simplCommand env_v' c
 simplCut2 env_v term@(Lit {}) env_k cont
   = simplContWith (env_v `setStaticPart` env_k) term cont
 simplCut2 env_v term@(Var {}) env_k cont
@@ -761,7 +778,7 @@ smallEnough env _term (Sometimes bodySize argWeights resWeight) cont
 
 inlineDFun :: SimplEnv -> [Var] -> DataCon -> [OutTerm] -> InCont -> Maybe OutTerm
 inlineDFun env bndrs con conArgs cont
---  | pprTraceShort "inlineDFun" (sep [ppr bndrs, ppr con, ppr conArgs, ppr cont] $$
+--  | pprTraceShort "inlineDFun" (sep ([ppr bndrs, ppr con, ppr conArgs, ppr cont, ppr args, ppr cont']) $$
 --      if enoughArgs && contIsCase env cont' then text "YES" else text "NO") False
 --  = undefined
   | enoughArgs, contIsCase env cont'
@@ -859,8 +876,8 @@ makeTrivial env term
   --  | otherwise
   = do
     (env', bndr) <- case term of
-      Cont cont -> mkFreshContId env (fsLit "*k") (contType cont)
-      _         -> mkFreshVar    env (fsLit "a") (termType term)
+      Cont cont -> mkFreshContId env (fsLit "*trivk") (substTy env (contType cont))
+      _         -> mkFreshVar    env (fsLit "triv") (substTy env (termType term))
     env'' <- simplLazyBind env' bndr bndr (staticPart env') term NotTopLevel NonRecursive
     term_final <- simplVar env'' bndr
     return (env'', term_final)

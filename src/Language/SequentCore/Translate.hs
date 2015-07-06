@@ -62,6 +62,7 @@ fromCoreExpr :: FromCoreEnv -> Core.CoreExpr -> SeqCoreCont
                             -> SeqCoreCommand
 fromCoreExpr env expr cont = go [] env expr cont
   where
+    go :: [SeqCoreBind] -> FromCoreEnv -> Core.CoreExpr -> SeqCoreCont -> SeqCoreCommand
     go binds env expr cont = case expr of
       Core.Var x         -> done $ lookupIdSubst (text "fromCoreExpr") env x
       Core.Lit l         -> done $ Lit l
@@ -74,18 +75,14 @@ fromCoreExpr env expr cont = go [] env expr cont
       Core.Let bs e      ->
         let (env', bs') = fromCoreBind env (Just cont) bs
         in go (bs' : binds) env' e cont
-      Core.Case e x _ as
-        | Return _ <- cont -> let (env_rhs, x') = substBndr env x
-                                  as' = map (fromCoreAlt env_rhs cont) as
-                              in go binds env e $ Case x' as'
-        | otherwise ->
-          -- Translating a case naively can duplicate lots of code. Rather than
-          -- copy the continuation for each branch, we stuff it into a let
-          -- binding and copy only a Return to that binding.
-          let k = mkCaseContId (contType cont)
-              (env_rhs, x') = substBndr env x
-              as' = map (fromCoreAlt env_rhs (Return k)) as
-          in go (NonRec k (Cont cont) : binds) env e $ Case x' as'
+      Core.Case e x _ as ->
+        -- Translating a case naively can duplicate lots of code. Rather than
+        -- copy the continuation for each branch, we bind it to a variable and
+        -- copy only a Return to that binding (c.f. makeTrivial in Simpl.hs)
+        let k = mkCaseContId (contType cont)
+            (env_rhs, x') = substBndr env x
+            as' = map (fromCoreAlt env_rhs (Return k)) as
+        in done $ mkCompute k (go [] env e (Case x' as'))
       Core.Coercion co   -> done $ Coercion (substCo env co)
       Core.Cast e co     -> go binds env e (Cast (substCo env co) cont)
       Core.Tick ti e     -> go binds env e (Tick (substTickish env ti) cont)

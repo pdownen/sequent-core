@@ -256,6 +256,9 @@ bindCont env stat cont
     let k' = uniqAway (se_inScope env) k
     return $ bindContAs env k' stat cont
 
+-- | Put a continuation into the environment as the new current continuation.
+-- This adds the continuation to the substitution, effectively pre-inlining it.
+-- Usefully, this defers simplification until later.
 bindContAs :: SimplEnv -> ContId -> StaticEnv -> InCont -> SimplEnv
 bindContAs env k stat cont
   = env { se_idSubst = extendVarEnv (se_idSubst env) k
