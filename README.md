@@ -218,7 +218,7 @@ since we aim to translate back and forth faithfully:
 ### Summary
 
 Our data types divide the constructors of the `Core` datatype into the three 
-types, `Term`, `Cont`, and `Command`. Thus
+types, `Term`, `Kont`, and `Command`. Thus
 the Sequent Core syntax is closely related to Core, making the translation
 relatively simple. Here are all the constructors of the original `Core` type,
 showing where we put each one:
@@ -227,11 +227,11 @@ showing where we put each one:
 | :---------- | :--- | :--- | :------ |
 | Var         | Term |      |         |
 | Lit         | Term |      |         |
-| App         | Term | Cont |         |
+| App         | Term | Kont |         |
 | Let         |      |      | Command |
-| Case        |      | Cont |         |
-| Cast        |      | Cont |         |
-| Tick        |      | Cont |         |
+| Case        |      | Kont |         |
+| Cast        |      | Kont |         |
+| Tick        |      | Kont |         |
 | Type        | Term |      |         |
 | Coercion    | Term |      |         | |
 

@@ -205,25 +205,25 @@ specInTerm env (Compute kb c)
 specInTerm _ v
   = return (emptyScUsage, v)
 
-specInCont :: ScEnv -> SeqCoreCont -> CoreM (ScUsage, SeqCoreCont)
-specInCont env (App v k)
+specInKont :: ScEnv -> SeqCoreKont -> CoreM (ScUsage, SeqCoreKont)
+specInKont env (App v k)
   = do
     (usage1, v') <- specInTerm env v
-    (usage2, k') <- specInCont env k
+    (usage2, k') <- specInKont env k
     return (usage1 <> usage2, App v' k')
-specInCont env (Case x as)
+specInKont env (Case x as)
   = do
     (usages, as') <- mapAndUnzipM (specInAlt env) as
     return (mconcat usages, Case x as')
-specInCont env (Cast co k)
+specInKont env (Cast co k)
   = do
-    (usage, k') <- specInCont env k
+    (usage, k') <- specInKont env k
     return (usage, Cast co k')
-specInCont env (Tick ti k)
+specInKont env (Tick ti k)
   = do
-    (usage, k') <- specInCont env k
+    (usage, k') <- specInKont env k
     return (usage, Tick ti k')
-specInCont _ k
+specInKont _ k
   = return (emptyScUsage, k)
 
 specInAlt :: ScEnv -> SeqCoreAlt -> CoreM (ScUsage, SeqCoreAlt)
@@ -239,7 +239,7 @@ specInBind env b
     return (u, b')
 
 specInCommand :: ScEnv -> SeqCoreCommand -> CoreM (ScUsage, SeqCoreCommand)
-specInCommand env (Command { cmdLet = bs, cmdTerm = v, cmdCont = fs })
+specInCommand env (Command { cmdLet = bs, cmdTerm = v, cmdKont = fs })
   = specBinds env bs [] []
   where
     specBinds :: ScEnv -> [SeqCoreBind] -> [SeqCoreBind] -> [ScUsage]
@@ -248,22 +248,22 @@ specInCommand env (Command { cmdLet = bs, cmdTerm = v, cmdCont = fs })
       = do
         (usage', v', fs') <- specInCut env v fs
         return (mconcat (usage' : usages), Command 
-          { cmdLet = reverse bs', cmdTerm = v', cmdCont = fs' })
+          { cmdLet = reverse bs', cmdTerm = v', cmdKont = fs' })
     specBinds env (b : bs) bs' usages
       = do
         (usage', env', b') <- specBind env b
         specBinds env' bs (b' : bs') (usage' : usages)
     
-specInCut :: ScEnv -> SeqCoreTerm -> SeqCoreCont
-        -> CoreM (ScUsage, SeqCoreTerm, SeqCoreCont)
+specInCut :: ScEnv -> SeqCoreTerm -> SeqCoreKont
+        -> CoreM (ScUsage, SeqCoreTerm, SeqCoreKont)
 specInCut env v k
   = do
     let u = usageFromCut env v k
     (u_v, v') <- specInTerm env v
-    (u_k, k') <- specInCont env k
+    (u_k, k') <- specInKont env k
     return (u <> u_v <> u_k, v', k')
 
-usageFromCut :: ScEnv -> SeqCoreTerm -> SeqCoreCont -> ScUsage
+usageFromCut :: ScEnv -> SeqCoreTerm -> SeqCoreKont -> ScUsage
 usageFromCut env (Var x) (Case {})
   | Just SpecArg <- sc_how_bound env `lookupVarEnv` x
   = ScUsage emptyVarEnv (unitVarSet x)

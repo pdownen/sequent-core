@@ -1,5 +1,5 @@
 module Language.SequentCore.Simpl.ExprSize (
-  ExprSize(..), termSize, contSize, commandSize
+  ExprSize(..), termSize, kontSize, commandSize
 ) where
 
 import Language.SequentCore.Syntax
@@ -75,7 +75,7 @@ mkBodySize cap b as r
   | otherwise   = BodySize { bsBase = b, bsArgDiscs = as, bsResultDisc = r }
 
 termSize    :: DynFlags -> Int -> SeqCoreTerm    -> Maybe ExprSize
-contSize    :: DynFlags -> Int -> SeqCoreCont    -> Maybe ExprSize
+kontSize    :: DynFlags -> Int -> SeqCoreKont    -> Maybe ExprSize
 commandSize :: DynFlags -> Int -> SeqCoreCommand -> Maybe ExprSize
 
 -- We have three mutually recursive functions, but only one argument changes
@@ -94,7 +94,7 @@ termSize dflags cap term
 commandSize dflags cap comm
   = body2ExprSize [] $ bodySize dflags cap [] (C comm)
 
-contSize dflags cap cont = body2ExprSize [] $ bodySize dflags cap [] (K cont)
+kontSize dflags cap kont = body2ExprSize [] $ bodySize dflags cap [] (K kont)
 
 bodySize dflags cap topArgs expr
   = cap `seq` size expr -- use seq to unbox cap now; we will use it often
@@ -103,7 +103,7 @@ bodySize dflags cap topArgs expr
     size (T (Coercion _))   = sizeZero
     size (T (Var _))        = sizeZero -- invariant: not a nullary constructor
     size (T (Compute _ comm)) = size (C comm)
-    size (T (Cont cont))    = size (K cont)
+    size (T (Kont kont))    = size (K kont)
     size (T (Lit lit))      = sizeN (litSize lit)
     size (T term@(Lam {}))  | erased    = size (T body)
                             | otherwise = lamScrutDiscount dflags (size (T body))
@@ -112,23 +112,23 @@ bodySize dflags cap topArgs expr
         erased              = all (\x -> not (isId x) || isRealWorldId x) xs
     
     size (K (Return _))     = sizeZero
-    size (K (Cast _ cont))  = size (K cont)
-    size (K (Tick _ cont))  = size (K cont)
-    size (K (App arg cont)) = sizeArg arg `addSizeNSD` size (K cont)
+    size (K (Cast _ kont))  = size (K kont)
+    size (K (Tick _ kont))  = size (K kont)
+    size (K (App arg kont)) = sizeArg arg `addSizeNSD` size (K kont)
     size (K (Case _ alts))  = sizeAlts alts
 
     size (C comm)           = sizeLets (cmdLet comm) `addSizeNSD`
-                              sizeCut (cmdTerm comm) (cmdCont comm)
+                              sizeCut (cmdTerm comm) (cmdKont comm)
     
-    sizeCut :: SeqCoreTerm -> SeqCoreCont -> BodySize
+    sizeCut :: SeqCoreTerm -> SeqCoreKont -> BodySize
     -- Compare this clause to size_up_app in CoreUnfold; already having the
     -- function and arguments at hand avoids some acrobatics
-    sizeCut (Var f) cont@(App {})
-      = let (args, cont') = collectArgs cont
+    sizeCut (Var f) kont@(App {})
+      = let (args, kont') = collectArgs kont
             realArgs      = filter (not . isErasedTerm) args
             voids         = count isRealWorldTerm realArgs
         in sizeArgs realArgs `addSizeNSD` sizeCall f realArgs voids
-                             `addSizeOfCont` cont'
+                             `addSizeOfKont` kont'
     sizeCut (Var x) (Case _b alts)
       | x `elem` topArgs
       = combineSizes total max
@@ -145,8 +145,8 @@ bodySize dflags cap topArgs expr
                      totResDisc
         combineSizes tot _ = tot -- must be TooBig
 
-    sizeCut term cont
-      = size (T term) `addSizeOfCont` cont
+    sizeCut term kont
+      = size (T term) `addSizeOfKont` kont
 
     sizeArg :: SeqCoreTerm -> BodySize
     sizeArg arg = size (T arg)
@@ -207,20 +207,20 @@ bodySize dflags cap topArgs expr
 
     -- If a continuation passes the value through unchanged, then it should not
     -- count against the result discount (and has size zero anyway).
-    addSizeOfCont :: BodySize -> SeqCoreCont -> BodySize
-    addSizeOfCont size1 cont
-      | isPassThroughCont cont = size1
-      | otherwise              = size1 `addSizeNSD` size (K cont)
+    addSizeOfKont :: BodySize -> SeqCoreKont -> BodySize
+    addSizeOfKont size1 kont
+      | isPassThroughKont kont = size1
+      | otherwise              = size1 `addSizeNSD` size (K kont)
 
-    isPassThroughCont :: Cont b -> Bool
-    isPassThroughCont (Return _)     = True
-    isPassThroughCont (Tick _ cont)  = isPassThroughCont cont
-    isPassThroughCont (Cast _ cont)  = isPassThroughCont cont
-    isPassThroughCont (App arg cont) = isErasedTerm arg
-                                         && isPassThroughCont cont
-    isPassThroughCont _              = False
+    isPassThroughKont :: Kont b -> Bool
+    isPassThroughKont (Return _)     = True
+    isPassThroughKont (Tick _ kont)  = isPassThroughKont kont
+    isPassThroughKont (Cast _ kont)  = isPassThroughKont kont
+    isPassThroughKont (App arg kont) = isErasedTerm arg
+                                         && isPassThroughKont kont
+    isPassThroughKont _              = False
 
-    infixl 6 `addSizeN`, `addSizeNSD`, `addSizeOfCont`
+    infixl 6 `addSizeN`, `addSizeNSD`, `addSizeOfKont`
 
 -- Lifted from CoreUnfold
 litSize :: Literal -> Int

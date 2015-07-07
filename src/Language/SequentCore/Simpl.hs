@@ -139,10 +139,10 @@ simplCommandNoFloats env comm
     return $ wrapFloats env' comm'
 
 simplCommand :: SimplEnv -> InCommand -> SimplM (SimplEnv, OutCommand)
-simplCommand env (Command { cmdLet = binds, cmdTerm = term, cmdCont = cont })
+simplCommand env (Command { cmdLet = binds, cmdTerm = term, cmdKont = kont })
   = do
     env' <- simplBinds env binds NotTopLevel
-    simplCut env' term (staticPart env') cont
+    simplCut env' term (staticPart env') kont
 
 simplTermNoFloats :: SimplEnv -> InTerm -> SimplM OutTerm
 simplTermNoFloats env term
@@ -151,7 +151,7 @@ simplTermNoFloats env term
     wrapFloatsAroundTerm env' term'
 
 simplTerm :: SimplEnv -> InTerm -> SimplM (SimplEnv, OutTerm)
-simplTerm _env (Cont {})
+simplTerm _env (Kont {})
   = panic "simplTerm"
 simplTerm env (Type ty)
   = return (env, Type (substTy env ty))
@@ -160,12 +160,12 @@ simplTerm env (Coercion co)
 simplTerm env (Compute k comm)
   = do
     let (env', k') = enterScope env k
-    comm' <- simplCommandNoFloats (setCont env' k) comm
+    comm' <- simplCommandNoFloats (setKont env' k) comm
     return (env, mkCompute k' comm')
 simplTerm env v
   = do
-    (env', k) <- mkFreshContId env (fsLit "*termk") ty
-    let env'' = zapFloats $ setCont env' k
+    (env', k) <- mkFreshKontId env (fsLit "*termk") ty
+    let env'' = zapFloats $ setKont env' k
     (env''', comm) <- simplCut env'' v (staticPart env'') (Return k)
     return (env, mkCompute k (wrapFloats env''' comm))
   where ty = substTy env (termType v)
@@ -221,36 +221,36 @@ simplLazyBind env_x x x' env_v v level isRec
             env' = extendIdSubst env_x x rhs
         return env'
       else case v of
-        Cont cont
+        Kont kont
           | TopLevel <- level
           -> pprPanic "simplLazyBind: top-level cont" (ppr x)
           | otherwise
           -> do
              let env_v' = zapFloats (env_v `inDynamicScope` env_x)
-             (env_v'', split) <- splitDupableCont env_v' cont
+             (env_v'', split) <- splitDupableKont env_v' kont
              case split of
                DupeAll dup -> do
                  -- TODO We can't tick here because often this is simply canceling
                  -- a continuation parameter that we added, say, to simplify a
                  -- term. But it seems like we *should* be ticking here sometimes?
                  -- tick (PostInlineUnconditionally x)
-                 return $ extendIdSubst (env_x `addFloats` env_v'') x (DoneTerm (Cont dup))
+                 return $ extendIdSubst (env_x `addFloats` env_v'') x (DoneTerm (Kont dup))
                DupeNone -> do
-                 (env_v''', cont') <- simplCont env_v'' cont
-                 finish x x' env_v''' (Cont cont')
+                 (env_v''', kont') <- simplKont env_v'' kont
+                 finish x x' env_v''' (Kont kont')
                DupeSome dupk nodup -> do
-                 (env_v''', nodup') <- simplCont (zapFloats env_v'') nodup
+                 (env_v''', nodup') <- simplKont (zapFloats env_v'') nodup
                  (env_v'''', nodup_x) <-
-                   mkFreshContId env_v''' (fsLit "*nodup") (contType nodup')
-                 env_x' <- finish nodup_x nodup_x env_v'''' (Cont nodup')
+                   mkFreshKontId env_v''' (fsLit "*nodup") (kontType nodup')
+                 env_x' <- finish nodup_x nodup_x env_v'''' (Kont nodup')
                  tick (PostInlineUnconditionally x)
                  -- Trickily, nodup may have been duped after all if it's
                  -- post-inlined. Thus assemble dup from the final value of
                  -- nodup.
-                 (env_x'', value_nodup_x) <- simplCont env_x' (Return nodup_x)
+                 (env_x'', value_nodup_x) <- simplKont env_x' (Return nodup_x)
                  let dup = dupk value_nodup_x
                      env_x''' = env_x'' `addFloats` env_v''
-                 return $ extendIdSubst env_x''' x (DoneTerm (Cont dup))
+                 return $ extendIdSubst env_x''' x (DoneTerm (Kont dup))
         _ -> do
              -- TODO Handle floating type lambdas
              let env_v' = zapFloats (env_v `inDynamicScope` env_x)
@@ -268,10 +268,10 @@ simplLazyBind env_x x x' env_v v level isRec
                         return (env_x `addFloats` env_v', v')
         completeBind env_x' new_x new_x' v'' level
 
-wrapFloatsAroundCont :: SimplEnv -> OutCont -> SimplM OutCont
-wrapFloatsAroundCont env cont
+wrapFloatsAroundKont :: SimplEnv -> OutKont -> SimplM OutKont
+wrapFloatsAroundKont env kont
   | isEmptyFloats env
-  = return cont
+  = return kont
   | otherwise
   -- Remember, most nontrivial continuations are strict contexts. Therefore it's
   -- okay to rewrite
@@ -280,14 +280,14 @@ wrapFloatsAroundCont env cont
   -- Return. However, we only call this when something's being floated from a
   -- continuation, and it seems unlikely we'd be floating a let from a Return.
   = do
-    let ty = contType cont
+    let ty = kontType kont
     (env', x) <- mkFreshVar env (fsLit "$in") ty
-    let comm = wrapFloats env' (mkCommand [] (Var x) cont)
+    let comm = wrapFloats env' (mkCommand [] (Var x) kont)
     return $ Case x [Alt DEFAULT [] comm]
     
 wrapFloatsAroundTerm :: SimplEnv -> OutTerm -> SimplM OutTerm
-wrapFloatsAroundTerm env (Cont cont)
-  = Cont <$> wrapFloatsAroundCont env cont
+wrapFloatsAroundTerm env (Kont kont)
+  = Kont <$> wrapFloatsAroundKont env kont
 wrapFloatsAroundTerm env term
   | isEmptyFloats env
   = return term
@@ -296,7 +296,7 @@ wrapFloatsAroundTerm env term
   | otherwise
   = do
     let ty = termType term
-    (env', k) <- mkFreshContId env (fsLit "*wrap") ty
+    (env', k) <- mkFreshKontId env (fsLit "*wrap") ty
     return $ mkCompute k $ wrapFloats env' (mkCommand [] term (Return k))
 
 completeNonRec :: SimplEnv -> InVar -> OutVar -> OutTerm -> TopLevelFlag
@@ -343,64 +343,64 @@ simplRec env xvs level
 -- TODO Deal with casts. Should maybe take the active cast as an argument;
 -- indeed, it would make sense to think of a cut as involving a term, a
 -- continuation, *and* the coercion that proves they're compatible.
-simplCut :: SimplEnv -> InTerm -> StaticEnv -> InCont
+simplCut :: SimplEnv -> InTerm -> StaticEnv -> InKont
                      -> SimplM (SimplEnv, OutCommand)
-simplCut env_v v env_k cont
+simplCut env_v v env_k kont
   | tracing
   , pprTraceShort "simplCut" (
-      ppr env_v $$ ppr v $$ ppr env_k $$ ppr cont
+      ppr env_v $$ ppr v $$ ppr env_k $$ ppr kont
     ) False
   = undefined
-simplCut env_v (Var x) env_k cont
+simplCut env_v (Var x) env_k kont
   = case substId env_v x of
       DoneId x'
         -> do
-           term'_maybe <- callSiteInline env_v x' cont
+           term'_maybe <- callSiteInline env_v x' kont
            case term'_maybe of
              Nothing
-               -> simplCut2 env_v (Var x') env_k cont
+               -> simplCut2 env_v (Var x') env_k kont
              Just term'
                -> do
                   tick (UnfoldingDone x')
-                  simplCut (zapSubstEnvs env_v) term' env_k cont
+                  simplCut (zapSubstEnvs env_v) term' env_k kont
       DoneTerm v
         -- Term already simplified (then PostInlineUnconditionally'd), so
         -- don't do any substitutions when processing it again
-        -> simplCut2 (zapSubstEnvs env_v) v env_k cont
+        -> simplCut2 (zapSubstEnvs env_v) v env_k kont
       SuspTerm stat v
-        -> simplCut (env_v `setStaticPart` stat) v env_k cont
-simplCut env_v term env_k cont
+        -> simplCut (env_v `setStaticPart` stat) v env_k kont
+simplCut env_v term env_k kont
   -- Proceed to phase 2
-  = simplCut2 env_v term env_k cont
+  = simplCut2 env_v term env_k kont
 
 -- Second phase of simplCut. Now, if the term is a variable, we looked it up
 -- and substituted it but decided not to inline it. (In other words, if it's an
 -- id, it's an OutId.)
-simplCut2 :: SimplEnv -> OutTerm -> StaticEnv -> InCont
+simplCut2 :: SimplEnv -> OutTerm -> StaticEnv -> InKont
                       -> SimplM (SimplEnv, OutCommand)
-simplCut2 env_v (Type ty) _env_k cont
-  = assert (isReturnCont cont) $
+simplCut2 env_v (Type ty) _env_k kont
+  = assert (isReturnKont kont) $
     let ty' = substTy env_v ty
-    in return (env_v, Command [] (Type ty') cont)
-simplCut2 env_v (Coercion co) _env_k cont
-  = assert (isReturnCont cont) $
+    in return (env_v, Command [] (Type ty') kont)
+simplCut2 env_v (Coercion co) _env_k kont
+  = assert (isReturnKont kont) $
     let co' = substCo env_v co
-    in return (env_v, Command [] (Coercion co') cont)
-simplCut2 _env_v (Cont {}) _env_k cont
-  = pprPanic "simplCut of cont" (ppr cont)
-simplCut2 env_v (Lam x body) env_k (App arg cont)
+    in return (env_v, Command [] (Coercion co') kont)
+simplCut2 _env_v (Kont {}) _env_k kont
+  = pprPanic "simplCut of cont" (ppr kont)
+simplCut2 env_v (Lam x body) env_k (App arg kont)
   = do
     tick (BetaReduction x)
     env_v' <- simplNonRec env_v x env_k arg NotTopLevel
-    simplCut env_v' body env_k cont
-simplCut2 env_v (Lam x body) env_k cont
+    simplCut env_v' body env_k kont
+simplCut2 env_v (Lam x body) env_k kont
   = do
     let (env_v', x') = enterScope env_v x
     body' <- simplTermNoFloats env_v' body
-    simplContWith (env_v' `setStaticPart` env_k) (Lam x' body') cont
-simplCut2 env_v term env_k cont
-  | Just (value, cont') <- splitValue term cont
-  , Just (env_k', x, alts) <- contIsCase_maybe (env_v `setStaticPart` env_k) cont'
+    simplKontWith (env_v' `setStaticPart` env_k) (Lam x' body') kont
+simplCut2 env_v term env_k kont
+  | Just (value, kont') <- splitValue term kont
+  , Just (env_k', x, alts) <- kontIsCase_maybe (env_v `setStaticPart` env_k) kont'
   , Just (pairs, body) <- matchCase env_v value alts
   = do
     tick (KnownBranch x)
@@ -447,7 +447,7 @@ simplCut2 env_v term env_k (Case case_bndr [Alt _ bndrs rhs])
       -- then in Sequent Core we have
       --   < launchMissiles# | $ 4#; $ "Russia"#; case of [ _ -> ... ] >,
       -- where the case is buried in the continuation. The code at hand won't
-      -- even see this. But if we wait until simplCont to do case elimination,
+      -- even see this. But if we wait until simplKont to do case elimination,
       -- we may miss the chance to match a term against a more interesting
       -- continuation. It will be found in the next iteration, but this seems
       -- likely to make several iterations often necessary (whereas the GHC
@@ -473,14 +473,14 @@ simplCut2 env_v term env_k (Case case_bndr [Alt _ bndrs rhs])
       -- Could allow for let bindings,
       -- but the original code in Simplify suggests doing so would be expensive
 
-simplCut2 env_v (Compute k c) env_k cont
+simplCut2 env_v (Compute k c) env_k kont
   = do
-    env_v' <- simplNonRec env_v k env_k (Cont cont) NotTopLevel
+    env_v' <- simplNonRec env_v k env_k (Kont kont) NotTopLevel
     simplCommand env_v' c
-simplCut2 env_v term@(Lit {}) env_k cont
-  = simplContWith (env_v `setStaticPart` env_k) term cont
-simplCut2 env_v term@(Var {}) env_k cont
-  = simplContWith (env_v `setStaticPart` env_k) term cont
+simplCut2 env_v term@(Lit {}) env_k kont
+  = simplKontWith (env_v `setStaticPart` env_k) term kont
+simplCut2 env_v term@(Var {}) env_k kont
+  = simplKontWith (env_v `setStaticPart` env_k) term kont
 
 -- TODO Somehow handle updating Definitions with NotAmong values?
 matchCase :: SimplEnv -> InValue -> [InAlt]
@@ -508,40 +508,40 @@ matchCase env_v value (_ : alts)
 matchCase _ _ []
   = Nothing
 
-simplContNoFloats :: SimplEnv -> InCont -> SimplM OutCont
-simplContNoFloats env cont
+simplKontNoFloats :: SimplEnv -> InKont -> SimplM OutKont
+simplKontNoFloats env kont
   = do
-    (env', cont') <- simplCont (zapFloats env) cont
-    wrapFloatsAroundCont env' cont'
+    (env', kont') <- simplKont (zapFloats env) kont
+    wrapFloatsAroundKont env' kont'
 
-simplCont :: SimplEnv -> InCont -> SimplM (SimplEnv, OutCont)
-simplCont env cont
+simplKont :: SimplEnv -> InKont -> SimplM (SimplEnv, OutKont)
+simplKont env kont
   | tracing
-  , pprTraceShort "simplCont" (
-      ppr env $$ ppr cont
+  , pprTraceShort "simplKont" (
+      ppr env $$ ppr kont
     ) False
   = undefined
-simplCont env cont
-  = go env cont (\k -> k)
+simplKont env kont
+  = go env kont (\k -> k)
   where
-    go :: SimplEnv -> InCont -> (OutCont -> OutCont) -> SimplM (SimplEnv, OutCont)
-    go env cont _
+    go :: SimplEnv -> InKont -> (OutKont -> OutKont) -> SimplM (SimplEnv, OutKont)
+    go env kont _
       | tracing
-      , pprTraceShort "simplCont::go" (
-          ppr env $$ ppr cont
+      , pprTraceShort "simplKont::go" (
+          ppr env $$ ppr kont
         ) False
       = undefined
-    go env (App arg cont) kc
+    go env (App arg kont) kc
       -- TODO Handle strict arguments differently? GHC detects whether arg is
       -- strict, but here we've lost that information.
       = do
         -- Don't float out of arguments (see Simplify.rebuildCall)
         arg' <- simplTermNoFloats env arg
-        go env cont (kc . App arg')
-    go env (Cast co cont) kc
+        go env kont (kc . App arg')
+    go env (Cast co kont) kc
       = do
         co' <- simplCoercion env co
-        go env cont (kc . Cast co')
+        go env kont (kc . Cast co')
     go env (Case x alts) kc
       = do
         let (env', x') = enterScope env x
@@ -550,25 +550,25 @@ simplCont env cont
           c' <- simplCommandNoFloats env'' c
           return $ Alt con xs' c'
         return (env, kc (Case x' alts'))
-    go env (Tick ti cont) kc
-      = go env cont (kc . Tick ti)
+    go env (Tick ti kont) kc
+      = go env kont (kc . Tick ti)
     go env (Return x) kc
       -- TODO Consider call-site inline
       = case substId env x of
           DoneId x'
             -> return (env, kc (Return x'))
-          DoneTerm (Cont k)
+          DoneTerm (Kont k)
             -> go (zapSubstEnvs env) k kc
-          SuspTerm stat (Cont k)
+          SuspTerm stat (Kont k)
             -> go (env `setStaticPart` stat) k kc
           _
             -> panic "return to non-continuation"
 
-simplContWith :: SimplEnv -> OutTerm -> InCont -> SimplM (SimplEnv, OutCommand)
-simplContWith env term cont
+simplKontWith :: SimplEnv -> OutTerm -> InKont -> SimplM (SimplEnv, OutCommand)
+simplKontWith env term kont
   = do
-    (env', cont') <- simplCont env cont
-    return (env', mkCommand [] term cont')
+    (env', kont') <- simplKont env kont
+    return (env', mkCommand [] term kont')
 
 simplCoercion :: SimplEnv -> Coercion -> SimplM Coercion
 simplCoercion env co =
@@ -585,18 +585,18 @@ simplVar env x
     DoneTerm v -> return v
     SuspTerm stat v -> simplTermNoFloats (env `setStaticPart` stat) v
 
-simplContId :: SimplEnv -> ContId -> SimplM OutCont
-simplContId env k
-  | isContId k
+simplKontId :: SimplEnv -> KontId -> SimplM OutKont
+simplKontId env k
+  | isKontId k
   = case substId env k of
       DoneId k'           -> return $ Return k'
-      DoneTerm (Cont cont)-> return cont
-      SuspTerm stat (Cont cont)
-        -> simplContNoFloats (env `setStaticPart` stat) cont
-      other               -> pprPanic "simplContId: bad cont binding"
+      DoneTerm (Kont kont)-> return kont
+      SuspTerm stat (Kont kont)
+        -> simplKontNoFloats (env `setStaticPart` stat) kont
+      other               -> pprPanic "simplKontId: bad kont binding"
                                (ppr k <+> arrow <+> ppr other)
   | otherwise
-  = pprPanic "simplContId: not a cont id" (ppr k)
+  = pprPanic "simplKontId: not a kont id" (ppr k)
 
 -- Based on preInlineUnconditionally in SimplUtils; see comments there
 preInlineUnconditionally :: SimplEnv -> InVar -> StaticEnv -> InTerm
@@ -667,9 +667,9 @@ postInlineUnconditionally _env x v level
         unfolding = idUnfolding x
 
 -- Heavily based on section 7 of the Secrets paper (JFP version)
-callSiteInline :: SimplEnv -> InVar -> InCont
+callSiteInline :: SimplEnv -> InVar -> InKont
                -> SimplM (Maybe OutTerm)
-callSiteInline env_v x cont
+callSiteInline env_v x kont
   = do
     ans <- go <$> getMode <*> getDynFlags
     when tracing $ liftCoreM $ putMsg $ ans `seq`
@@ -679,34 +679,34 @@ callSiteInline env_v x cont
   where
     go _mode _dflags
       | Just (BoundTo rhs level guid) <- def
-      , shouldInline env_v rhs (idOccInfo x) level guid cont
+      , shouldInline env_v rhs (idOccInfo x) level guid kont
       = Just rhs
       | Just (BoundToDFun bndrs con args) <- def
-      = inlineDFun env_v bndrs con args cont
+      = inlineDFun env_v bndrs con args kont
       | otherwise
       = Nothing
     def = findDef env_v x
 
 shouldInline :: SimplEnv -> OutTerm -> OccInfo -> TopLevelFlag -> Guidance
-             -> InCont -> Bool
-shouldInline env rhs occ level guid cont
+             -> InKont -> Bool
+shouldInline env rhs occ level guid kont
   = case occ of
       IAmALoopBreaker weak
         -> weak -- inline iff it's a "rule-only" loop breaker
       IAmDead
         -> pprPanic "shouldInline" (text "dead binder")
       OneOcc True True _ -- occurs once, but inside a non-linear lambda
-        -> whnfOrBot env rhs && someBenefit env rhs level cont
+        -> whnfOrBot env rhs && someBenefit env rhs level kont
       OneOcc False False _ -- occurs in multiple branches, but not in lambda
-        -> inlineMulti env rhs level guid cont
+        -> inlineMulti env rhs level guid kont
       _
-        -> whnfOrBot env rhs && inlineMulti env rhs level guid cont
+        -> whnfOrBot env rhs && inlineMulti env rhs level guid kont
 
-someBenefit :: SimplEnv -> OutTerm -> TopLevelFlag -> InCont -> Bool
-someBenefit env rhs level cont
-  | termIsConstruction rhs, contIsCase env cont
+someBenefit :: SimplEnv -> OutTerm -> TopLevelFlag -> InKont -> Bool
+someBenefit env rhs level kont
+  | termIsConstruction rhs, kontIsCase env kont
   = True
-  | Lit {} <- rhs, contIsCase env cont
+  | Lit {} <- rhs, kontIsCase env kont
   = True
   | Lam {} <- rhs
   = consider xs args
@@ -714,12 +714,12 @@ someBenefit env rhs level cont
   = False
   where
     (xs, _)       = lambdas rhs
-    (args, cont') = collectArgs cont
+    (args, kont') = collectArgs kont
 
     -- See Secrets, section 7.2, for the someBenefit criteria
     consider :: [OutVar] -> [InTerm] -> Bool
     consider [] (_:_)      = True -- (c) saturated call in interesting context
-    consider [] []         | contIsCase env cont' = True -- (c) ditto
+    consider [] []         | kontIsCase env kont' = True -- (c) ditto
                            -- Check for (d) saturated call to nested
                            | otherwise = isNotTopLevel level
     consider (_:_) []      = False -- unsaturated
@@ -734,29 +734,29 @@ whnfOrBot :: SimplEnv -> OutTerm -> Bool
 whnfOrBot _ (Lam {})  = True
 whnfOrBot _ term      = any ($ term) [isTrivialTerm, termIsBottom, termIsConstruction]
 
-inlineMulti :: SimplEnv -> OutTerm -> TopLevelFlag -> Guidance -> InCont -> Bool
-inlineMulti env rhs level guid cont
-  = noSizeIncrease rhs cont
-    || someBenefit env rhs level cont && smallEnough env rhs guid cont
+inlineMulti :: SimplEnv -> OutTerm -> TopLevelFlag -> Guidance -> InKont -> Bool
+inlineMulti env rhs level guid kont
+  = noSizeIncrease rhs kont
+    || someBenefit env rhs level kont && smallEnough env rhs guid kont
 
-noSizeIncrease :: OutTerm -> InCont -> Bool
-noSizeIncrease _rhs _cont = False --TODO
+noSizeIncrease :: OutTerm -> InKont -> Bool
+noSizeIncrease _rhs _kont = False --TODO
 
-smallEnough :: SimplEnv -> OutTerm -> Guidance -> InCont -> Bool
+smallEnough :: SimplEnv -> OutTerm -> Guidance -> InKont -> Bool
 smallEnough _ _ Never _ = False
-smallEnough env term (Usually unsatOk boringOk) cont
+smallEnough env term (Usually unsatOk boringOk) kont
   = (unsatOk || not unsat) && (boringOk || not boring)
   where
     unsat = length valArgs < termArity term
-    (_, valArgs, _) = collectTypeAndOtherArgs cont
-    boring = isReturnCont cont && not (contIsCase env cont)
+    (_, valArgs, _) = collectTypeAndOtherArgs kont
+    boring = isReturnKont kont && not (kontIsCase env kont)
     -- FIXME Should probably count known applications as interesting, too
 
-smallEnough env _term (Sometimes bodySize argWeights resWeight) cont
+smallEnough env _term (Sometimes bodySize argWeights resWeight) kont
   -- The Formula (p. 40)
   = bodySize - sizeOfCall - keenness `times` discounts <= threshold
   where
-    (_, args, cont') = collectTypeAndOtherArgs cont
+    (_, args, kont') = collectTypeAndOtherArgs kont
     sizeOfCall           | null args =  0 -- a lone variable or polymorphic value
                          | otherwise = 10 * (1 + length args)
     keenness             = ufKeenessFactor (se_dflags env)
@@ -765,7 +765,7 @@ smallEnough env _term (Sometimes bodySize argWeights resWeight) cont
     argDiscs             = sum $ zipWith argDisc args argWeights
     argDisc arg w        | isEvald arg = w
                          | otherwise   = 0
-    resDisc              | length args > length argWeights || isCase cont'
+    resDisc              | length args > length argWeights || isCase kont'
                          = resWeight
                          | otherwise = 0
 
@@ -776,25 +776,25 @@ smallEnough env _term (Sometimes bodySize argWeights resWeight) cont
 
     real `times` int     = ceiling (real * fromIntegral int)
 
-inlineDFun :: SimplEnv -> [Var] -> DataCon -> [OutTerm] -> InCont -> Maybe OutTerm
-inlineDFun env bndrs con conArgs cont
---  | pprTraceShort "inlineDFun" (sep ([ppr bndrs, ppr con, ppr conArgs, ppr cont, ppr args, ppr cont']) $$
---      if enoughArgs && contIsCase env cont' then text "YES" else text "NO") False
+inlineDFun :: SimplEnv -> [Var] -> DataCon -> [OutTerm] -> InKont -> Maybe OutTerm
+inlineDFun env bndrs con conArgs kont
+--  | pprTraceShort "inlineDFun" (sep ([ppr bndrs, ppr con, ppr conArgs, ppr kont, ppr args, ppr kont']) $$
+--      if enoughArgs && kontIsCase env kont' then text "YES" else text "NO") False
 --  = undefined
-  | enoughArgs, contIsCase env cont'
+  | enoughArgs, kontIsCase env kont'
   = Just term
   | otherwise
   = Nothing
   where
-    (args, cont') = collectArgsUpTo (length bndrs) cont
+    (args, kont') = collectArgsUpTo (length bndrs) kont
     enoughArgs    = length args == length bndrs
     term          = mkLambdas bndrs bodyTerm
     bodyTerm      = mkAppTerm (Var (dataConWorkId con)) conArgs
 
-data ContSplitting
-  = DupeAll OutCont
+data KontSplitting
+  = DupeAll OutKont
   | DupeNone
-  | DupeSome (OutCont -> OutCont) InCont
+  | DupeSome (OutKont -> OutKont) InKont
 
 -- | Divide a continuation into some (floated) bindings, a simplified
 -- continuation we'll happily copy into many case branches, and possibly an
@@ -815,48 +815,48 @@ data ContSplitting
 -- regular continuations of unboxed tuples for this, though that could make
 -- inlining decisions trickier.
 
-splitDupableCont :: SimplEnv -> InCont -> SimplM (SimplEnv, ContSplitting)
-splitDupableCont env cont
+splitDupableKont :: SimplEnv -> InKont -> SimplM (SimplEnv, KontSplitting)
+splitDupableKont env kont
   = do
-    (env', ans) <- go env True (\cont' -> cont') cont
+    (env', ans) <- go env True (\kont' -> kont') kont
     return $ case ans of
       Left dup                 -> (env', DupeAll dup)
       Right (True,  _,  _)     -> (env', DupeNone)
       Right (False, kk, nodup) -> (env', DupeSome kk nodup)
   where
-    -- The OutCont -> OutCont is a continuation for the outer continuation (!!).
+    -- The OutKont -> OutKont is a continuation for the outer continuation (!!).
     -- The Bool is there because we can't test whether the continuation is the
     -- identity.
-    go :: SimplEnv -> Bool -> (OutCont -> OutCont) -> InCont
-       -> SimplM (SimplEnv, Either OutCont (Bool, OutCont -> OutCont, InCont))
+    go :: SimplEnv -> Bool -> (OutKont -> OutKont) -> InKont
+       -> SimplM (SimplEnv, Either OutKont (Bool, OutKont -> OutKont, InKont))
     go env top kk (Return kid)
       = case substId env kid of
           DoneId  kid'              -> return (env, Left $ kk (Return kid'))
-          DoneTerm (Cont cont')     -> do
+          DoneTerm (Kont kont')     -> do
                                        let env' = zapFloats (zapSubstEnvs env)
-                                       (env'', ans) <- go env' top kk cont'
+                                       (env'', ans) <- go env' top kk kont'
                                        return (env `addFloats` env'', ans)
-          SuspTerm stat (Cont cont')-> do
+          SuspTerm stat (Kont kont')-> do
                                        let env' = zapFloats (stat `inDynamicScope` env)
-                                       (env'', ans) <- go env' top kk cont'
+                                       (env'', ans) <- go env' top kk kont'
                                        return (env `addFloats` env'', ans)
           other                     -> pprPanic "non-continuation at cont id"
                                          (ppr other)
     
-    go env _top kk (Cast co cont)
+    go env _top kk (Cast co kont)
       = do
         co' <- simplCoercion env co
-        go env False (kk . Cast co') cont
+        go env False (kk . Cast co') kont
     
-    go env top kk cont@(Tick {})
-      = return (env, Right (top, kk, cont))
+    go env top kk kont@(Tick {})
+      = return (env, Right (top, kk, kont))
     
-    go env _top kk (App arg cont)
+    go env _top kk (App arg kont)
       = do
         (env', arg') <- makeTrivial env arg
-        go env' False (kk . App arg') cont
+        go env' False (kk . App arg') kont
 
-    go env top kk cont@(Case {})
+    go env top kk kont@(Case {})
       -- Never duplicate cases! This is a marked departure from the original
       -- simplifier, which goes to great lengths to inline case statements in
       -- the hopes of making a case reduction possible. (For instance, this is
@@ -864,7 +864,7 @@ splitDupableCont env cont
       -- prepared than it is to detect known-branch conditions because we can
       -- easily check whether an id is bound to a case (much as GHC uses
       -- exprIsConApp_maybe to find whether one is bound to a constructor).
-      = return (env, Right (top, kk, cont)) 
+      = return (env, Right (top, kk, kont)) 
 
 makeTrivial :: SimplEnv -> InTerm
                         -> SimplM (SimplEnv, OutTerm)
@@ -876,31 +876,31 @@ makeTrivial env term
   --  | otherwise
   = do
     (env', bndr) <- case term of
-      Cont cont -> mkFreshContId env (fsLit "*trivk") (substTy env (contType cont))
+      Kont kont -> mkFreshKontId env (fsLit "*trivk") (substTy env (kontType kont))
       _         -> mkFreshVar    env (fsLit "triv") (substTy env (termType term))
     env'' <- simplLazyBind env' bndr bndr (staticPart env') term NotTopLevel NonRecursive
     term_final <- simplVar env'' bndr
     return (env'', term_final)
 
-contIsCase :: SimplEnv -> InCont -> Bool
-contIsCase _env (Case {}) = True
-contIsCase env (Return k)
-  | Just (BoundTo (Cont cont) _ _) <- lookupVarEnv (se_defs env) k
-  = contIsCase env cont
-contIsCase _ _ = False
+kontIsCase :: SimplEnv -> InKont -> Bool
+kontIsCase _env (Case {}) = True
+kontIsCase env (Return k)
+  | Just (BoundTo (Kont kont) _ _) <- lookupVarEnv (se_defs env) k
+  = kontIsCase env kont
+kontIsCase _ _ = False
 
-contIsCase_maybe :: SimplEnv -> InCont -> Maybe (StaticEnv, InId, [InAlt])
-contIsCase_maybe env (Case bndr alts) = Just (staticPart env, bndr, alts)
-contIsCase_maybe env (Return k)
+kontIsCase_maybe :: SimplEnv -> InKont -> Maybe (StaticEnv, InId, [InAlt])
+kontIsCase_maybe env (Case bndr alts) = Just (staticPart env, bndr, alts)
+kontIsCase_maybe env (Return k)
   = case substId env k of
       DoneId k' ->
         case lookupVarEnv (se_defs env) k' of
-          Just (BoundTo (Cont cont) _ _) -> contIsCase_maybe (zapSubstEnvs env) cont
+          Just (BoundTo (Kont kont) _ _) -> kontIsCase_maybe (zapSubstEnvs env) kont
           _                              -> Nothing
-      DoneTerm (Cont cont)               -> contIsCase_maybe (zapSubstEnvs env) cont
-      SuspTerm stat (Cont cont)          -> contIsCase_maybe (stat `inDynamicScope` env) cont
-      _                                  -> panic "contIsCase_maybe"
-contIsCase_maybe _ _ = Nothing
+      DoneTerm (Kont kont)               -> kontIsCase_maybe (zapSubstEnvs env) kont
+      SuspTerm stat (Kont kont)          -> kontIsCase_maybe (stat `inDynamicScope` env) kont
+      _                                  -> panic "kontIsCase_maybe"
+kontIsCase_maybe _ _ = Nothing
 
 -- TODO This might be generally useful; move to Syntax.hs?
 data Value b
@@ -912,15 +912,15 @@ type SeqCoreValue = Value SeqCoreBndr
 type InValue = SeqCoreValue
 type OutValue = SeqCoreValue
   
-splitValue :: Term b -> Cont b -> Maybe (Value b, Cont b)
-splitValue (Lit lit) cont = Just (LitVal lit, cont)
-splitValue term@(Lam {}) cont = Just (uncurry LamVal (lambdas term), cont)
-splitValue (Var fid) cont
+splitValue :: Term b -> Kont b -> Maybe (Value b, Kont b)
+splitValue (Lit lit) kont = Just (LitVal lit, kont)
+splitValue term@(Lam {}) kont = Just (uncurry LamVal (lambdas term), kont)
+splitValue (Var fid) kont
   | Just dc <- isDataConWorkId_maybe fid
   , length valArgs == dataConRepArity dc
-  = Just (ConsVal dc tyArgs valArgs, cont')
+  = Just (ConsVal dc tyArgs valArgs, kont')
   where
-    (tyArgs, valArgs, cont') = collectTypeAndOtherArgs cont
+    (tyArgs, valArgs, kont') = collectTypeAndOtherArgs kont
 splitValue _ _               = Nothing
 
 valueToTerm :: SeqCoreValue -> SeqCoreTerm

@@ -26,7 +26,7 @@ embed {{ tex-preamble
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 metavar x ::=   {{ com Term variable names }}
-metavar kappa {{ tex k }} ::=
+metavar kappa {{ tex p }} ::=
   {{ com Continuation variable names }}
 metavar alpha {{ tex \alpha }}, beta {{ tex \beta }} ::=
   {{ com Type-level variable names }}
@@ -47,7 +47,7 @@ lit {{ tex \textsf{lit} }} :: 'Literal_' ::= {{ com Literals }}
 z :: 'Name_' ::= {{ com Term, continuation, or type name }}
   | alpha           ::   :: Type    {{ com Type-level name }}
   | x               ::   :: Term    {{ com Term name }}
-  | kappa           ::   :: Cont    {{ com Continuation name }}
+  | kappa           ::   :: Kont    {{ com Continuation name }}
 
 n, m :: 'Var_' ::= {{ com Variable names, \coderef{basicTypes/Var.lhs}{Var} }}
   | z _ t           ::   :: IdOrTyVar   {{ com Name, labeled with type/kind }}
@@ -75,7 +75,7 @@ v, w :: 'Term_' ::= {{ com Terms, \coderef{Syntax.hs}{Term} }}
   | compute n . c                                ::   :: Compute {{ com Computation }}
   | t                                            ::   :: Type {{ com Type }}
   | g                                            ::   :: Coercion {{ com Coercion }}
-  | e                                            ::   :: Cont {{ com Continuation }}
+  | e                                            ::   :: Kont {{ com Continuation }}
   | v subst                                      :: M :: Subst {{ com Substitution }}
   | ( v )                                        :: M :: Parens {{ com Parenthesized term }}
   | S ( n )                                      :: M :: Lookup {{ com Lookup in the runtime store }}
@@ -83,7 +83,7 @@ v, w :: 'Term_' ::= {{ com Terms, \coderef{Syntax.hs}{Term} }}
 vs :: 'TermList_' ::= {{ com Term lists }}
   | </ vi // i />                                ::   :: Terms
 
-e :: 'Cont_' ::= {{ com Continuations, \coderef{Syntax.hs}{Cont} }}
+e {{ tex k }} :: 'Cont_' ::= {{ com Continuations, \coderef{Syntax.hs}{Kont} }}
   | ret n                                        ::   :: Return {{ com Continuation variable }}
   | applyTo v ; e                                ::   :: App  {{ com Application }}
     {{ tex \$ \, [[v]] ; [[e]] }}
@@ -213,14 +213,14 @@ T :: 'TyCon_' ::= {{ com Type constructors, \coderef{types/TyCon.lhs}{TyCon} }}
 
 H :: 'PrimTyCon_' ::= {{ com Primitive type constructors, \coderef{prelude/TysPrim.lhs}{} }}
   | Int#         ::   :: intPrimTyCon           {{ com Unboxed Int (\texttt{intPrimTyCon}) }}
-  | Cont#        ::   :: contTyCon              {{ com Continuation (\texttt{contTyCon}) }}
+  | Cont#        ::   :: kontTyCon              {{ com Continuation (\texttt{kontTyCon}) }}
   | ( ~# )       ::   :: eqPrimTyCon            {{ com Unboxed equality (\texttt{eqPrimTyCon}) }}
   | ( ~R# )      ::   :: eqReprPrimTyCon        {{ com Unboxed representational equality (\texttt{eqReprPrimTyCon}) }}
   | BOX          ::   :: superKindTyCon         {{ com Sort of kinds (\texttt{superKindTyCon}) }}
   | *            ::   :: liftedTypeKindTyCon    {{ com Kind of lifted types (\texttt{liftedTypeKindTyCon}) }}
   | #            ::   :: unliftedTypeKindTyCon  {{ com Kind of unlifted types (\texttt{unliftedTypeKindTyCon}) }}
   | OpenKind     ::   :: openTypeKindTyCon      {{ com Either $*$ or $\#$ (\texttt{openTypeKindTyCon}) }}
-  | ContKind     ::   :: contKindTyCon          {{ com Continuation (\texttt{contKindTyCon}) }}
+  | ContKind     ::   :: kontKindTyCon          {{ com Continuation (\texttt{kontKindTyCon}) }}
   | Constraint   ::   :: constraintTyCon        {{ com Constraint (\texttt{constraintTyCon}) }}
 
 %% CONTEXTS %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -252,7 +252,7 @@ kinded_types {{ tex \overline{(\sigma_i : \kappa_i)}^i }} :: 'Kinded_Types_' ::=
 subst :: 'Subst_' ::= {{ com List of substitutions }}
   | [ n |-> t ]        ::   :: TyMapping
   | [ n |-> v ]        ::   :: ValMapping
-  | [ n |-> e ]        ::   :: ContMapping
+  | [ n |-> e ]        ::   :: KontMapping
   | </ substi // i />  ::   :: List
 
 liftingsubst :: 'LiftSubst_' ::= {{ com List of lifting substitutions }}
@@ -307,7 +307,7 @@ terminals :: 'terminals_' ::=
   | ==>!         ::   :: unsafe
     {{ tex \twoheadrightarrow\!\!\!\!\!\! \raisebox{-.3ex}{!} \,\,\,\,\, }}
   | sym          ::   :: sym              {{ tex \textsf{sym} }}
-  | ;            ::   :: joincont         {{ tex ; }}
+  | ;            ::   :: joinkont         {{ tex ; }}
   | ;;           ::   :: trans            {{ tex \fatsemi }}
   | Left         ::   :: Left             {{ tex \textsf{left} }}
   | Right        ::   :: Right            {{ tex \textsf{right} }}
@@ -398,7 +398,7 @@ formula :: 'formula_' ::=
     {{ tex \exists \tau \text{ s.t.~} [[v]] = \tau }}
   | v is_a_coercion                    ::   :: is_a_coercion
     {{ tex \exists \gamma \text{ s.t.~} [[v]] = \gamma }}
-  | v is_a_cont                        ::   :: is_a_cont
+  | v is_a_kont                        ::   :: is_a_kont
     {{ tex \exists e \text{ s.t.~} [[v]] = e }}
   | t is_a_prop                        ::   :: is_a_prop
     {{ tex \exists \tau_1, \tau_2, \kappa \text{ s.t.~} [[t]] =

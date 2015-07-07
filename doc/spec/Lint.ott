@@ -72,7 +72,7 @@ G |-ct e : t
 G |-name kappa_t ok
 </ mi // i /> = fv(t)
 </ mi elt G // i />
-------------------- :: ContBinding
+------------------- :: KontBinding
 G |-sbind kappa_t <- e
 
 defn G  |- vl v : t ::  :: lintCoreTerm :: 'Vl_'
@@ -113,8 +113,8 @@ G |-co g : t1 ~Rep k t2
 ----------------------- :: CoercionRep
 G |-vl g : (~R#) k t1 t2
 
-defn G  |- ct e : t ::   :: lintCoreCont :: 'Ct_'
-  {{ com Continuation typing, \coderef{Lint.hs}{lintCoreCont} }}
+defn G  |- ct e : t ::   :: lintCoreKont :: 'Ct_'
+  {{ com Continuation typing, \coderef{Lint.hs}{lintCoreKont} }}
   {{ tex [[G]] \labeledjudge{ct} [[e]] : [[t]] }}
 by
 
@@ -123,7 +123,7 @@ kappa_t elt G
 G |-ct ret kappa_t : t
 
 G |-vl v : t
-not (v is_a_cont)
+not (v is_a_kont)
 G |-ct e : s
 ------------ :: ValApp
 G |-ct applyTo v ; e : t -> s
@@ -419,7 +419,7 @@ G |-ty lit : k
 
 G |-ty t : k
 G |-ki k ok
------------ :: ContTy
+----------- :: KontTy
 G |-ty Cont# t : ContKind k
 
 defn G |- subst n |-> t ok ::  :: checkTyKind :: 'Subst_'

@@ -337,10 +337,10 @@ substTerm _doc subst orig_term = unT $ subst_expr subst (T orig_term)
 
 subst_term :: Subst -> SeqCoreTerm    -> SeqCoreTerm
 subst_comm :: Subst -> SeqCoreCommand -> SeqCoreCommand
-subst_cont :: Subst -> SeqCoreCont    -> SeqCoreCont
+subst_kont :: Subst -> SeqCoreKont    -> SeqCoreKont
 subst_term subst = unT . subst_expr subst . T
 subst_comm subst = unC . subst_expr subst . C
-subst_cont subst = unK . subst_expr subst . K
+subst_kont subst = unK . subst_expr subst . K
 
 subst_expr :: Subst -> SeqCoreExpr   -> SeqCoreExpr
 subst_expr subst expr
@@ -348,12 +348,12 @@ subst_expr subst expr
   where
     go (T term) = T (goT term)
     go (C comm) = C (goC comm)
-    go (K cont) = K (goK cont)
+    go (K kont) = K (goK kont)
   
     goT (Var v)         = lookupIdSubst (text "subst_term") subst v 
     goT (Type ty)       = Type (substTy subst ty)
     goT (Coercion co)   = Coercion (substCo subst co)
-    goT (Cont cont)     = Cont (goK cont)
+    goT (Kont kont)     = Kont (goK kont)
     goT (Lit lit)       = Lit lit
     goT (Compute k comm)= Compute k' (subst_comm subst' comm)
                       where
@@ -362,9 +362,9 @@ subst_expr subst expr
                       where
                         (subst', x') = substBndr subst x
     
-    goK (App arg cont)  = App (goT arg) (goK cont)
-    goK (Tick tickish cont) = Tick (substTickish subst tickish) (goK cont)
-    goK (Cast co cont)      = Cast (substCo subst co) (goK cont)
+    goK (App arg kont)  = App (goT arg) (goK kont)
+    goK (Tick tickish kont) = Tick (substTickish subst tickish) (goK kont)
+    goK (Cast co kont)      = Cast (substCo subst co) (goK kont)
        -- Do not optimise even identity coercions
        -- Reason: substitution applies to the LHS of RULES, and
        --         if you "optimise" an identity coercion, you may
@@ -374,13 +374,13 @@ subst_expr subst expr
     goK (Case bndr alts) = Case bndr' (map (go_alt subst') alts)
                       where
                         (subst', bndr') = substBndr subst bndr
-    goK (Return k)       = case lookupIdSubst (text "subst_cont") subst k of
+    goK (Return k)       = case lookupIdSubst (text "subst_kont") subst k of
                              Var k'    -> Return k'
-                             Cont cont -> cont
+                             Kont kont -> kont
                              other     -> pprPanic "subst_expr::goK" (ppr other)
 
-    goC (Command binds term cont) = Command binds' (subst_term subst' term)
-                                                  (subst_cont subst' cont)
+    goC (Command binds term kont) = Command binds' (subst_term subst' term)
+                                                  (subst_kont subst' kont)
                       where
                         (subst', binds') = mapAccumL substBind subst binds
 

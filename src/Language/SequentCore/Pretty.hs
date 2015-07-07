@@ -50,15 +50,15 @@ ppr_binding (val_bdr, expr)
 
 ppr_comm :: OutputableBndr b => (SDoc -> SDoc) -> Command b -> SDoc
 ppr_comm add_par comm
-  = maybe_add_par $ ppr_let <+> cut (cmdTerm comm) (cmdCont comm)
+  = maybe_add_par $ ppr_let <+> cut (cmdTerm comm) (cmdKont comm)
   where
     ppr_let
       = case cmdLet comm of
           [] -> empty
           binds -> hang (text "let") 2 (ppr_binds binds) $$ text "in"
     maybe_add_par = if null (cmdLet comm) then noParens else add_par
-    cut val cont
-      = cat [text "<" <> pprCoreTerm val, vcat $ ppr_block "|" ";" ">" $ ppr_cont_frames cont]
+    cut val kont
+      = cat [text "<" <> pprCoreTerm val, vcat $ ppr_block "|" ";" ">" $ ppr_kont_frames kont]
 
 ppr_term :: OutputableBndr b => (SDoc -> SDoc) -> Term b -> SDoc
 ppr_term _ (Var name) = ppr name
@@ -81,29 +81,29 @@ ppr_term add_par (Compute kbndr comm)
   = add_par $
       hang (text "compute" <+> pprBndr LambdaBind kbndr)
         2 (pprCoreComm comm)
-ppr_term add_par (Cont k)
-  = ppr_cont add_par k
+ppr_term add_par (Kont k)
+  = ppr_kont add_par k
 
-ppr_cont_frames :: OutputableBndr b => Cont b -> [SDoc]
-ppr_cont_frames (App v k)
-  = char '$' <+> ppr_term noParens v : ppr_cont_frames k
-ppr_cont_frames (Case var alts)
+ppr_kont_frames :: OutputableBndr b => Kont b -> [SDoc]
+ppr_kont_frames (App v k)
+  = char '$' <+> ppr_term noParens v : ppr_kont_frames k
+ppr_kont_frames (Case var alts)
   = [hang (text "case as" <+> pprBndr LetBind var <+> text "of") 2 $
       vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)]
-ppr_cont_frames (Cast _ k)
-  = text "cast ..." : ppr_cont_frames k
-ppr_cont_frames (Tick _ k)
-  = text "tick ..." : ppr_cont_frames k
-ppr_cont_frames (Return k)
+ppr_kont_frames (Cast _ k)
+  = text "cast ..." : ppr_kont_frames k
+ppr_kont_frames (Tick _ k)
+  = text "tick ..." : ppr_kont_frames k
+ppr_kont_frames (Return k)
   = [text "ret" <+> ppr k]
 
-ppr_cont :: OutputableBndr b => (SDoc -> SDoc) -> Cont b -> SDoc
-ppr_cont add_par k
+ppr_kont :: OutputableBndr b => (SDoc -> SDoc) -> Kont b -> SDoc
+ppr_kont add_par k
   | null frames
   = text "pass"
   | otherwise
-  = add_par $ sep $ punctuate semi (ppr_cont_frames k)
-  where frames = ppr_cont_frames k
+  = add_par $ sep $ punctuate semi (ppr_kont_frames k)
+  where frames = ppr_kont_frames k
 
 pprCoreAlt :: OutputableBndr b => Alt b -> SDoc
 pprCoreAlt (Alt con args rhs)
@@ -133,8 +133,8 @@ instance OutputableBndr b => Outputable (Term b) where
 instance OutputableBndr b => Outputable (Command b) where
   ppr = ppr_comm noParens
 
-instance OutputableBndr b => Outputable (Cont b) where
-  ppr = ppr_cont noParens
+instance OutputableBndr b => Outputable (Kont b) where
+  ppr = ppr_kont noParens
 
 instance OutputableBndr b => Outputable (Alt b) where
   ppr = pprCoreAlt

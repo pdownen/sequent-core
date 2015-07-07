@@ -34,10 +34,10 @@ lintCoreBind env (NonRec bndr rhs)
         bndr'  = bndr `setIdType` bndrTy
         env'   = extendTvInScope env bndr'
     case rhs of
-      Cont cont -> do
-                   contTy <- contIdTyOrError env bndr
-                   lintCoreCont (text "in RHS for cont id" <+> ppr bndr)
-                                env' contTy cont
+      Kont kont -> do
+                   kontTy <- kontIdTyOrError env bndr
+                   lintCoreKont (text "in RHS for cont id" <+> ppr bndr)
+                                env' kontTy kont
       _         -> do
                    rhsTy <- lintCoreTerm env' rhs
                    checkRhsType bndr bndrTy rhsTy
@@ -82,7 +82,7 @@ lintCoreTerm env (Lam x body)
 
 lintCoreTerm env (Compute bndr comm)
   = do
-    ty <- contIdTyOrError env bndr
+    ty <- kontIdTyOrError env bndr
     lintCoreCommand env' comm
     return ty
   where
@@ -97,31 +97,31 @@ lintCoreTerm env (Type ty)
 lintCoreTerm env (Coercion co)
   = return $ substTy env (coercionType co)
 
-lintCoreTerm _env (Cont cont)
-  = Left $ text "unexpected continuation as term:" <+> ppr cont
+lintCoreTerm _env (Kont kont)
+  = Left $ text "unexpected continuation as term:" <+> ppr kont
 
 lintCoreCommand :: LintEnv -> SeqCoreCommand -> LintM ()
-lintCoreCommand env (Command { cmdLet = binds, cmdTerm = term, cmdCont = cont })
+lintCoreCommand env (Command { cmdLet = binds, cmdTerm = term, cmdKont = kont })
   = do
     env' <- foldM lintCoreBind env binds
-    lintCoreCut env' term cont
+    lintCoreCut env' term kont
 
-lintCoreCut :: LintEnv -> SeqCoreTerm -> SeqCoreCont -> LintM ()
-lintCoreCut env term cont
+lintCoreCut :: LintEnv -> SeqCoreTerm -> SeqCoreKont -> LintM ()
+lintCoreCut env term kont
   = do
     ty <- lintCoreTerm env term
-    lintCoreCont (text "in continuation of" <+> ppr term) env ty cont
+    lintCoreKont (text "in continuation of" <+> ppr term) env ty kont
 
-lintCoreCont :: SDoc -> LintEnv -> Type -> SeqCoreCont -> LintM ()
-lintCoreCont desc env ty (Return k)
+lintCoreKont :: SDoc -> LintEnv -> Type -> SeqCoreKont -> LintM ()
+lintCoreKont desc env ty (Return k)
   | Just k' <- lookupInScope (getTvInScope env) k
   = if substTy env (idType k) `eqType` idType k'
-      then void $ checkingType (desc <> colon <+> text "cont variable" <+> ppr k) ty $ contIdTyOrError env k
+      then void $ checkingType (desc <> colon <+> text "cont variable" <+> ppr k) ty $ kontIdTyOrError env k
       else Left $ desc <> colon <+> text "cont variable" <+> pprBndr LetBind k <+> text "bound as"
                                                          <+> pprBndr LetBind k'
   | otherwise
   = Left $ text "not found in context:" <+> pprBndr LetBind k
-lintCoreCont desc env ty (App (Type tyArg) cont)
+lintCoreKont desc env ty (App (Type tyArg) kont)
   | Just (tyVar, resTy) <- splitForAllTy_maybe (substTy env ty)
   = do
     let tyArg' = substTy env tyArg
@@ -130,28 +130,28 @@ lintCoreCont desc env ty (App (Type tyArg) cont)
            let env' = extendTvSubst env tyVar tyArg'
                -- Don't reapply the rest of the substitution; just apply the new thing
                resTy' = substTy (extendTvSubst emptyTvSubst tyVar tyArg') resTy
-           lintCoreCont desc env' resTy' cont
+           lintCoreKont desc env' resTy' kont
       else mkError (desc <> colon <+> text "type argument" <+> ppr tyArg)
              (ppr (typeKind tyArg')) (ppr (idType tyVar))
   | otherwise
   = Left $ desc <> colon <+> text "not a forall type:" <+> ppr ty
-lintCoreCont desc env ty (App arg cont)
+lintCoreKont desc env ty (App arg kont)
   | Just (argTy, resTy) <- splitFunTy_maybe (substTy env ty)
   = do
     void $ checkingType (desc <> colon <+> ppr arg) argTy $ lintCoreTerm env arg
-    lintCoreCont desc env resTy cont
+    lintCoreKont desc env resTy kont
   | otherwise
   = Left $ desc <> colon <+> text "not a function type:" <+> ppr ty
-lintCoreCont desc env ty (Cast co cont)
+lintCoreKont desc env ty (Cast co kont)
   = do
     let Pair fromTy toTy = coercionKind co
         fromTy' = substTy env fromTy
         toTy'   = substTy env toTy
     void $ checkingType (desc <> colon <+> text "incoming type of" <+> ppr co) ty $ return fromTy'
-    lintCoreCont desc env toTy' cont
-lintCoreCont desc env ty (Tick _ cont)
-  = lintCoreCont desc env ty cont
-lintCoreCont desc env ty (Case bndr alts)
+    lintCoreKont desc env toTy' kont
+lintCoreKont desc env ty (Tick _ kont)
+  = lintCoreKont desc env ty kont
+lintCoreKont desc env ty (Case bndr alts)
   = do
     let env' = extendTvInScopeSubsted env bndr
     forM_ alts $ \(Alt _ bndrs rhs) ->
@@ -186,8 +186,8 @@ checkingType desc ex go
     unless (ex `eqType` act) $ mkError desc (ppr ex) (ppr act)
     return act
 
-contIdTyOrError :: LintEnv -> ContId -> LintM Type
-contIdTyOrError env k
-  = case isContTy_maybe (substTy env (idType k)) of
+kontIdTyOrError :: LintEnv -> KontId -> LintM Type
+kontIdTyOrError env k
+  = case isKontTy_maybe (substTy env (idType k)) of
       Just arg -> return arg
       _        -> Left (text "bad cont type:" <+> pprBndr LetBind k)

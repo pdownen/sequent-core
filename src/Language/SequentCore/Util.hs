@@ -26,7 +26,7 @@ pprTraceShort str doc x
    | otherwise         = pprAndThen unsafeGlobalDynFlags trace str doc x
    
 pprAndThen :: DynFlags -> (String -> a) -> String -> SDoc -> a
-pprAndThen dflags cont heading pretty_msg
-  = cont (showSDoc dflags doc)
+pprAndThen dflags kont heading pretty_msg
+  = kont (showSDoc dflags doc)
     where
         doc = sep [text heading, nest 4 pretty_msg]

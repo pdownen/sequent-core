@@ -98,8 +98,8 @@ Continuations represent strict Haskell contexts, only ``inside-out'':
 
 \gram{\ottalt}
 
-Each constructor (besides $[[ret]]$) in \verb|Cont| corresponds to a particular
-fragment of Core (Table \ref{tab:cont-vs-cont}).
+Each constructor (besides $[[ret]]$) in \verb|Kont| corresponds to a particular
+fragment of Core (Table \ref{tab:kont-vs-kont}).
 
 \begin{table}
 \centering
@@ -112,7 +112,7 @@ Continuation & Context \\
 \([[case as n of </ alti // i />]]\) & \( \keyword{case}~\square~\keyword{as}~n~\keyword{of}~\overline{alt_i}^{\;i} \)
 \end{tabular}
 \caption{Continuations in Dual System FC and equivalent contexts in System FC.}
-\label{tab:cont-vs-cont}
+\label{tab:kont-vs-kont}
 \end{table}
 
 Finally, a \verb|Command| describes the interaction between a value and its
@@ -218,7 +218,7 @@ type of the data it \emph{consumes}. Thus a function application supplies a
 term, but it always has a function type (whose argument type, of course, must
 match the type of the term).
 
-\ottdefnlintCoreCont{}
+\ottdefnlintCoreKont{}
 
 A command does not in itself have a type, but each of its bindings must be
 well-typed, and its term's type must match its continuation's type:

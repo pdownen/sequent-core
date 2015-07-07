@@ -1,11 +1,11 @@
 module Language.SequentCore.WiredIn (
-  contKindTyCon, contTyCon, contFunTyCon,
+  kontKindTyCon, kontTyCon, kontFunTyCon,
   
-  mkContKind, mkContTy, isContTy, isContTy_maybe,
-  mkContFunTy, isContFunTy, splitContFunTy_maybe,
+  mkKontKind, mkKontTy, isKontTy, isKontTy_maybe,
+  mkKontFunTy, isKontFunTy, splitKontFunTy_maybe,
   sequentCoreTag, sequentCoreWiredInTag,
   
-  mkLamContId, mkLetContId, mkArgContId, mkCaseContId, mkContArgId
+  mkLamKontId, mkLetKontId, mkArgKontId, mkCaseKontId, mkKontArgId
 ) where
 
 import FastString
@@ -24,42 +24,42 @@ sequentCoreTag, sequentCoreWiredInTag :: Char
 sequentCoreTag        = 'Q'
 sequentCoreWiredInTag = 'q'
 
-contKindKey, contTypeKey, contFunTypeKey,
-  lamContKey, argContKey, letContKey, caseContKey, contArgKey :: Unique
-[ contKindKey, contTypeKey, contFunTypeKey,
-  lamContKey, argContKey, letContKey, caseContKey, contArgKey ]
+kontKindKey, kontTypeKey, kontFunTypeKey,
+  lamKontKey, argKontKey, letKontKey, caseKontKey, kontArgKey :: Unique
+[ kontKindKey, kontTypeKey, kontFunTypeKey,
+  lamKontKey, argKontKey, letKontKey, caseKontKey, kontArgKey ]
   = map (mkUnique sequentCoreWiredInTag) [1..8]
 
-lamContName, argContName, letContName, caseContName, contArgName :: Name
-[lamContName, argContName, letContName, caseContName, contArgName] =
+lamKontName, argKontName, letKontName, caseKontName, kontArgName :: Name
+[lamKontName, argKontName, letKontName, caseKontName, kontArgName] =
   zipWith mkSystemVarName
-    [lamContKey,    argContKey,    letContKey,    caseContKey,    contArgKey]
+    [lamKontKey,    argKontKey,    letKontKey,    caseKontKey,    kontArgKey]
     [fsLit "*lamk", fsLit "*argk", fsLit "*letk", fsLit "*casek", fsLit "karg"]
 
-contKindTyConName, contTyConName, contFunTyConName :: Name
-contKindTyConName = mkPrimTyConName (fsLit "ContKind") contKindKey    contKindTyCon
-contTyConName     = mkPrimTyConName (fsLit "Cont#")    contTypeKey    contTyCon
-contFunTyConName  = mkPrimTyConName (fsLit "ContFun")  contFunTypeKey contFunTyCon
+kontKindTyConName, kontTyConName, kontFunTyConName :: Name
+kontKindTyConName = mkPrimTyConName (fsLit "ContKind") kontKindKey    kontKindTyCon
+kontTyConName     = mkPrimTyConName (fsLit "Cont#")    kontTypeKey    kontTyCon
+kontFunTyConName  = mkPrimTyConName (fsLit "KontFun")  kontFunTypeKey kontFunTyCon
 
-mkLamContId, mkArgContId, mkLetContId, mkCaseContId :: Type -> Var
-[mkLamContId, mkArgContId, mkLetContId, mkCaseContId]
-  = map (\name ty -> mkLocalId name (mkContTy ty))
-      [lamContName, argContName, letContName, caseContName]
+mkLamKontId, mkArgKontId, mkLetKontId, mkCaseKontId :: Type -> Var
+[mkLamKontId, mkArgKontId, mkLetKontId, mkCaseKontId]
+  = map (\name ty -> mkLocalId name (mkKontTy ty))
+      [lamKontName, argKontName, letKontName, caseKontName]
 
-mkContArgId :: Type -> Id
-mkContArgId ty = mkLocalId contArgName ty
+mkKontArgId :: Type -> Id
+mkKontArgId ty = mkLocalId kontArgName ty
 
-contKindTyCon, contTyCon, contFunTyCon :: TyCon
-contKindTyCon = mkKindTyCon contKindTyConName superKind
+kontKindTyCon, kontTyCon, kontFunTyCon :: TyCon
+kontKindTyCon = mkKindTyCon kontKindTyConName superKind
 
 -- TODO VoidRep isn't really right, but does it matter? This type should never
 -- appear in Core anyway.
-contTyCon = mkPrimTyCon contTyConName kind [Representational] VoidRep
+kontTyCon = mkPrimTyCon kontTyConName kind [Representational] VoidRep
   where
     kKi  = mkTyVarTy kKiVar
-    kind = mkPiTypes [kKiVar] (mkFunTy kKi (mkContKind kKi))
+    kind = mkPiTypes [kKiVar] (mkFunTy kKi (mkKontKind kKi))
 
-contFunTyCon = mkSynTyCon contFunTyConName kind vars roles rhs parent
+kontFunTyCon = mkSynTyCon kontFunTyConName kind vars roles rhs parent
   where
     kind = mkArrowKinds [openTypeKind, openTypeKind] liftedTypeKind
     vars = [openAlphaTyVar, openBetaTyVar]
@@ -67,37 +67,37 @@ contFunTyCon = mkSynTyCon contFunTyConName kind vars roles rhs parent
     rhs = SynonymTyCon (mkFunTy openAlphaTy openBetaTy)
     parent = NoParentTyCon
 
-mkContKind :: Kind -> Kind
-mkContKind kind = mkTyConApp contKindTyCon [kind]
+mkKontKind :: Kind -> Kind
+mkKontKind kind = mkTyConApp kontKindTyCon [kind]
 
-mkContTy :: Type -> Type
-mkContTy ty = mkTyConApp contTyCon [typeKind ty, ty]
+mkKontTy :: Type -> Type
+mkKontTy ty = mkTyConApp kontTyCon [typeKind ty, ty]
 
-isContTy :: Type -> Bool
-isContTy ty | Just (con, _) <- splitTyConApp_maybe ty
-            = con == contTyCon
+isKontTy :: Type -> Bool
+isKontTy ty | Just (con, _) <- splitTyConApp_maybe ty
+            = con == kontTyCon
             | otherwise
             = False
 
-isContTy_maybe :: Type -> Maybe Type
-isContTy_maybe ty | Just (con, [_, arg]) <- splitTyConApp_maybe ty
-                  , con == contTyCon
+isKontTy_maybe :: Type -> Maybe Type
+isKontTy_maybe ty | Just (con, [_, arg]) <- splitTyConApp_maybe ty
+                  , con == kontTyCon
                   = Just arg
                   | otherwise
                   = Nothing
 
-mkContFunTy :: Type -> Type -> Type
-mkContFunTy inTy outTy = mkTyConApp contFunTyCon [inTy, outTy]
+mkKontFunTy :: Type -> Type -> Type
+mkKontFunTy inTy outTy = mkTyConApp kontFunTyCon [inTy, outTy]
 
 -- Note that we *don't* use splitTyConApp_maybe here because the whole point is
 -- to check for a type synonym ...
 
-isContFunTy :: Type -> Bool
-isContFunTy (TyConApp con _) = con == contFunTyCon
-isContFunTy _                = False
+isKontFunTy :: Type -> Bool
+isKontFunTy (TyConApp con _) = con == kontFunTyCon
+isKontFunTy _                = False
 
-splitContFunTy_maybe :: Type -> Maybe (Type, Type)
-splitContFunTy_maybe (TyConApp con [inTy, outTy]) | con == contFunTyCon
+splitKontFunTy_maybe :: Type -> Maybe (Type, Type)
+splitKontFunTy_maybe (TyConApp con [inTy, outTy]) | con == kontFunTyCon
   = Just (inTy, outTy)
-splitContFunTy_maybe _
+splitKontFunTy_maybe _
   = Nothing

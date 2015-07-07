@@ -8,8 +8,8 @@
 
 module Language.SequentCore.Syntax (
   -- * AST Types
-  Term(..), Cont(..), Command(..), Bind(..), Alt(..), AltCon(..), Expr(..), Program, ContId,
-  SeqCoreTerm, SeqCoreCont, SeqCoreCommand, SeqCoreBind, SeqCoreBndr,
+  Term(..), Kont(..), Command(..), Bind(..), Alt(..), AltCon(..), Expr(..), Program, KontId,
+  SeqCoreTerm, SeqCoreKont, SeqCoreCommand, SeqCoreBind, SeqCoreBndr,
     SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
   mkCommand, mkLambdas, mkCompute, mkAppTerm, mkConstruction, addLets,
@@ -18,20 +18,20 @@ module Language.SequentCore.Syntax (
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
   partitionTypes, isLambda,
   isValueArg, isTypeTerm, isCoTerm, isErasedTerm, isRuntimeTerm, isProperTerm,
-  isTrivial, isTrivialTerm, isTrivialCont, isReturnCont,
+  isTrivial, isTrivialTerm, isTrivialKont, isReturnKont,
   termIsConstruction, termAsConstruction, splitConstruction,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
   flattenBind, flattenBinds, bindersOf, bindersOfBinds,
   -- * Calculations
-  termArity, termType, contType,
+  termArity, termType, kontType,
   termIsBottom, commandIsBottom,
   needsCaseBinding,
-  termOkForSpeculation, commandOkForSpeculation, contOkForSpeculation,
-  termOkForSideEffects, commandOkForSideEffects, contOkForSideEffects,
-  termIsCheap, contIsCheap, commandIsCheap,
-  termIsExpandable, contIsExpandable, commandIsExpandable,
+  termOkForSpeculation, commandOkForSpeculation, kontOkForSpeculation,
+  termOkForSideEffects, commandOkForSideEffects, kontOkForSideEffects,
+  termIsCheap, kontIsCheap, commandIsCheap,
+  termIsExpandable, kontIsExpandable, commandIsExpandable,
   -- * Continuation ids
-  isContId, asContId, Language.SequentCore.WiredIn.mkContTy, contTyArg,
+  isKontId, asKontId, Language.SequentCore.WiredIn.mkKontTy, kontTyArg,
   -- * Alpha-equivalence
   (=~=), AlphaEq(..), AlphaEnv, HasId(..)
 ) where
@@ -84,33 +84,33 @@ data Term b     = Lit Literal       -- ^ A primitive literal value.
                                     -- argument to a type-level lambda.
                 | Coercion Coercion -- ^ A coercion. Used to pass evidence
                                     -- for the @cast@ operation to a lambda.
-                | Cont (Cont b)     -- ^ A continuation. Allowed /only/ as the
+                | Kont (Kont b)     -- ^ A continuation. Allowed /only/ as the
                                     -- body of a non-recursive @let@.
 
 -- | A continuation, representing a strict context of a Haskell expression.
 -- Computation in the sequent calculus is expressed as the interaction of a
 -- value with a continuation.
-data Cont b     = App  {- expr -} (Term b) (Cont b)
+data Kont b     = App  {- expr -} (Term b) (Kont b)
                   -- ^ Apply the value to an argument.
                 | Case {- expr -} b [Alt b]
                   -- ^ Perform case analysis on the value.
-                | Cast {- expr -} Coercion (Cont b)
+                | Cast {- expr -} Coercion (Kont b)
                   -- ^ Cast the value using the given coercion.
-                | Tick (Tickish Id) {- expr -} (Cont b)
+                | Tick (Tickish Id) {- expr -} (Kont b)
                   -- ^ Annotate the enclosed frame. Used by the profiler.
-                | Return ContId
+                | Return KontId
                   -- ^ Reference to a bound continuation.
 
 -- | The identifier for a covariable, which is like a variable but it binds a
 -- continuation.
-type ContId = Id
+type KontId = Id
 
 -- | A general computation. A command brings together a list of bindings, some
 -- term, and a /continuation/ saying what to do with the value produced by the
 -- term. The term and continuation comprise a /cut/ in the sequent calculus.
 --
 -- __Invariant__: If 'cmdTerm' is a variable representing a constructor, then
--- 'cmdCont' must /not/ begin with as many 'App' frames as the constructor's
+-- 'cmdKont' must /not/ begin with as many 'App' frames as the constructor's
 -- arity. In other words, the command must not represent a saturated application
 -- of a constructor. Such an application should be represented by a 'Cons' value
 -- instead. When in doubt, use 'mkCommand' to enforce this invariant.
@@ -119,7 +119,7 @@ data Command b  = Command { -- | Bindings surrounding the computation.
                             -- | The term producing the value.
                           , cmdTerm :: Term b
                             -- | What to do with the value.
-                          , cmdCont  :: Cont b
+                          , cmdKont  :: Kont b
                           }
 
 -- | A binding. Similar to the @Bind@ datatype from GHC. Can be either a single
@@ -135,7 +135,7 @@ data Alt b      = Alt AltCon [b] (Command b)
 -- writing mutually recursive functions.
 data Expr a     = T { unT :: Term a }
                 | C { unC :: Command a }
-                | K { unK :: Cont a }
+                | K { unK :: Kont a }
 
 -- | An entire program.
 type Program a  = [Bind a]
@@ -144,8 +144,8 @@ type Program a  = [Bind a]
 type SeqCoreBndr    = Var
 -- | Usual instance of 'Term', with 'Var's for binders
 type SeqCoreTerm   = Term   Var
--- | Usual instance of 'Cont', with 'Var's for binders
-type SeqCoreCont    = Cont    Var
+-- | Usual instance of 'Kont', with 'Var's for binders
+type SeqCoreKont    = Kont    Var
 -- | Usual instance of 'Command', with 'Var's for binders
 type SeqCoreCommand = Command Var
 -- | Usual instance of 'Bind', with 'Var's for binders
@@ -165,15 +165,15 @@ type SeqCoreProgram = Program Var
 --
 -- A smart constructor. If the term happens to be a Compute, may fold its
 -- command into the result.
-mkCommand :: HasId b => [Bind b] -> Term b -> Cont b -> Command b
+mkCommand :: HasId b => [Bind b] -> Term b -> Kont b -> Command b
 mkCommand binds (Compute kbndr (Command { cmdLet = binds'
                                         , cmdTerm = term'
-                                        , cmdCont = Return kid })) cont
+                                        , cmdKont = Return kid })) kont
   | identifier kbndr == kid
-  = mkCommand (binds ++ binds') term' cont
+  = mkCommand (binds ++ binds') term' kont
 
-mkCommand binds term cont
-  = Command { cmdLet = binds, cmdTerm = term, cmdCont = cont }
+mkCommand binds term kont
+  = Command { cmdLet = binds, cmdTerm = term, cmdKont = kont }
 
 mkLambdas :: [b] -> Term b -> Term b
 mkLambdas = flip (foldr Lam)
@@ -193,7 +193,7 @@ mkCompute k comm
 mkAppTerm :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreTerm
 mkAppTerm fun args = mkCompute k (mkCommand [] fun (foldr App (Return k) args))
   where
-    k = mkArgContId retTy
+    k = mkArgKontId retTy
     (tyArgs, _) = partitionTypes args
     (_, retTy) = Type.splitFunTys $ Type.applyTys (termType fun) tyArgs
 
@@ -218,7 +218,7 @@ addNonRec bndr rhs comm
 addLetsToTerm :: [SeqCoreBind] -> SeqCoreTerm -> SeqCoreTerm
 addLetsToTerm [] term = term
 addLetsToTerm binds term = mkCompute k (mkCommand binds term (Return k))
-  where k = mkLetContId (termType term)
+  where k = mkLetKontId (termType term)
 
 --------------------------------------------------------------------------------
 -- Deconstructors
@@ -232,7 +232,7 @@ lambdas term         = ([], term)
 -- | Divide a continuation into a sequence of arguments and an outer
 -- continuation. If @k@ is not an application continuation, then
 -- @collectArgs k == ([], k)@.
-collectArgs :: Cont b -> ([Term b], Cont b)
+collectArgs :: Kont b -> ([Term b], Kont b)
 collectArgs (App v k)
   = (v : vs, k')
   where (vs, k') = collectArgs k
@@ -242,7 +242,7 @@ collectArgs k
 -- | Divide a continuation into a sequence of type arguments and an outer
 -- continuation. If @k@ is not an application continuation or only applies
 -- non-type arguments, then @collectTypeArgs k == ([], k)@.
-collectTypeArgs :: Cont b -> ([KindOrType], Cont b)
+collectTypeArgs :: Kont b -> ([KindOrType], Kont b)
 collectTypeArgs (App (Type ty) k)
   = (ty : tys, k')
   where (tys, k') = collectTypeArgs k
@@ -252,7 +252,7 @@ collectTypeArgs k
 -- | Divide a continuation into a sequence of type arguments, then a sequence
 -- of non-type arguments, then an outer continuation. If @k@ is not an
 -- application continuation, then @collectTypeAndOtherArgs k == ([], [], k)@.
-collectTypeAndOtherArgs :: Cont b -> ([KindOrType], [Term b], Cont b)
+collectTypeAndOtherArgs :: Kont b -> ([KindOrType], [Term b], Kont b)
 collectTypeAndOtherArgs k
   = let (tys, k') = collectTypeArgs k
         (vs, k'') = collectArgs k'
@@ -261,7 +261,7 @@ collectTypeAndOtherArgs k
 -- | Divide a continuation into a sequence of up to @n@ arguments and an outer
 -- continuation. If @k@ is not an application continuation, then
 -- @collectArgsUpTo n k == ([], k)@.
-collectArgsUpTo :: Int -> Cont b -> ([Term b], Cont b)
+collectArgsUpTo :: Int -> Kont b -> ([Term b], Kont b)
 collectArgsUpTo 0 k
   = ([], k)
 collectArgsUpTo n (App v k)
@@ -280,7 +280,7 @@ partitionTypes vs = ([], vs)
 -- | True if the given command is a simple lambda, with no let bindings and no
 -- continuation.
 isLambda :: Command b -> Bool
-isLambda (Command { cmdLet = [], cmdCont = Return {}, cmdTerm = Lam {} })
+isLambda (Command { cmdLet = [], cmdKont = Return {}, cmdTerm = Lam {} })
   = True
 isLambda _
   = False
@@ -317,7 +317,7 @@ isRuntimeTerm v = not (isErasedTerm v)
 isProperTerm :: Term b -> Bool
 isProperTerm (Type _)     = False
 isProperTerm (Coercion _) = False
-isProperTerm (Cont _)     = False
+isProperTerm (Kont _)     = False
 isProperTerm _            = True
 
 -- | True if the given command is so simple we can duplicate it freely. This
@@ -325,7 +325,7 @@ isProperTerm _            = True
 isTrivial :: HasId b => Command b -> Bool
 isTrivial c
   = null (cmdLet c) &&
-      isTrivialCont (cmdCont c) &&
+      isTrivialKont (cmdKont c) &&
       isTrivialTerm (cmdTerm c)
 
 -- | True if the given term is so simple we can duplicate it freely. Some
@@ -335,34 +335,34 @@ isTrivialTerm :: HasId b => Term b -> Bool
 isTrivialTerm (Lit l)     = litIsTrivial l
 isTrivialTerm (Lam x t)   = not (isRuntimeVar (identifier x)) && isTrivialTerm t
 isTrivialTerm (Compute _ c) = isTrivial c
-isTrivialTerm (Cont cont) = isTrivialCont cont
+isTrivialTerm (Kont kont) = isTrivialKont kont
 isTrivialTerm _           = True
 
 -- | True if the given continuation is so simple we can duplicate it freely.
 -- This is true of casts and of applications of erased arguments (types and
 -- coercions). Ticks are not considered trivial, since this would cause them to
 -- be inlined.
-isTrivialCont :: Cont b -> Bool
-isTrivialCont (Return _) = True
-isTrivialCont (Cast _ k) = isTrivialCont k
-isTrivialCont (App v k)  = isErasedTerm v && isTrivialCont k
-isTrivialCont _          = False
+isTrivialKont :: Kont b -> Bool
+isTrivialKont (Return _) = True
+isTrivialKont (Cast _ k) = isTrivialKont k
+isTrivialKont (App v k)  = isErasedTerm v && isTrivialKont k
+isTrivialKont _          = False
 
 -- | True if the given continuation is a return continuation, @Return _@.
-isReturnCont :: Cont b -> Bool
-isReturnCont (Return _) = True
-isReturnCont _          = False
+isReturnKont :: Kont b -> Bool
+isReturnKont (Return _) = True
+isReturnKont _          = False
 
 -- | If a command represents a saturated call to some function, splits it into
 -- the function, the arguments, and the remaining continuation after the
 -- arguments.
 commandAsSaturatedCall :: HasId b =>
-                          Command b -> Maybe (Term b, [Term b], Cont b)
+                          Command b -> Maybe (Term b, [Term b], Kont b)
 commandAsSaturatedCall c
   = do
     let term = cmdTerm c
-    (args, cont) <- asSaturatedCall term (cmdCont c)
-    return (term, args, cont)
+    (args, kont) <- asSaturatedCall term (cmdKont c)
+    return (term, args, kont)
 
 termIsConstruction :: HasId b => Term b -> Bool
 termIsConstruction = isJust . termAsConstruction
@@ -376,20 +376,20 @@ termAsConstruction (Var id)      | Just dc <- isDataConWorkId_maybe id
 termAsConstruction (Compute k c) = commandAsConstruction (identifier k) c
 termAsConstruction _             = Nothing
 
-splitConstruction :: Term b -> Cont b -> Maybe (DataCon, [Type], [Term b], Cont b)
-splitConstruction (Var fid) cont
+splitConstruction :: Term b -> Kont b -> Maybe (DataCon, [Type], [Term b], Kont b)
+splitConstruction (Var fid) kont
   | Just dataCon <- isDataConWorkId_maybe fid
   , length valArgs == dataConRepArity dataCon
-  = Just (dataCon, tyArgs, valArgs, cont')
+  = Just (dataCon, tyArgs, valArgs, kont')
   where
-    (tyArgs, valArgs, cont') = collectTypeAndOtherArgs cont
+    (tyArgs, valArgs, kont') = collectTypeAndOtherArgs kont
 splitConstruction _ _
   = Nothing
 
-commandAsConstruction :: ContId -> Command b
+commandAsConstruction :: KontId -> Command b
                       -> Maybe (DataCon, [Type], [Term b])
-commandAsConstruction retId (Command { cmdLet = [], cmdTerm = term, cmdCont = cont })
-  | Just (dc, tyArgs, valArgs, Return retId') <- splitConstruction term cont
+commandAsConstruction retId (Command { cmdLet = [], cmdTerm = term, cmdKont = kont })
+  | Just (dc, tyArgs, valArgs, Return retId') <- splitConstruction term kont
   , retId == retId'
   = Just (dc, tyArgs, valArgs)
 commandAsConstruction _ _
@@ -398,20 +398,20 @@ commandAsConstruction _ _
 -- | If the given term is a function, and the given continuation would provide
 -- enough arguments to saturate it, returns the arguments and the remainder of
 -- the continuation.
-asSaturatedCall :: HasId b => Term b -> Cont b -> Maybe ([Term b], Cont b)
-asSaturatedCall term cont
+asSaturatedCall :: HasId b => Term b -> Kont b -> Maybe ([Term b], Kont b)
+asSaturatedCall term kont
   | 0 < arity, arity <= length args
   = Just (args, others)
   | otherwise
   = Nothing
   where
     arity = termArity term
-    (args, others) = collectArgs cont
+    (args, others) = collectArgs kont
 
 -- | If a command does nothing but provide a value to the given continuation id,
 -- returns that value.
-asValueCommand :: ContId -> Command b -> Maybe (Term b)
-asValueCommand k (Command { cmdLet = [], cmdTerm = v, cmdCont = Return k' })
+asValueCommand :: KontId -> Command b -> Maybe (Term b)
+asValueCommand k (Command { cmdLet = [], cmdTerm = v, cmdKont = Return k' })
   | k == k'
   = Just v
 asValueCommand _ _
@@ -440,19 +440,19 @@ termType :: HasId b => Term b -> Type
 termType (Lit l)        = literalType l
 termType (Var x)        = idType x
 termType (Lam x t)      = Type.mkPiType (identifier x) (termType t)
-termType (Compute k _)  = contTyArg (idType (identifier k))
+termType (Compute k _)  = kontTyArg (idType (identifier k))
 -- see exprType in GHC CoreUtils
 termType _other         = alphaTy
 
--- | Compute the type a continuation accepts. If @contType cont@ is Foo and @cont@ is bound
+-- | Compute the type a continuation accepts. If @kontType kont@ is Foo and @kont@ is bound
 -- to @k@, then @k@'s @idType@ will be @!Foo@.
-contType :: HasId b => Cont b -> Type
-contType (Return k)   = contTyArg (idType k)
-contType (App arg k)  = Type.mkFunTy (termType arg) (contType k)
-contType (Cast co k)  = let Pair fromTy toTy = coercionKind co
-                        in assert (toTy `Type.eqType` contType k) fromTy
-contType (Case b _)   = idType (identifier b)
-contType (Tick _ k)   = contType k
+kontType :: HasId b => Kont b -> Type
+kontType (Return k)   = kontTyArg (idType k)
+kontType (App arg k)  = Type.mkFunTy (termType arg) (kontType k)
+kontType (Cast co k)  = let Pair fromTy toTy = coercionKind co
+                        in assert (toTy `Type.eqType` kontType k) fromTy
+kontType (Case b _)   = idType (identifier b)
+kontType (Tick _ k)   = kontType k
 
 -- | Compute (a conservative estimate of) the arity of a term.
 termArity :: HasId b => Term b -> Int
@@ -471,14 +471,14 @@ termIsBottom _             = False
 
 -- | Find whether a command definitely evaluates to bottom.
 commandIsBottom :: Command b -> Bool
-commandIsBottom (Command { cmdTerm = Var x, cmdCont = cont })
+commandIsBottom (Command { cmdTerm = Var x, cmdKont = kont })
   | isBottomingId x
-  = go 0 cont
+  = go 0 kont
     where
-      go n (App arg cont') | isTypeTerm arg = go n cont'
-                           | otherwise       = (go $! (n+1)) cont'
-      go n (Tick _ cont')  = go n cont'
-      go n (Cast _ cont')  = go n cont'
+      go n (App arg kont') | isTypeTerm arg = go n kont'
+                           | otherwise       = (go $! (n+1)) kont'
+      go n (Tick _ kont')  = go n kont'
+      go n (Cast _ kont')  = go n kont'
       go n _               = n >= idArity x
 commandIsBottom _          = False
 
@@ -490,7 +490,7 @@ needsCaseBinding ty rhs
 
 termOkForSpeculation,    termOkForSideEffects    :: Term b   -> Bool
 commandOkForSpeculation, commandOkForSideEffects :: Command b -> Bool
-contOkForSpeculation,    contOkForSideEffects    :: Cont b    -> Bool
+kontOkForSpeculation,    kontOkForSideEffects    :: Kont b    -> Bool
 
 termOkForSpeculation = termOk primOpOkForSpeculation
 termOkForSideEffects = termOk primOpOkForSideEffects
@@ -498,8 +498,8 @@ termOkForSideEffects = termOk primOpOkForSideEffects
 commandOkForSpeculation = commOk primOpOkForSpeculation
 commandOkForSideEffects = commOk primOpOkForSideEffects
 
-contOkForSpeculation = contOk primOpOkForSpeculation
-contOkForSideEffects = contOk primOpOkForSideEffects
+kontOkForSpeculation = kontOk primOpOkForSpeculation
+kontOkForSideEffects = kontOk primOpOkForSideEffects
 
 termOk :: (PrimOp -> Bool) -> Term b -> Bool
 termOk primOpOk (Var id)         = appOk primOpOk id []
@@ -507,20 +507,20 @@ termOk primOpOk (Compute _ comm) = commOk primOpOk comm
 termOk _ _                       = True
 
 commOk :: (PrimOp -> Bool) -> Command b -> Bool
-commOk primOpOk (Command { cmdLet = binds, cmdTerm = term, cmdCont = cont })
-  = null binds && cutOk primOpOk term cont
+commOk primOpOk (Command { cmdLet = binds, cmdTerm = term, cmdKont = kont })
+  = null binds && cutOk primOpOk term kont
 
-cutOk :: (PrimOp -> Bool) -> Term b -> Cont b -> Bool
-cutOk primOpOk (Var fid) cont
-  | (args, cont') <- collectArgs cont
-  = appOk primOpOk fid args && contOk primOpOk cont'
-cutOk primOpOk term cont
-  = termOk primOpOk term && contOk primOpOk cont
+cutOk :: (PrimOp -> Bool) -> Term b -> Kont b -> Bool
+cutOk primOpOk (Var fid) kont
+  | (args, kont') <- collectArgs kont
+  = appOk primOpOk fid args && kontOk primOpOk kont'
+cutOk primOpOk term kont
+  = termOk primOpOk term && kontOk primOpOk kont
 
-contOk :: (PrimOp -> Bool) -> Cont b -> Bool
-contOk _        (Return _)= False -- TODO Should look at unfolding??
-contOk _        (App _ _) = False
-contOk primOpOk (Case _bndr alts)
+kontOk :: (PrimOp -> Bool) -> Kont b -> Bool
+kontOk _        (Return _)= False -- TODO Should look at unfolding??
+kontOk _        (App _ _) = False
+kontOk primOpOk (Case _bndr alts)
   =  all (\(Alt _ _ rhs) -> commOk primOpOk rhs) alts
   && altsAreExhaustive
   where
@@ -532,10 +532,10 @@ contOk primOpOk (Case _bndr alts)
           DataAlt dc -> 1 + length alts == tyConFamilySize (dataConTyCon dc)
       | otherwise
       = False
-contOk primOpOk (Tick ti cont)
-  = not (tickishCounts ti) && contOk primOpOk cont
-contOk primOpOk (Cast _ cont)
-  = contOk primOpOk cont
+kontOk primOpOk (Tick ti kont)
+  = not (tickishCounts ti) && kontOk primOpOk kont
+kontOk primOpOk (Cast _ kont)
+  = kontOk primOpOk kont
 
 -- See comments in CoreUtils.app_ok
 appOk :: (PrimOp -> Bool) -> Id -> [Term b] -> Bool
@@ -568,9 +568,9 @@ termIsCheap, termIsExpandable :: HasId b => Term b -> Bool
 termIsCheap      = termCheap isCheapApp
 termIsExpandable = termCheap isExpandableApp
 
-contIsCheap, contIsExpandable :: HasId b => Cont b -> Bool
-contIsCheap      = contCheap isCheapApp
-contIsExpandable = contCheap isExpandableApp
+kontIsCheap, kontIsExpandable :: HasId b => Kont b -> Bool
+kontIsCheap      = kontCheap isCheapApp
+kontIsExpandable = kontCheap isExpandableApp
 
 commandIsCheap, commandIsExpandable :: HasId b => Command b -> Bool
 commandIsCheap      = commCheap isCheapApp
@@ -586,33 +586,33 @@ termCheap _        (Coercion _) = True
 termCheap appCheap (Lam x t)    = isRuntimeVar (identifier x)
                                || termCheap appCheap t
 termCheap appCheap (Compute _ c)= commCheap appCheap c
-termCheap appCheap (Cont cont)  = contCheap appCheap cont
+termCheap appCheap (Kont kont)  = kontCheap appCheap kont
 
-contCheap :: HasId b => CheapMeasure -> Cont b -> Bool
-contCheap _        (Return _)      = True
-contCheap appCheap (Case _ alts) = all (\(Alt _ _ rhs) -> commCheap appCheap rhs)
+kontCheap :: HasId b => CheapMeasure -> Kont b -> Bool
+kontCheap _        (Return _)      = True
+kontCheap appCheap (Case _ alts) = all (\(Alt _ _ rhs) -> commCheap appCheap rhs)
                                          alts
-contCheap appCheap (Cast _ cont)   = contCheap appCheap cont
-contCheap appCheap (Tick ti cont)  = not (tickishCounts ti)
-                                   && contCheap appCheap cont
-contCheap appCheap (App arg cont)  = isErasedTerm arg
-                                   && contCheap appCheap cont
+kontCheap appCheap (Cast _ kont)   = kontCheap appCheap kont
+kontCheap appCheap (Tick ti kont)  = not (tickishCounts ti)
+                                   && kontCheap appCheap kont
+kontCheap appCheap (App arg kont)  = isErasedTerm arg
+                                   && kontCheap appCheap kont
 
 commCheap :: HasId b => CheapMeasure -> Command b -> Bool
-commCheap appCheap (Command { cmdLet = binds, cmdTerm = term, cmdCont = cont})
+commCheap appCheap (Command { cmdLet = binds, cmdTerm = term, cmdKont = kont})
   = all (termCheap appCheap . snd) (flattenBinds binds)
-  && cutCheap appCheap term cont
+  && cutCheap appCheap term kont
 
 -- See the last clause in CoreUtils.exprIsCheap' for explanations
 
-cutCheap :: HasId b => CheapMeasure -> Term b -> Cont b -> Bool
-cutCheap appCheap term (Cast _ cont) = cutCheap appCheap term cont
-cutCheap appCheap (Var fid) cont@(App {})
-  = case collectTypeAndOtherArgs cont of
-      (_, [], cont')   -> contCheap appCheap cont'
-      (_, args, cont')
+cutCheap :: HasId b => CheapMeasure -> Term b -> Kont b -> Bool
+cutCheap appCheap term (Cast _ kont) = cutCheap appCheap term kont
+cutCheap appCheap (Var fid) kont@(App {})
+  = case collectTypeAndOtherArgs kont of
+      (_, [], kont')   -> kontCheap appCheap kont'
+      (_, args, kont')
         | appCheap fid (length args)
-        -> papCheap args && contCheap appCheap cont'
+        -> papCheap args && kontCheap appCheap kont'
         | otherwise
         -> case idDetails fid of
              RecSelId {}  -> selCheap args
@@ -647,16 +647,16 @@ isExpandableApp fid valArgCount = isConLikeId fid
 --------------------------------------------------------------------------------
 
 -- | Find whether an id is a continuation id.
-isContId :: Id -> Bool
-isContId x = isContTy (idType x)
+isKontId :: Id -> Bool
+isKontId x = isKontTy (idType x)
 
 -- | Tag an id as a continuation id.
-asContId :: Id -> ContId
-asContId x | isContId x = x
-           | otherwise  = x `setIdType` mkContTy (idType x)
+asKontId :: Id -> KontId
+asKontId x | isKontId x = x
+           | otherwise  = x `setIdType` mkKontTy (idType x)
 
-contTyArg :: Type -> Type
-contTyArg ty = isContTy_maybe ty `orElse` pprPanic "contTyArg" (ppr ty)
+kontTyArg :: Type -> Type
+kontTyArg ty = isKontTy_maybe ty `orElse` pprPanic "kontTyArg" (ppr ty)
 
 --------------------------------------------------------------------------------
 -- Alpha-Equivalence
@@ -713,12 +713,12 @@ instance HasId b => AlphaEq (Term b) where
     = env `rnOccL` x1 == env `rnOccR` x2
   aeqIn env (Compute k1 c1) (Compute k2 c2)
     = aeqIn (rnBndr2 env (identifier k1) (identifier k2)) c1 c2
-  aeqIn env (Cont k1) (Cont k2)
+  aeqIn env (Kont k1) (Kont k2)
     = aeqIn env k1 k2
   aeqIn _ _ _
     = False
 
-instance HasId b => AlphaEq (Cont b) where
+instance HasId b => AlphaEq (Kont b) where
   aeqIn env (App c1 k1) (App c2 k2)
     = aeqIn env c1 c2 && aeqIn env k1 k2
   aeqIn env (Case x1 as1) (Case x2 as2)
@@ -735,8 +735,8 @@ instance HasId b => AlphaEq (Cont b) where
 
 instance HasId b => AlphaEq (Command b) where
   aeqIn env 
-    (Command { cmdLet = bs1, cmdTerm = v1, cmdCont = c1 })
-    (Command { cmdLet = bs2, cmdTerm = v2, cmdCont = c2 })
+    (Command { cmdLet = bs1, cmdTerm = v1, cmdKont = c1 })
+    (Command { cmdLet = bs2, cmdTerm = v2, cmdKont = c2 })
     | Just env' <- aeqBindsIn env bs1 bs2
     = aeqIn env' v1 v2 && aeqIn env' c1 c2
     | otherwise
