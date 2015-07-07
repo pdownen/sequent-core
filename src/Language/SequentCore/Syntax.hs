@@ -108,12 +108,6 @@ type KontId = Id
 -- | A general computation. A command brings together a list of bindings, some
 -- term, and a /continuation/ saying what to do with the value produced by the
 -- term. The term and continuation comprise a /cut/ in the sequent calculus.
---
--- __Invariant__: If 'cmdTerm' is a variable representing a constructor, then
--- 'cmdKont' must /not/ begin with as many 'App' frames as the constructor's
--- arity. In other words, the command must not represent a saturated application
--- of a constructor. Such an application should be represented by a 'Cons' value
--- instead. When in doubt, use 'mkCommand' to enforce this invariant.
 data Command b  = Command { -- | Bindings surrounding the computation.
                             cmdLet   :: [Bind b]
                             -- | The term producing the value.
