@@ -157,7 +157,7 @@ fromCoreBind env cont_maybe bind =
                     ,  Just kont      <- cont_maybe
                     ,  let (env', b') = substBndr env (b `setIdType` mkKontTy inTy)
                     ,  Just kont'     <- fromCoreLamAsKont env' kont e
-                    -> (env', NonRec b' (Kont kont'))
+                    -> (env', NonRec (BindKont b' kont'))
                     |  otherwise
                     -> let b' | Just (inTy, outTy) <- splitKontFunTy_maybe (idType b)
                               = b `setIdType` mkFunTy inTy outTy
@@ -165,11 +165,11 @@ fromCoreBind env cont_maybe bind =
                               = b
                            (env', b'') = substBndr env b'
                            val = fromCoreExprAsTerm env' e mkLetKontId
-                       in (env', NonRec b'' val)
+                       in (env', NonRec (BindTerm b'' val))
     Core.Rec pairs  -> let (env', bs') = substRecBndrs env (map fst pairs)
                            vals'       = [fromCoreExprAsTerm env' e mkLetKontId
                                            | (_, e) <- pairs]
-                       in (env', Rec (zip bs' vals'))
+                       in (env', Rec (zipWith BindTerm bs' vals'))
 
 fromCoreBinds :: FromCoreEnv -> [Core.CoreBind] -> [SeqCoreBind]
 fromCoreBinds env binds
@@ -192,7 +192,6 @@ termToCoreExpr val =
     Type t       -> Core.Type t
     Coercion co  -> Core.Coercion co
     Compute kb c -> commandToCoreExpr kb c
-    Kont _       -> pprPanic "termToCoreExpr" (ppr val)
 
 -- | Translates a continuation into a function that will wrap a Core expression
 -- with a fragment of context (an argument to apply to, a case expression to
@@ -220,15 +219,21 @@ kontIdToCore retId k = k `setIdType` mkKontFunTy argTy retTy
 bindToCore :: Maybe KontId -> SeqCoreBind -> Core.CoreBind
 bindToCore retId_maybe bind =
   case bind of
-    NonRec b (Kont k) -> Core.NonRec b' (Core.Lam x (k' (Core.Var x)))
+    NonRec pair -> Core.NonRec b v where (b, v) = bindPairToCore retId_maybe pair
+    Rec pairs   -> Core.Rec (map (bindPairToCore retId_maybe) pairs)
+
+bindPairToCore :: Maybe KontId -> SeqCoreBindPair -> (Core.CoreBndr, Core.CoreExpr)
+bindPairToCore retId_maybe pair =
+  case pair of
+    BindTerm b v -> (b, termToCoreExpr v)
+    BindKont b k -> (b', Core.Lam x (k' (Core.Var x)))
       where
         b'    = kontIdToCore retId b
         x     = setOneShotLambda $ mkKontArgId argTy
         k'    = kontToCoreExpr retId k
         argTy = isKontTy_maybe (idType b) `orElse` pprPanic "bindToCore" (pprBndr LetBind b)
         retId = retId_maybe `orElse` panic "bindToCore: top-level cont"
-    NonRec b v        -> Core.NonRec b (termToCoreExpr v)
-    Rec bs            -> Core.Rec [ (b, termToCoreExpr v) | (b,v) <- bs ]
+    
 
 -- | Translates a list of top-level bindings into Core.
 bindsToCore :: [SeqCoreBind] -> [Core.CoreBind]

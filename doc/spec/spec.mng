@@ -83,9 +83,7 @@ Terms largely correspond to WHNF terms in Core:
 
 Similarly to Core's \verb|Expr| type, types and coercions should only appear in
 terms that are either function arguments (see the continuation syntax) or
-right-hand sides of $[[let]]$s (see the command syntax). Additionally,
-continuations as terms should only appear as right-hand sides. None of these
-are first-class values.
+right-hand sides of $[[let]]$s (see the command syntax).
 
 There is one major novelty in \verb|Term|:
 The $[[compute]]$ form wraps a general computation as a term. It binds a
@@ -124,6 +122,8 @@ continuation; in addition, it may introduce bindings into the context:
 
 \gram{\ottbinding}
 
+\gram{\ottr}
+
 Some of the invariants in the Core datatypes carry over into Sequent Core:
 \begin{itemize}
 \item The right-hand sides of all top-level and recursive bindings
@@ -135,8 +135,8 @@ is ok-for-speculation. See \verb|#let_app_invariant#| in \ghcfile{coreSyn/CoreSy
 evaluation order explicit using commands; however, by design, a computation
 that's ok for speculation has negligible cost and always succeeds, and thus the
 ``detour'' it causes is minor.}
-\item We allow a non-recursive binding to bind a type variable, coercion
-variable, or continuation variable.
+\item We allow a non-recursive binding to bind a type variable or coercion
+variable.
 \end{itemize}
 
 Finally, as in Core, a program is just a list of bindings:
@@ -226,7 +226,7 @@ well-typed, and its term's type must match its continuation's type:
 \ottdefnlintCoreCommand{}
 
 %\begin{itemize}
-%\item There are two more case for $[[G |-vl e : t]]$, for type and continuation
+%\item There are two more case for $[[G |-vl v : t]]$, for type and continuation
 %expressions. These are included in the GHC code but are elided
 %here because they cases are never used in practice. Type expressions
 %can only appear in arguments to functions or as right-hand sides of bindings,

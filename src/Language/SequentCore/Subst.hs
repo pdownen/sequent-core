@@ -54,6 +54,7 @@ import Var
 import VarEnv
 import VarSet
 
+import Control.Arrow     ( (+++) )
 import Control.Exception ( assert )
 import Data.List         ( mapAccumL )
 
@@ -353,7 +354,6 @@ subst_expr subst expr
     goT (Var v)         = lookupIdSubst (text "subst_term") subst v 
     goT (Type ty)       = Type (substTy subst ty)
     goT (Coercion co)   = Coercion (substCo subst co)
-    goT (Kont kont)     = Kont (goK kont)
     goT (Lit lit)       = Lit lit
     goT (Compute k comm)= Compute k' (subst_comm subst' comm)
                       where
@@ -376,7 +376,6 @@ subst_expr subst expr
                         (subst', bndr') = substBndr subst bndr
     goK (Return k)       = case lookupIdSubst (text "subst_kont") subst k of
                              Var k'    -> Return k'
-                             Kont kont -> kont
                              other     -> pprPanic "subst_expr::goK" (ppr other)
 
     goC (Command binds term kont) = Command binds' (subst_term subst' term)
@@ -397,25 +396,30 @@ substBindSC subst bind    -- Short-cut if the substitution is empty
   = substBind subst bind
   | otherwise
   = case bind of
-       NonRec bndr rhs -> (subst', NonRec bndr' rhs)
+       NonRec pair -> (subst', NonRec (pair { binderOfPair = bndr' }))
           where
-            (subst', bndr') = substBndr subst bndr
-       Rec pairs -> (subst', Rec (bndrs' `zip` rhss'))
+            (subst', bndr') = substBndr subst (binderOfPair pair)
+       Rec pairs -> (subst', Rec (zipWith mkBindPair bndrs' rhss'))
           where
-            (bndrs, rhss)    = unzip pairs
+            (bndrs, rhss)    = unzip (map destBindPair pairs)
             (subst', bndrs') = substRecBndrs subst bndrs
             rhss' | isEmptySubst subst' = rhss
-                  | otherwise           = map (subst_term subst') rhss
+                  | otherwise           = map (substBindRhs subst') rhss
 
-substBind subst (NonRec bndr rhs) = (subst', NonRec bndr' (subst_term subst rhs))
+substBind subst (NonRec pair) = (subst', NonRec pair')
                                   where
+                                    (bndr, rhs)     = destBindPair pair
                                     (subst', bndr') = substBndr subst bndr
+                                    pair' = mkBindPair bndr' (substBindRhs subst rhs)
 
-substBind subst (Rec pairs) = (subst', Rec (bndrs' `zip` rhss'))
+substBind subst (Rec pairs) = (subst', Rec (zipWith mkBindPair bndrs' rhss'))
                             where
-                                (bndrs, rhss)    = unzip pairs
+                                (bndrs, rhss)    = unzip (map destBindPair pairs)
                                 (subst', bndrs') = substRecBndrs subst bndrs
-                                rhss' = map (subst_term subst') rhss
+                                rhss' = map (substBindRhs subst') rhss
+
+substBindRhs :: Subst -> Either SeqCoreTerm SeqCoreKont -> Either SeqCoreTerm SeqCoreKont
+substBindRhs subst = subst_term subst +++ subst_kont subst
 
 -- | De-shadowing the program is sometimes a useful pre-pass. It can be done simply
 -- by running over the bindings with an empty substitution, because substitution

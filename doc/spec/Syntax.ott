@@ -75,7 +75,6 @@ v, w :: 'Term_' ::= {{ com Terms, \coderef{Syntax.hs}{Term} }}
   | compute n . c                                ::   :: Compute {{ com Computation }}
   | t                                            ::   :: Type {{ com Type }}
   | g                                            ::   :: Coercion {{ com Coercion }}
-  | e                                            ::   :: Kont {{ com Continuation }}
   | v subst                                      :: M :: Subst {{ com Substitution }}
   | ( v )                                        :: M :: Parens {{ com Parenthesized term }}
   | S ( n )                                      :: M :: Lookup {{ com Lookup in the runtime store }}
@@ -103,14 +102,18 @@ c :: 'Command_' ::= {{ com Commands, \coderef{Syntax.hs}{Command} }}
   | let binding in c                             :: M :: BindOne {{ com Append one binding }}
   | c subst                                      :: M :: SubstList {{ com Substitution list }}
   | (c)                                          :: M :: Parens
-                                                
+
+r :: 'Rhs_' ::= {{ com Right-hand sides of bindings }}
+  | v                             ::   :: Term {{ com Bound term }}
+  | e                             ::   :: Kont {{ com Bound continuation }}
+                                                                                                
 bindings :: 'Binds_' ::= {{ com Series of let-bindings }}
   | </ bindingi // , // i />      ::   :: List    {{ com List of bindings }}
   | bindings1 , bindings2         :: M :: Concat  {{ com Concatenate lists }}
 
 binding :: 'Bind_' ::= {{ com Let-bindings, \coderef{Syntax.hs}{Bind} }}
-  | n = v                         ::   :: NonRec  {{ com Non-recursive binding }}
-  | rec </ ni = vi // and // i /> ::   :: Rec     {{ com Recursive binding }}
+  | n = r                         ::   :: NonRec  {{ com Non-recursive binding }}
+  | rec </ ni = ri // and // i /> ::   :: Rec     {{ com Recursive binding }}
 
 alt :: 'Alt_' ::= {{ com Case alternative, \coderef{Syntax.hs}{Alt} }}
   | Kp </ ni // i /> -> c         ::   :: Alt  {{ com Constructor applied to fresh names }}

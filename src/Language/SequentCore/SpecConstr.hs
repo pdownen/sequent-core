@@ -1,3 +1,5 @@
+{-# LANGUAGE ParallelListComp #-}
+
 -- |
 -- Module      : Language.SequentCore.SpecConstr
 -- Description : SpecConstr reimplementation
@@ -103,6 +105,7 @@ import VarEnv
 import VarSet
 
 import Control.Applicative  ( (<$>), (<|>) )
+import Control.Arrow        ( second )
 import Control.Monad
 import Data.List            ( nubBy )
 import Data.Monoid
@@ -226,6 +229,12 @@ specInKont env (Tick ti k)
 specInKont _ k
   = return (emptyScUsage, k)
 
+specInRhs :: ScEnv -> Either SeqCoreTerm SeqCoreKont -> CoreM (ScUsage, Either SeqCoreTerm SeqCoreKont)
+specInRhs env (Left term)
+  = second Left <$> specInTerm env term
+specInRhs env (Right kont)
+  = second Right <$> specInKont env kont
+
 specInAlt :: ScEnv -> SeqCoreAlt -> CoreM (ScUsage, SeqCoreAlt)
 specInAlt env (Alt ac xs c)
   = do
@@ -280,21 +289,26 @@ usageFromCut _ _ _
   = emptyScUsage
 
 specBind :: ScEnv -> SeqCoreBind -> CoreM (ScUsage, ScEnv, SeqCoreBind)
-specBind env (NonRec x v)
+specBind env (NonRec pair)
   = do
-    (u, v') <- specInTerm env v
-    return (u, env, NonRec x v')
+    let (x, v) = destBindPair pair
+    (u, v') <- specInRhs env v
+    return (u, env, NonRec (mkBindPair x v'))
 specBind env (Rec bs)
   = do
-    (usages, vs') <- unzip `liftM` mapM (specInTerm env' . snd) bs
+    (usages, vs') <- unzip `liftM` mapM (specInRhs env' . rhsOfPair) bs
     let
       totalUsages = mconcat usages
-      bs'         = zip (map fst bs) vs'
-    bindss <- mapM (specialize env' totalUsages) bs'
+      bs'         = zip (map binderOfPair bs) vs'
+    bindss <- forM bs' $ \(bndr, rhs) ->
+      case rhs of
+        Left  term -> map (uncurry BindTerm) <$>
+                        specialize env' totalUsages (bndr, term)
+        Right kont -> return [BindKont bndr kont]
     return (totalUsages, env', Rec (concat bindss))
   where 
     env'  = env { sc_how_bound = hb' }
-    hb'   = mkVarEnv [(x, SpecFun) | (x, _) <- bs] `plusVarEnv`
+    hb'   = mkVarEnv [(binderOfPair b, SpecFun) | b <- bs] `plusVarEnv`
                     sc_how_bound env
 
 data CallPat = [Var] :-> [SeqCoreTerm]
@@ -389,7 +403,8 @@ specialize env (ScUsage calls used) (x, v)
     specCall :: CallPat -> CoreM Spec
     specCall pat@(vars :-> vals)
       = do
-        let v' = mkLambdas vars $ addLetsToTerm (zipWith NonRec binders vals) body
+        let v' = mkLambdas vars $
+                   addLetsToTerm [NonRec (BindTerm x v) | x <- binders | v <- vals] body
         x' <- mkSysLocalM (fsLit "scsc") (termType v')
         return $ Spec { spec_pat = pat, spec_id = x', spec_defn = v' }
 

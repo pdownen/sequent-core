@@ -75,6 +75,6 @@ S |- < v | case as n of </ alti // i /> > --> c [n |-> v]
 
 T </ taa // aa /> ~#k T </ t'aa // aa /> = coercionKind g
 forall </ alphaaa_kaa // aa />. forall </ betabb_k'bb // bb />. </ t1cc // cc /> @-> T </ alphaaa_kaa // aa /> = dataConRepType K
-</ v'cc = compute ncc . < ecc | |> (t1cc @ </ [alphaaa_kaa |-> nth aa g] // aa /> </ [betabb_k'bb |-> <sbb>_Nom] // bb />); ret ncc > // cc /> 
+</ v'cc = compute ncc . < vcc | |> (t1cc @ </ [alphaaa_kaa |-> nth aa g] // aa /> </ [betabb_k'bb |-> <sbb>_Nom] // bb />); ret ncc > // cc /> 
 --------------------------- :: CasePush
 S |- < K | applyToAll </ taa // aa /> </ sbb // bb /> </ vcc // cc /> ; |> g; case as n of </ alti // i /> > --> < K | applyToAll </ t'aa // aa /> </ sbb // bb /> </ v'cc // cc /> ; case as n of </ alti // i /> >

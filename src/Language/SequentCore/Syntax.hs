@@ -8,19 +8,21 @@
 
 module Language.SequentCore.Syntax (
   -- * AST Types
-  Term(..), Kont(..), Command(..), Bind(..), Alt(..), AltCon(..), Expr(..), Program, KontId,
-  SeqCoreTerm, SeqCoreKont, SeqCoreCommand, SeqCoreBind, SeqCoreBndr,
-    SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
+  Term(..), Kont(..), Command(..), Bind(..), BindPair(..), Alt(..), AltCon(..),
+  Expr(..), Program, KontId,
+  SeqCoreTerm, SeqCoreKont, SeqCoreCommand, SeqCoreBind, SeqCoreBindPair,
+    SeqCoreBndr, SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
   mkCommand, mkLambdas, mkCompute, mkAppTerm, mkConstruction, addLets,
   addLetsToTerm, addNonRec,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
   partitionTypes, isLambda,
-  isValueArg, isTypeTerm, isCoTerm, isErasedTerm, isRuntimeTerm, isProperTerm,
+  isValueArg, isTypeTerm, isCoTerm, isErasedTerm, isRuntimeTerm,
   isTrivial, isTrivialTerm, isTrivialKont, isReturnKont,
   termIsConstruction, termAsConstruction, splitConstruction,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
+  rhsOfPair, mkBindPair, destBindPair, bindsTerm, bindsKont,
   flattenBind, flattenBinds, bindersOf, bindersOfBinds,
   -- * Calculations
   termArity, termType, kontType,
@@ -84,8 +86,6 @@ data Term b     = Lit Literal       -- ^ A primitive literal value.
                                     -- argument to a type-level lambda.
                 | Coercion Coercion -- ^ A coercion. Used to pass evidence
                                     -- for the @cast@ operation to a lambda.
-                | Kont (Kont b)     -- ^ A continuation. Allowed /only/ as the
-                                    -- body of a non-recursive @let@.
 
 -- | A continuation, representing a strict context of a Haskell expression.
 -- Computation in the sequent calculus is expressed as the interaction of a
@@ -116,10 +116,14 @@ data Command b  = Command { -- | Bindings surrounding the computation.
                           , cmdKont  :: Kont b
                           }
 
+-- | The binding of one identifier to one term or continuation.
+data BindPair b = BindTerm { binderOfPair :: b, boundTerm :: Term b }
+                | BindKont { binderOfPair :: b, boundKont :: Kont b }
+
 -- | A binding. Similar to the @Bind@ datatype from GHC. Can be either a single
 -- non-recursive binding or a mutually recursive block.
-data Bind b     = NonRec b (Term b) -- ^ A single non-recursive binding.
-                | Rec [(b, Term b)] -- ^ A block of mutually recursive bindings.
+data Bind b     = NonRec (BindPair b) -- ^ A single non-recursive binding.
+                | Rec [BindPair b]    -- ^ A block of mutually recursive bindings.
 
 -- | A case alternative. Given by the head constructor (or literal), a list of
 -- bound variables (empty for a literal), and the body as a 'Command'.
@@ -144,6 +148,8 @@ type SeqCoreKont    = Kont    Var
 type SeqCoreCommand = Command Var
 -- | Usual instance of 'Bind', with 'Var's for binders
 type SeqCoreBind    = Bind    Var
+-- | Usual instance of 'BindPair', with 'Var's for binders
+type SeqCoreBindPair = BindPair Var
 -- | Usual instance of 'Alt', with 'Var's for binders
 type SeqCoreAlt     = Alt     Var
 -- | Usual instance of 'Expr', with 'Var's for binders
@@ -202,12 +208,12 @@ addLets bs c = c { cmdLet = bs ++ cmdLet c }
 
 -- | Adds the given binding outside the given command, possibly using a case
 -- binding rather than a let. See "CoreSyn" on the let/app invariant.
-addNonRec :: HasId b => b -> Term b -> Command b -> Command b
-addNonRec bndr rhs comm
+addNonRec :: HasId b => BindPair b -> Command b -> Command b
+addNonRec (BindTerm bndr rhs) comm
   | needsCaseBinding (idType (identifier bndr)) rhs
   = mkCommand [] rhs (Case bndr [Alt DEFAULT [] comm])
-  | otherwise
-  = addLets [NonRec bndr rhs] comm
+addNonRec pair comm
+  = addLets [NonRec pair] comm
   
 addLetsToTerm :: [SeqCoreBind] -> SeqCoreTerm -> SeqCoreTerm
 addLetsToTerm [] term = term
@@ -304,16 +310,6 @@ isErasedTerm _ = False
 isRuntimeTerm :: Term b -> Bool
 isRuntimeTerm v = not (isErasedTerm v)
 
--- | True if the given term can appear in an expression without restriction.
--- Not true if the term is a type, coercion, or continuation; these can only
--- appear on the RHS of a let or (except for continuations) as an argument in
--- a function call.
-isProperTerm :: Term b -> Bool
-isProperTerm (Type _)     = False
-isProperTerm (Coercion _) = False
-isProperTerm (Kont _)     = False
-isProperTerm _            = True
-
 -- | True if the given command is so simple we can duplicate it freely. This
 -- means it has no bindings and its term and continuation are both trivial.
 isTrivial :: HasId b => Command b -> Bool
@@ -329,7 +325,6 @@ isTrivialTerm :: HasId b => Term b -> Bool
 isTrivialTerm (Lit l)     = litIsTrivial l
 isTrivialTerm (Lam x t)   = not (isRuntimeVar (identifier x)) && isTrivialTerm t
 isTrivialTerm (Compute _ c) = isTrivial c
-isTrivialTerm (Kont kont) = isTrivialKont kont
 isTrivialTerm _           = True
 
 -- | True if the given continuation is so simple we can duplicate it freely.
@@ -411,16 +406,33 @@ asValueCommand k (Command { cmdLet = [], cmdTerm = v, cmdKont = Return k' })
 asValueCommand _ _
   = Nothing
 
-flattenBind :: Bind b -> [(b, Term b)]
-flattenBind (NonRec bndr rhs) = [(bndr, rhs)]
-flattenBind (Rec pairs)       = pairs
+flattenBind :: Bind b -> [BindPair b]
+flattenBind (NonRec pair) = [pair]
+flattenBind (Rec pairs)   = pairs
 
-flattenBinds :: [Bind b] -> [(b, Term b)]
+flattenBinds :: [Bind b] -> [BindPair b]
 flattenBinds = concatMap flattenBind
 
+rhsOfPair :: BindPair b -> Either (Term b) (Kont b)
+rhsOfPair (BindTerm _ v) = Left v
+rhsOfPair (BindKont _ k) = Right k
+
+bindsTerm, bindsKont :: BindPair b -> Bool
+bindsTerm (BindTerm {}) = True
+bindsTerm (BindKont {}) = False
+
+bindsKont pair = not (bindsTerm pair)
+
+mkBindPair :: b -> Either (Term b) (Kont b) -> BindPair b
+mkBindPair x (Left term)  = BindTerm x term
+mkBindPair p (Right kont) = BindKont p kont
+
+destBindPair :: BindPair b -> (b, Either (Term b) (Kont b))
+destBindPair pair = (binderOfPair pair, rhsOfPair pair)
+
 bindersOf :: Bind b -> [b]
-bindersOf (NonRec bndr _) = [bndr]
-bindersOf (Rec pairs) = map fst pairs
+bindersOf (NonRec pair) = [binderOfPair pair]
+bindersOf (Rec pairs) = map binderOfPair pairs
 
 bindersOfBinds :: [Bind b] -> [b]
 bindersOfBinds = concatMap bindersOf
@@ -580,7 +592,6 @@ termCheap _        (Coercion _) = True
 termCheap appCheap (Lam x t)    = isRuntimeVar (identifier x)
                                || termCheap appCheap t
 termCheap appCheap (Compute _ c)= commCheap appCheap c
-termCheap appCheap (Kont kont)  = kontCheap appCheap kont
 
 kontCheap :: HasId b => CheapMeasure -> Kont b -> Bool
 kontCheap _        (Return _)      = True
@@ -594,7 +605,8 @@ kontCheap appCheap (App arg kont)  = isErasedTerm arg
 
 commCheap :: HasId b => CheapMeasure -> Command b -> Bool
 commCheap appCheap (Command { cmdLet = binds, cmdTerm = term, cmdKont = kont})
-  = all (termCheap appCheap . snd) (flattenBinds binds)
+  = all (either (termCheap appCheap) (kontCheap appCheap) . rhsOfPair)
+        (flattenBinds binds)
   && cutCheap appCheap term kont
 
 -- See the last clause in CoreUtils.exprIsCheap' for explanations
@@ -707,8 +719,6 @@ instance HasId b => AlphaEq (Term b) where
     = env `rnOccL` x1 == env `rnOccR` x2
   aeqIn env (Compute k1 c1) (Compute k2 c2)
     = aeqIn (rnBndr2 env (identifier k1) (identifier k2)) c1 c2
-  aeqIn env (Kont k1) (Kont k2)
-    = aeqIn env k1 k2
   aeqIn _ _ _
     = False
 
@@ -749,18 +759,28 @@ aeqBindsIn _ _ _
 -- | If the given bindings are alpha-equivalent, returns an augmented environment
 -- tracking the correspondences between the bound variables.
 aeqBindIn :: HasId b => AlphaEnv -> Bind b -> Bind b -> Maybe AlphaEnv
-aeqBindIn env (NonRec x1 c1) (NonRec x2 c2)
-  = if aeqIn env' c1 c2 then Just env' else Nothing
-  where env' = rnBndr2 env (identifier x1) (identifier x2)
-aeqBindIn env (Rec bs1) (Rec bs2)
-  = if and $ zipWith alpha bs1 bs2 then Just env' else Nothing
+aeqBindIn env (NonRec pair1) (NonRec pair2)
+  = aeqBindPairIn env pair1 pair2
+aeqBindIn env (Rec pairs1) (Rec pairs2)
+  = if and $ zipWith alpha pairs1 pairs2 then Just env' else Nothing
   where
-    alpha :: HasId b => (b, Term b) -> (b, Term b) -> Bool
-    alpha (_, c1) (_, c2)
-      = aeqIn env' c1 c2
+    alpha :: HasId b => BindPair b -> BindPair b -> Bool
+    alpha pair1 pair2
+      = aeqIn env' (rhsOfPair pair1) (rhsOfPair pair2)
     env'
-      = rnBndrs2 env (map (identifier . fst) bs1) (map (identifier . fst) bs2)
+      = rnBndrs2 env (map (identifier . binderOfPair) pairs1)
+                     (map (identifier . binderOfPair) pairs2)
 aeqBindIn _ _ _
+  = Nothing
+
+aeqBindPairIn :: HasId b => AlphaEnv -> BindPair b -> BindPair b -> Maybe AlphaEnv
+aeqBindPairIn env (BindTerm x v) (BindTerm y w)
+  = if aeqIn env' v w then Just env' else Nothing
+  where env' = rnBndr2 env (identifier x) (identifier y)
+aeqBindPairIn env (BindKont p k) (BindKont q j)
+  = if aeqIn env' k j then Just env' else Nothing
+  where env' = rnBndr2 env (identifier p) (identifier q)
+aeqBindPairIn _   _              _
   = Nothing
 
 instance HasId b => AlphaEq (Alt b) where
@@ -803,6 +823,11 @@ instance AlphaEq Coercion where
     
 instance AlphaEq a => AlphaEq [a] where
   aeqIn env xs ys = and $ zipWith (aeqIn env) xs ys
+
+instance (AlphaEq a, AlphaEq b) => AlphaEq (Either a b) where
+  aeqIn env (Left x)  (Left y)  = aeqIn env x y
+  aeqIn env (Right x) (Right y) = aeqIn env x y
+  aeqIn _   _         _         = False
 
 instance HasId b => AlphaEq (Bind b) where
   aeqIn env b1 b2 = isJust $ aeqBindIn env b1 b2

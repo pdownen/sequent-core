@@ -24,7 +24,6 @@ import Language.SequentCore.Syntax
 import Language.SequentCore.Plugin
 
 import Outputable
-import Var
 
 import Control.Monad (forM_)
 
@@ -62,20 +61,22 @@ inspectSequentCore rawOpts bs = do
   if null unknownOpts
     then do
       forM_ bs $ \bind -> case bind of
-        NonRec x term -> showBind opts x term
-        Rec pairs -> forM_ pairs $ \(x, term) -> showBind opts x term
+        NonRec pair -> showBind opts pair
+        Rec pairs -> forM_ pairs (showBind opts)
     else do
       errorMsg $ text "Unrecognized option(s): " <+>
                    sep (punctuate comma $ map text unknownOpts)
   return bs
 
-showBind :: Options -> Var -> SeqCoreTerm -> CoreM ()
-showBind opts x term
+showBind :: Options -> SeqCoreBindPair -> CoreM ()
+showBind opts pair
   = do
     dflags <- getDynFlags
-    let idPart = ppr x
+    let (x, rhs) = destBindPair pair
+        idPart = ppr x
         cap = ufCreationThreshold dflags
-        sizePart | optShowSizes opts = ppr (termSize dflags cap term)
+        sizePart | optShowSizes opts = ppr size
                  | otherwise         = empty
+        size = either (termSize dflags cap) (kontSize dflags cap) rhs
     putMsg $ sep [ idPart, sizePart ]
   where

@@ -38,20 +38,20 @@ defn G |- bind binding ::  :: lint_bind :: 'Binding_' {{ com Binding typing, \co
   {{ tex [[G]] \labeledjudge{bind} [[binding]] }}
 by
 
-G |-sbind n <- e
+G |-sbind n <- r
 ---------------------- :: NonRec
-G |-bind n = e
+G |-bind n = r
 
 </ G'i @ // i /> = inits(</ zi_si // i />)
 </ G, G'i |-ty si : ki // i />
 no_duplicates </ zi // i />
 G' = G, </ zi_si // i />
-</ G' |-sbind zi_si <- vi // i />
+</ G' |-sbind zi_si <- ri // i />
 ------------------------ :: LetRec
-G |-bind rec </ zi_si = vi // i />
+G |-bind rec </ zi_si = ri // i />
 
-defn G  |- sbind n <- v ::  :: lintSingleBinding :: 'SBinding_' {{ com Single binding typing }}
-  {{ tex [[G]] \labeledjudge{sbind} [[n]] [[<-]] [[v]] }}
+defn G  |- sbind n <- r ::  :: lintSingleBinding :: 'SBinding_' {{ com Single binding typing }}
+  {{ tex [[G]] \labeledjudge{sbind} [[n]] [[<-]] [[r]] }}
 by
 
 G |-vl v : t
@@ -59,7 +59,7 @@ G |-name z_t ok
 </ mi // i /> = fv(t)
 </ mi elt G // i />
 ----------------- :: ValBinding
-G |-sbind z_t <- v
+G |-sbind x_t <- v
 
 G |-ty t : k
 G |-name alpha_k ok
@@ -135,9 +135,9 @@ G |-ct e : s[alpha_k |-> t]
 G |-ct applyTo t ; e : forall alpha_k . s
 
 G |-ty t : k
-</ G, z_t; t |-altern alti // i />
+</ G, x_t; t |-altern alti // i />
 ---------------------------------------------------- :: Case
-G |-ct case as z_t of </ alti // i /> : t
+G |-ct case as x_t of </ alti // i /> : t
 
 G |-co g : t1 ~Rep k t2
 G |-ct e : t2
@@ -446,7 +446,7 @@ G |-cm c
 --------------------- :: DEFAULT
 G; t |-altern _ -> c
 
-s = literalType lit
+t = literalType lit
 G |-cm c
 ---------------------------------------- :: LitAlt
 G; t |-altern lit -> c

@@ -2,19 +2,20 @@ module Language.SequentCore.Simpl.Env (
   SimplEnv(..), StaticEnv, SimplIdSubst, SubstAns(..), IdDefEnv, Definition(..),
   Guidance(..),
 
-  InCommand, InTerm, InKont, InAlt, InBind,
+  InCommand, InTerm, InKont, InAlt, InBind, InBindPair,
   InId, InVar, InTyVar, InCoVar,
-  OutCommand, OutTerm, OutKont, OutAlt, OutBind,
+  OutCommand, OutTerm, OutKont, OutAlt, OutBind, OutBindPair,
   OutId, OutVar, OutTyVar, OutCoVar,
   
-  mkBoundTo, findDef, setDef,
+  mkBoundTo, mkBoundToKont, findDef, setDef,
   initialEnv, mkSuspension, enterScope, enterScopes, mkFreshVar, mkFreshKontId,
-  substId, substTy, substTyVar, substCo, substCoVar,
-  extendIdSubst, zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
+  substId, substKv, substTy, substTyVar, substCo, substCoVar,
+  extendIdSubst, extendKvSubst, zapSubstEnvs, setSubstEnvs, staticPart, setStaticPart,
   inDynamicScope, zapKont, bindKont, bindKontAs, pushKont, setKont, retType, restoreEnv,
   
   Floats, emptyFloats, addNonRecFloat, addRecFloats, zapFloats, mapFloats,
-  extendFloats, addFloats, wrapFloats, isEmptyFloats, doFloatFromRhs,
+  extendFloats, addFloats, wrapFloats, isEmptyFloats,
+  doFloatFromRhs, doFloatKontFromRhs,
   getFloatBinds, getFloats,
   
   termIsHNF, commandIsHNF
@@ -54,7 +55,8 @@ import Control.Monad       ( liftM )
 infixl 1 `setStaticPart`
 
 data SimplEnv
-  = SimplEnv    { se_idSubst :: SimplIdSubst    -- InId    |--> SubstAns (in/out)
+  = SimplEnv    { se_idSubst :: SimplIdSubst    -- InId    |--> TermSubstAns (in/out)
+                , se_kvSubst :: SimplKvSubst    -- InKontId|--> KontSubstAns (in/out)
                 , se_tvSubst :: TvSubstEnv      -- InTyVar |--> OutType
                 , se_cvSubst :: CvSubstEnv      -- InCoVar |--> OutCoercion
                 , se_retId   :: Maybe KontId
@@ -65,11 +67,16 @@ data SimplEnv
 
 newtype StaticEnv = StaticEnv SimplEnv -- Ignore se_inScope, se_floats, se_defs
 
-type SimplIdSubst = IdEnv SubstAns -- InId |--> SubstAns
-data SubstAns
-  = DoneTerm OutTerm
+type SimplSubst a = IdEnv (SubstAns a) -- InId |--> SubstAns a
+data SubstAns a
+  = Done (Out a)
   | DoneId OutId
-  | SuspTerm StaticEnv InTerm
+  | Susp StaticEnv (In a)
+
+type SimplIdSubst = SimplSubst SeqCoreTerm
+type SimplKvSubst = SimplSubst SeqCoreKont
+type TermSubstAns = SubstAns SeqCoreTerm
+type KontSubstAns = SubstAns SeqCoreKont
 
 -- The original simplifier uses the IdDetails stored in a Var to store unfolding
 -- info. We store similar data externally instead. (This is based on the Secrets
@@ -80,6 +87,8 @@ data Definition
             , defLevel :: TopLevelFlag
             , defGuidance :: Guidance
             }
+  | BoundToKont { defKont :: OutKont
+                , defGuidance :: Guidance }
   | BoundToDFun { dfunBndrs :: [Var]
                 , dfunDataCon :: DataCon
                 , dfunArgs :: [OutTerm] }
@@ -97,29 +106,44 @@ data Guidance
 mkBoundTo :: DynFlags -> OutTerm -> TopLevelFlag -> Definition
 mkBoundTo dflags term level = BoundTo term level (mkGuidance dflags term)
 
+mkBoundToKont :: DynFlags -> OutKont -> Definition
+mkBoundToKont dflags kont = BoundToKont kont (mkKontGuidance dflags kont)
+
 mkGuidance :: DynFlags -> OutTerm -> Guidance
 mkGuidance dflags term
   = let cap = ufCreationThreshold dflags
     in case termSize dflags cap term of
-         Nothing -> Never
-         Just (ExprSize base args res) ->
-           Sometimes base args res
+       Nothing -> Never
+       Just (ExprSize base args res) ->
+         Sometimes base args res
 
+mkKontGuidance :: DynFlags -> OutKont -> Guidance
+mkKontGuidance dflags kont
+  = let cap = ufCreationThreshold dflags
+    in case kontSize dflags cap kont of
+       Nothing -> Never
+       Just (ExprSize base args res) ->
+         Sometimes base args res
+
+type In a       = a
 type InCommand  = SeqCoreCommand
 type InTerm     = SeqCoreTerm
 type InKont     = SeqCoreKont
 type InAlt      = SeqCoreAlt
 type InBind     = SeqCoreBind
+type InBindPair = SeqCoreBindPair
 type InId       = Id
 type InVar      = Var
 type InTyVar    = TyVar
 type InCoVar    = CoVar
 
+type Out a      = a
 type OutCommand = SeqCoreCommand
 type OutTerm    = SeqCoreTerm
 type OutKont    = SeqCoreKont
 type OutAlt     = SeqCoreAlt
 type OutBind    = SeqCoreBind
+type OutBindPair = SeqCoreBindPair
 type OutId      = Id
 type OutVar     = Var
 type OutTyVar   = TyVar
@@ -128,6 +152,7 @@ type OutCoVar   = CoVar
 initialEnv :: DynFlags -> SimplEnv
 initialEnv dflags
   = SimplEnv { se_idSubst = emptyVarEnv
+             , se_kvSubst = emptyVarEnv
              , se_tvSubst = emptyVarEnv
              , se_cvSubst = emptyVarEnv
              , se_retId   = Nothing
@@ -136,8 +161,8 @@ initialEnv dflags
              , se_floats  = emptyFloats
              , se_dflags  = dflags }
 
-mkSuspension :: StaticEnv -> InTerm -> SubstAns
-mkSuspension = SuspTerm
+mkSuspension :: StaticEnv -> InTerm -> SubstAns SeqCoreTerm
+mkSuspension = Susp
 
 enterScope :: SimplEnv -> InVar -> (SimplEnv, OutVar)
 enterScope env x
@@ -184,13 +209,21 @@ mkFreshKontId env name inTy
         env' = env { se_inScope = extendInScopeSet (se_inScope env) k' }
     return (env', k')
 
-substId :: SimplEnv -> InId -> SubstAns
+substId :: SimplEnv -> InId -> TermSubstAns
 substId (SimplEnv { se_idSubst = ids, se_inScope = ins }) x
   = case lookupVarEnv ids x of
       -- See comments in GHC's SimplEnv.substId for explanations
-      Nothing                 -> DoneId (refine ins x)
-      Just (DoneId x')        -> DoneId (refine ins x')
-      Just (DoneTerm (Var x'))-> DoneId (refine ins x')
+      Nothing              -> DoneId (refine ins x)
+      Just (DoneId x')     -> DoneId (refine ins x')
+      Just (Done (Var x')) -> DoneId (refine ins x')
+      Just ans             -> ans
+
+substKv :: SimplEnv -> InId -> KontSubstAns
+substKv (SimplEnv { se_kvSubst = kvs, se_inScope = ins }) p
+  = case lookupVarEnv kvs p of
+      Nothing                 -> DoneId (refine ins p)
+      Just (DoneId p')        -> DoneId (refine ins p')
+      Just (Done (Return p')) -> DoneId (refine ins p')
       Just ans                -> ans
 
 refine :: InScopeSet -> OutVar -> OutVar
@@ -230,9 +263,13 @@ substCo env co = Coercion.substCo (getCvSubst env) co
 substCoVar :: SimplEnv -> CoVar -> Coercion
 substCoVar env co = Coercion.substCoVar (getCvSubst env) co
 
-extendIdSubst :: SimplEnv -> InVar -> SubstAns -> SimplEnv
+extendIdSubst :: SimplEnv -> InVar -> TermSubstAns -> SimplEnv
 extendIdSubst env x rhs
   = env { se_idSubst = extendVarEnv (se_idSubst env) x rhs }
+
+extendKvSubst :: SimplEnv -> InVar -> KontSubstAns -> SimplEnv
+extendKvSubst env x rhs
+  = env { se_kvSubst = extendVarEnv (se_kvSubst env) x rhs }
 
 zapSubstEnvs :: SimplEnv -> SimplEnv
 zapSubstEnvs env
@@ -261,8 +298,7 @@ bindKont env stat kont
 -- Usefully, this defers simplification until later.
 bindKontAs :: SimplEnv -> KontId -> StaticEnv -> InKont -> SimplEnv
 bindKontAs env k stat kont
-  = env { se_idSubst = extendVarEnv (se_idSubst env) k
-                         (SuspTerm stat (Kont kont))
+  = env { se_kvSubst = extendVarEnv (se_kvSubst env) k (Susp stat kont)
         , se_retId   = Just k }
 
 pushKont :: MonadUnique m => SimplEnv -> InKont -> m SimplEnv
@@ -301,14 +337,11 @@ restoreEnv :: SimplEnv -> Maybe (SimplEnv, InKont)
 restoreEnv env
   = do
     k <- se_retId env
-    substAns <- lookupVarEnv (se_idSubst env) k
+    substAns <- lookupVarEnv (se_kvSubst env) k
     case substAns of
-      DoneTerm term -> use (zapSubstEnvs env, term)
+      Done kont -> Just (zapSubstEnvs env, kont)
       DoneId _ -> Nothing -- not sure what this means, but consistent with prev
-      SuspTerm env' term -> use (env' `inDynamicScope` env, term)
-      where
-        use (env', Kont kont) = Just (env', kont)
-        use (_env', term) = pprPanic "restoreEnv" (ppr term)
+      Susp env' kont -> Just (env' `inDynamicScope` env, kont)
 
 -- See [Simplifier floats] in SimplEnv
 
@@ -337,11 +370,11 @@ andFF FltOkSpec  _          = FltOkSpec
 andFF FltLifted  flt        = flt
 
 classifyFF :: SeqCoreBind -> FloatFlag
-classifyFF (Rec _) = FltLifted
-classifyFF (NonRec bndr rhs)
+classifyFF (NonRec (BindTerm bndr rhs))
   | not (isStrictId bndr)    = FltLifted
   | termOkForSpeculation rhs = FltOkSpec
   | otherwise                = FltCareful
+classifyFF _ = FltLifted
 
 doFloatFromRhs :: TopLevelFlag -> RecFlag -> Bool -> OutTerm -> SimplEnv -> Bool
 -- If you change this function look also at FloatIn.noFloatFromRhs
@@ -355,25 +388,40 @@ doFloatFromRhs lvl rc str rhs (SimplEnv {se_floats = Floats fs ff})
                    FltOkSpec  -> isNotTopLevel lvl && isNonRec rc
                    FltCareful -> isNotTopLevel lvl && isNonRec rc && str
 
+doFloatKontFromRhs :: RecFlag -> Bool -> OutKont -> SimplEnv -> Bool
+-- If you change this function look also at FloatIn.noFloatFromRhs
+doFloatKontFromRhs rc str rhs (SimplEnv {se_floats = Floats fs ff})
+  =  not (isNilOL fs) && want_to_float && can_float
+  where
+     want_to_float = kontIsCheap rhs || kontIsExpandable rhs 
+                     -- See Note [Float when cheap or expandable]
+     can_float = case ff of
+                   FltLifted  -> True
+                   FltOkSpec  -> isNonRec rc
+                   FltCareful -> isNonRec rc && str
+
+
 emptyFloats :: Floats
 emptyFloats = Floats nilOL FltLifted
 
 unitFloat :: OutBind -> Floats
 unitFloat bind = Floats (unitOL bind) (classifyFF bind)
 
-addNonRecFloat :: SimplEnv -> OutId -> OutTerm -> SimplEnv
-addNonRecFloat env id rhs
+addNonRecFloat :: SimplEnv -> OutBindPair -> SimplEnv
+addNonRecFloat env pair
   = id `seq`   -- This seq forces the Id, and hence its IdInfo,
                -- and hence any inner substitutions
-    env { se_floats = se_floats env `addFlts` unitFloat (NonRec id rhs),
+    env { se_floats = se_floats env `addFlts` unitFloat (NonRec pair),
           se_inScope = extendInScopeSet (se_inScope env) id }
+  where
+    id = binderOfPair pair
 
-mapFloats :: SimplEnv -> ((OutId, OutTerm) -> (OutId, OutTerm)) -> SimplEnv
+mapFloats :: SimplEnv -> (OutBindPair -> OutBindPair) -> SimplEnv
 mapFloats env@SimplEnv { se_floats = Floats fs ff } fun
    = env { se_floats = Floats (mapOL app fs) ff }
    where
-     app (NonRec b e) = case fun (b,e) of (b',e') -> NonRec b' e'
-     app (Rec bs)     = Rec (map fun bs)
+     app (NonRec pair) = NonRec (fun pair)
+     app (Rec bs)      = Rec (map fun bs)
 
 extendFloats :: SimplEnv -> OutBind -> SimplEnv
 -- Add these bindings to the floats, and extend the in-scope env too
@@ -385,7 +433,8 @@ extendFloats env bind
     bndrs = bindersOf bind
     defs = map asDef (flattenBind bind)
     -- FIXME The NotTopLevel flag might wind up being wrong!
-    asDef (x, term) = (x, mkBoundTo (se_dflags env) term NotTopLevel)
+    asDef (BindTerm x term) = (x, mkBoundTo (se_dflags env) term NotTopLevel)
+    asDef (BindKont p kont) = (p, mkBoundToKont (se_dflags env) kont)
 
 addFloats :: SimplEnv -> SimplEnv -> SimplEnv
 -- Add the floats for env2 to env1;
@@ -401,7 +450,7 @@ wrapFloats env cmd = foldrOL wrap cmd (floatBinds (se_floats env))
   where
     wrap :: OutBind -> OutCommand -> OutCommand
     wrap bind@(Rec {}) cmd = cmd { cmdLet = bind : cmdLet cmd }
-    wrap (NonRec b r)  cmd = addNonRec b r cmd
+    wrap (NonRec pair) cmd = addNonRec pair cmd
 
 addFlts :: Floats -> Floats -> Floats
 addFlts (Floats bs1 l1) (Floats bs2 l2)
@@ -466,7 +515,7 @@ setDef env x def
 
 defToUnfolding :: Definition -> Unfolding
 defToUnfolding (NotAmong cons) = mkOtherCon cons
-defToUnfolding (BoundTo { defTerm = Kont {} })
+defToUnfolding (BoundToKont {})
   = NoUnfolding -- TODO Can we do better? Translating requires knowing the outer linear cont.
 defToUnfolding (BoundTo { defTerm = term, defLevel = lev, defGuidance = guid })
   = mkCoreUnfolding InlineRhs (isTopLevel lev) (termToCoreExpr term)
@@ -510,9 +559,10 @@ commandIsHNF _ _
   = False
 
 instance Outputable SimplEnv where
-  ppr (SimplEnv ids tvs cvs kont in_scope _defs floats _dflags)
+  ppr (SimplEnv ids kvs tvs cvs kont in_scope _defs floats _dflags)
     =  text "<InScope =" <+> braces (fsep (map ppr (varEnvElts (getInScopeVars in_scope))))
 --    $$ text " Defs      =" <+> ppr defs
+    $$ text " KvSubst   =" <+> ppr kvs
     $$ text " IdSubst   =" <+> ppr ids
     $$ text " TvSubst   =" <+> ppr tvs
     $$ text " CvSubst   =" <+> ppr cvs
@@ -523,24 +573,26 @@ instance Outputable SimplEnv where
       floatBndrs = bindersOfBinds (getFloatBinds floats)
 
 instance Outputable StaticEnv where
-  ppr (StaticEnv (SimplEnv ids tvs cvs kont _in_scope _defs _floats _dflags))
+  ppr (StaticEnv (SimplEnv ids kvs tvs cvs kont _in_scope _defs _floats _dflags))
     =  text "<IdSubst   =" <+> ppr ids
+    $$ text " KvSubst   =" <+> ppr kvs
     $$ text " TvSubst   =" <+> ppr tvs
     $$ text " CvSubst   =" <+> ppr cvs
     $$ text " RetId     =" <+> ppr kont
      <> char '>'
 
-instance Outputable SubstAns where
-  ppr (DoneTerm v) = brackets (text "Term:" <+> ppr v)
+instance Outputable a => Outputable (SubstAns a) where
+  ppr (Done v) = brackets (text "Done:" <+> ppr v)
   ppr (DoneId x) = brackets (text "Id:" <+> ppr x)
-  ppr (SuspTerm _ term@(Kont (Return _))) = brackets (text "Suspended:" <+> ppr term)
-  ppr (SuspTerm {}) = text "Suspended"
---  ppr (SuspTerm _env v)
+  ppr (Susp {}) = text "Suspended"
+--  ppr (Susp _env v)
 --    = brackets $ hang (text "Suspended:") 2 (ppr v)
 
 instance Outputable Definition where
   ppr (BoundTo c level guid)
     = sep [brackets (ppr level <+> ppr guid), ppr c]
+  ppr (BoundToKont k guid)
+    = sep [brackets (ppr guid), ppr k]
   ppr (BoundToDFun bndrs con args)
     = char '\\' <+> hsep (map ppr bndrs) <+> arrow <+> ppr con <+> hsep (map (parens . ppr) args)
   ppr (NotAmong alts) = text "NotAmong" <+> ppr alts

@@ -103,7 +103,6 @@ bodySize dflags cap topArgs expr
     size (T (Coercion _))   = sizeZero
     size (T (Var _))        = sizeZero -- invariant: not a nullary constructor
     size (T (Compute _ comm)) = size (C comm)
-    size (T (Kont kont))    = size (K kont)
     size (T (Lit lit))      = sizeN (litSize lit)
     size (T term@(Lam {}))  | erased    = size (T body)
                             | otherwise = lamScrutDiscount dflags (size (T body))
@@ -171,19 +170,22 @@ bodySize dflags cap topArgs expr
     sizeAlts alts = foldr (addAltSize . sizeAlt) sizeZero alts
 
     sizeBind :: SeqCoreBind -> BodySize
-    sizeBind (NonRec x rhs)
+    sizeBind (NonRec (BindTerm x rhs))
       = size (T rhs) `addSizeN` allocSize
       where
         allocSize
           -- An unlifted type has no heap allocation
           | isUnLiftedType (idType x) =  0
           | otherwise                 = 10
+    sizeBind (NonRec (BindKont _p kont))
+      = size (K kont)
 
     sizeBind (Rec pairs)
       = foldr (addSizeNSD . pairSize) (sizeN allocSize) pairs
       where
-        allocSize                     = 10 * length pairs
-        pairSize (_x, rhs)            = size (T rhs)
+        allocSize                     = 10 * length (filter bindsTerm pairs)
+        pairSize (BindTerm _x rhs)    = size (T rhs)
+        pairSize (BindKont _p kont)   = size (K kont)
 
     sizeLets :: [SeqCoreBind] -> BodySize
     sizeLets binds = foldr (addSizeNSD . sizeBind) sizeZero binds

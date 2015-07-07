@@ -28,30 +28,59 @@ lintTerm :: TvSubst -> SeqCoreTerm -> Maybe SDoc
 lintTerm env term = eitherToMaybe $ lintCoreTerm env term 
 
 lintCoreBind :: LintEnv -> SeqCoreBind -> LintM LintEnv
-lintCoreBind env (NonRec bndr rhs)
+lintCoreBind env (NonRec pair)
   = do
-    let bndrTy = substTy env (idType bndr)
+    let bndr   = binderOfPair pair
+        bndrTy = substTy env (idType bndr)
         bndr'  = bndr `setIdType` bndrTy
         env'   = extendTvInScope env bndr'
-    case rhs of
-      Kont kont -> do
-                   kontTy <- kontIdTyOrError env bndr
-                   lintCoreKont (text "in RHS for cont id" <+> ppr bndr)
-                                env' kontTy kont
-      _         -> do
-                   rhsTy <- lintCoreTerm env' rhs
-                   checkRhsType bndr bndrTy rhsTy
+    void $ lintCoreBindPair env' pair
     return env'
 lintCoreBind env (Rec pairs)
   = do
-    let bndrs   = map fst pairs
+    let bndrs   = map binderOfPair pairs
         bndrTys = map (substTy env . idType) bndrs
         bndrs'  = zipWith setIdType bndrs bndrTys
         env'    = extendTvInScopeList env bndrs'
-    rhsTys <- mapM (lintCoreTerm env' . snd) pairs
+    rhsTys <- mapM (lintCoreBindPair env') pairs
     forM_ (zip3 bndrs bndrTys rhsTys) $ \(bndr, bndrTy, rhsTy) ->
       checkRhsType bndr bndrTy rhsTy
     return env'
+
+{-
+Note [Checking terms vs. continuations]
+---------------------------------------
+
+Checking a term can be done straightforwardly: As usual, we check that it has a
+consistent type, and return that type if so. But in the face of polymorphism, we
+can't do the same with continuations. Consider:
+
+  $ @ Int; $ 3; $ 4; ret p
+
+What is this continuation's type? Supposing p has type Bool, the most general
+type would be forall a. a -> a -> Bool, but it could also be forall a. Int -> a
+-> Bool or forall a. Int -> a -> Bool or even conceivably forall a. Int -> Int
+-> Bool. Fortunately, we always *expect* a continuation to have a particular
+type: If it occurs in a command, it must have the same type as the term, and if
+it's bound by a let, it must have the identifier's type.
+
+Hence the asymmetry between lintCoreTerm and lintCoreKont, where the former
+returns LintM Type and the latter takes an extra Type parameter but returns
+LintM ().
+-}
+
+lintCoreBindPair :: LintEnv -> SeqCoreBindPair -> LintM Type
+lintCoreBindPair env (BindTerm bndr term)
+  = do
+    termTy <- lintCoreTerm env term
+    checkRhsType bndr (idType bndr) termTy
+    return termTy
+lintCoreBindPair env (BindKont bndr kont)
+  = do
+    kontTy <- kontIdTyOrError env bndr
+    lintCoreKont (text "in RHS for cont id" <+> ppr bndr)
+                 env kontTy kont
+    return kontTy
 
 lintCoreTerm :: LintEnv -> SeqCoreTerm -> LintM Type
 lintCoreTerm env (Var x)
@@ -96,9 +125,6 @@ lintCoreTerm env (Type ty)
 
 lintCoreTerm env (Coercion co)
   = return $ substTy env (coercionType co)
-
-lintCoreTerm _env (Kont kont)
-  = Left $ text "unexpected continuation as term:" <+> ppr kont
 
 lintCoreCommand :: LintEnv -> SeqCoreCommand -> LintM ()
 lintCoreCommand env (Command { cmdLet = binds, cmdTerm = term, cmdKont = kont })

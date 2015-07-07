@@ -22,8 +22,8 @@ import PprCore ()
 import Data.List
 
 ppr_bind :: OutputableBndr b => Bind b -> SDoc
-ppr_bind (NonRec val_bdr expr) = ppr_binding (val_bdr, expr)
-ppr_bind (Rec binds)           = hang (text "rec") 2 (vcat $ intersperse space $ ppr_block "{" ";" "}" (map ppr_binding binds))
+ppr_bind (NonRec pair) = ppr_binding pair
+ppr_bind (Rec binds)   = hang (text "rec") 2 (vcat $ intersperse space $ ppr_block "{" ";" "}" (map ppr_binding binds))
 
 ppr_binds_top :: OutputableBndr b => [Bind b] -> SDoc
 ppr_binds_top binds = ppr_binds_with "" "" "" binds
@@ -43,10 +43,11 @@ ppr_binds binds = ppr_binds_with "{" ";" "}" binds
 ppr_binds_with :: OutputableBndr b => String -> String -> String -> [Bind b] -> SDoc
 ppr_binds_with open mid close binds = vcat $ intersperse space $ ppr_block open mid close (map ppr_bind binds)
 
-ppr_binding :: OutputableBndr b => (b, Term b) -> SDoc
-ppr_binding (val_bdr, expr)
+ppr_binding :: OutputableBndr b => BindPair b -> SDoc
+ppr_binding pair
   = pprBndr LetBind val_bdr $$
-    hang (ppr val_bdr <+> equals) 2 (pprCoreTerm expr)
+    hang (ppr val_bdr <+> equals) 2 (either pprCoreTerm pprCoreKont (rhsOfPair pair))
+  where val_bdr = binderOfPair pair
 
 ppr_comm :: OutputableBndr b => (SDoc -> SDoc) -> Command b -> SDoc
 ppr_comm add_par comm
@@ -81,8 +82,6 @@ ppr_term add_par (Compute kbndr comm)
   = add_par $
       hang (text "compute" <+> pprBndr LambdaBind kbndr)
         2 (pprCoreComm comm)
-ppr_term add_par (Kont k)
-  = ppr_kont add_par k
 
 ppr_kont_frames :: OutputableBndr b => Kont b -> [SDoc]
 ppr_kont_frames (App v k)
@@ -120,6 +119,9 @@ pprCoreComm comm = ppr_comm noParens comm
 
 pprCoreTerm :: OutputableBndr b => Term b -> SDoc
 pprCoreTerm val = ppr_term noParens val
+
+pprCoreKont :: OutputableBndr b => Kont b -> SDoc
+pprCoreKont kont = ppr_kont noParens kont
 
 noParens :: SDoc -> SDoc
 noParens pp = pp
