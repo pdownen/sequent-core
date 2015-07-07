@@ -16,3 +16,4 @@ import Language.SequentCore.Plugin
 import Language.SequentCore.Pretty
 import Language.SequentCore.Syntax
 import Language.SequentCore.Translate
+
