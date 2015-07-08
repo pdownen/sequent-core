@@ -1,0 +1,7 @@
+*.tex
+*.log
+*.aux
+*.pdf
+
+# Commit spec.pdf for those without Ott:
+!spec.pdf
