@@ -13,7 +13,7 @@ module Language.SequentCore.Syntax (
   SeqCoreTerm, SeqCoreKont, SeqCoreCommand, SeqCoreBind, SeqCoreBindPair,
     SeqCoreBndr, SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
-  mkCommand, mkLambdas, mkCompute, mkAppTerm, mkConstruction, addLets,
+  mkCommand, mkLambdas, mkCompute, mkAppTerm, mkApp, mkConstruction, addLets,
   addLetsToTerm, addNonRec,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
@@ -191,11 +191,14 @@ mkCompute k comm
     kid = identifier k
   
 mkAppTerm :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreTerm
-mkAppTerm fun args = mkCompute k (mkCommand [] fun (foldr App (Return k) args))
+mkAppTerm fun args = mkCompute k (mkApp fun args (Return k))
   where
     k = mkArgKontId retTy
     (tyArgs, _) = partitionTypes args
     (_, retTy) = Type.splitFunTys $ Type.applyTys (termType fun) tyArgs
+
+mkApp :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreKont -> SeqCoreCommand
+mkApp fun args kont = mkCommand [] fun (foldr App kont args)
 
 mkConstruction :: DataCon -> [Type] -> [SeqCoreTerm] -> SeqCoreTerm
 mkConstruction dc tyArgs valArgs

@@ -20,6 +20,7 @@ import Language.SequentCore.Simpl.Monad
 import Language.SequentCore.Syntax
 import Language.SequentCore.Translate
 import Language.SequentCore.Util
+import Language.SequentCore.WiredIn
 
 import BasicTypes
 import Coercion    ( Coercion, isCoVar )
@@ -30,19 +31,21 @@ import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
 import CoreSyn     ( isRuntimeVar, isCheapUnfolding )
 import CoreUnfold  ( smallEnoughToInline )
 import DataCon
-import DynFlags    ( gopt, GeneralFlag(..), ufKeenessFactor, ufUseThreshold )
+import DynFlags    ( DynFlags, gopt, GeneralFlag(..), ufKeenessFactor, ufUseThreshold )
 import FastString
 import Id
 import HscTypes    ( ModGuts(..) )
-import Literal     ( Literal )
+import Literal     ( Literal, litIsDupable )
+import MonadUtils
+import MkCore      ( mkWildValBinder )
 import OccurAnal   ( occurAnalysePgm )
 import Outputable
 import Type        ( Type, isUnLiftedType )
+import TysWiredIn  ( mkTupleTy, tupleCon )
 import Var
 import VarEnv
 import VarSet
 
-import Control.Applicative ( (<$>), (<*>) )
 import Control.Exception   ( assert )
 import Control.Monad       ( foldM, forM, when )
 
@@ -158,7 +161,7 @@ simplTerm env (Coercion co)
 simplTerm env (Compute k comm)
   = do
     let (env', k') = enterScope env k
-    comm' <- simplCommandNoFloats (setKont env' k) comm
+    comm' <- simplCommandNoFloats (setKont env' k') comm
     return (env, mkCompute k' comm')
 simplTerm env v
   = do
@@ -237,7 +240,8 @@ simplNonRecKont :: SimplEnv -> InVar -> StaticEnv -> InKont -> SimplM SimplEnv
 simplNonRecKont env_p p env_k k
   = do
     let (env_p', p') = enterScope env_p p
-    simplKontBind env_p' p p' env_k k NonRecursive
+    env_p'' <- simplKontBind env_p' p p' env_k k NonRecursive
+    return $ setKont env_p'' p'
 
 simplKontBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InKont
               -> RecFlag -> SimplM SimplEnv
@@ -265,8 +269,8 @@ simplKontBind env_p p p' env_k k isRec
             -- term. But it seems like we *should* be ticking here sometimes?
             -- tick (PostInlineUnconditionally x)
             return $ extendKvSubst (env_p `addFloats` env_k'') p (Done dup)
-          DupeNone -> do
-            (env_k''', kont') <- simplKont env_k'' k
+          DupeNone nodup -> do
+            (env_k''', kont') <- simplKont env_k'' nodup
             finish p p' env_k''' kont'
           DupeSome dupk nodup -> do
             (env_k''', nodup') <- simplKont (zapFloats env_k'') nodup
@@ -320,12 +324,12 @@ wrapFloatsAroundTerm env term
     (env', k) <- mkFreshKontId env (fsLit "*wrap") ty
     return $ mkCompute k $ wrapFloats env' (mkCommand [] term (Return k))
 
-completeNonRec :: SimplEnv -> InVar -> OutVar -> (Either OutTerm OutKont)
+completeNonRec :: SimplEnv -> InVar -> OutVar -> Either OutTerm OutKont
                -> TopLevelFlag -> SimplM SimplEnv
 -- TODO Something like Simplify.prepareRhs
 completeNonRec = completeBind
 
-completeBind :: SimplEnv -> InVar -> OutVar -> (Either OutTerm OutKont)
+completeBind :: SimplEnv -> InVar -> OutVar -> Either OutTerm OutKont
              -> TopLevelFlag -> SimplM SimplEnv
 completeBind env x x' v level
   = do
@@ -349,6 +353,39 @@ completeBind env x x' v level
             (env', x''') = setDef env x'' def
         when tracing $ liftCoreM $ putMsg (text "defined" <+> ppr x''' <+> equals <+> ppr def)
         return $ addNonRecFloat env' (mkBindPair x''' v)
+
+addPolyBind :: TopLevelFlag -> SimplEnv -> OutBind -> SimplM SimplEnv
+-- Add a new binding to the environment, complete with its unfolding
+-- but *do not* do postInlineUnconditionally, because we have already
+-- processed some of the scope of the binding
+-- We still want the unfolding though.  Consider
+--      let
+--            x = /\a. let y = ... in Just y
+--      in body
+-- Then we float the y-binding out (via abstractFloats and addPolyBind)
+-- but 'x' may well then be inlined in 'body' in which case we'd like the
+-- opportunity to inline 'y' too.
+--
+-- INVARIANT: the arity is correct on the incoming binders
+
+addPolyBind top_lvl env (NonRec pair)
+  = do  
+    dflags <- getDynFlags
+    let (poly_id, rhs) = destBindPair pair
+        -- FIXME Duplicated code
+        def = case rhs of
+                Left term -> mkBoundTo dflags term top_lvl
+                Right kont -> mkBoundToKont dflags kont
+        (env', final_id) = setDef env poly_id def 
+    when tracing $ liftCoreM $
+      putMsg (text "addPolyBind defined" <+> ppr final_id <+> equals <+> ppr def)
+    return (addNonRecFloat env' (mkBindPair final_id rhs))
+
+addPolyBind _ env bind@(Rec _)
+  = return (extendFloats env bind)
+        -- Hack: letrecs are more awkward, so we extend "by steam"
+        -- without adding unfoldings etc.  At worst this leads to
+        -- more simplifier iterations
 
 simplRec :: SimplEnv -> [InBindPair] -> TopLevelFlag
          -> SimplM SimplEnv
@@ -568,10 +605,9 @@ simplKont env kont
     go env (Case x alts) kc
       = do
         let (env', x') = enterScope env x
-        alts' <- forM alts $ \(Alt con xs c) -> do
-          let (env'', xs') = enterScopes env' xs
-          c' <- simplCommandNoFloats env'' c
-          return $ Alt con xs' c'
+        -- FIXME The Nothing there could be the scrutinee, but we don't ever
+        -- have access to it here.
+        alts' <- forM alts (simplAlt env' Nothing [] x)
         return (env, kc (Case x' alts'))
     go env (Tick ti kont) kc
       = go env kont (kc . Tick ti)
@@ -590,6 +626,16 @@ simplKontWith env term kont
   = do
     (env', kont') <- simplKont env kont
     return (env', mkCommand [] term kont')
+
+simplAlt :: SimplEnv -> Maybe OutValue -> [AltCon] -> OutId -> InAlt -> SimplM OutAlt
+simplAlt env _scrut_maybe _notAmong _caseBndr (Alt con xs c)
+  = do
+    -- TODO Important: Update definitions! This is likely to be low-hanging
+    -- fruit. This is why we take the scrutinee, other constructors, and case
+    -- binder as arguments.
+    let (env', xs') = enterScopes env xs
+    c' <- simplCommandNoFloats env' c
+    return $ Alt con xs' c'
 
 simplCoercion :: SimplEnv -> Coercion -> SimplM Coercion
 simplCoercion env co =
@@ -815,8 +861,16 @@ inlineDFun env bndrs con conArgs kont
 
 data KontSplitting
   = DupeAll OutKont
-  | DupeNone
+  | DupeNone InKont
   | DupeSome (OutKont -> OutKont) InKont
+
+instance Outputable KontSplitting where
+  ppr (DupeAll kont) = text "Duplicate all"
+  ppr (DupeNone nodup) = hang (text "Duplicate none:") 2 (ppr nodup)
+  ppr (DupeSome dupk nodup)
+    = hang (text "Split:") 2 (ppr (dupk dummy) $$ text "----" $$ ppr nodup)
+    where
+      dummy = Return (mkLamKontId (mkTupleTy BoxedTuple []))
 
 -- | Divide a continuation into some (floated) bindings, a simplified
 -- continuation we'll happily copy into many case branches, and possibly an
@@ -829,7 +883,8 @@ data KontSplitting
 --   3. Don't duplicate ticks (because GHC doesn't).
 --   4. Duplicate applications, but ANF-ize them first to share the arguments.
 --   5. Don't duplicate cases (!) because, unlike with Simplify.mkDupableCont,
---        we don't need to (see comment in Case clause).
+--        we don't need to (see comment in Case clause). But "ANF-ize" in a dual
+--        sense by creating a join point for each branch.
 --
 -- TODO We could conceivably copy single-branch cases, since this would still
 -- limit bloat, but we would need polyadic continuations in most cases (just as
@@ -843,7 +898,7 @@ splitDupableKont env kont
     (env', ans) <- go env True (\kont' -> kont') kont
     return $ case ans of
       Left dup                 -> (env', DupeAll dup)
-      Right (True,  _,  _)     -> (env', DupeNone)
+      Right (True,  _,  nodup) -> (env', DupeNone nodup)
       Right (False, kk, nodup) -> (env', DupeSome kk nodup)
   where
     -- The OutKont -> OutKont is a continuation for the outer continuation (!!).
@@ -873,24 +928,40 @@ splitDupableKont env kont
     
     go env _top kk (App arg kont)
       = do
-        (env', arg') <- makeTrivial env arg
+        (env', arg') <- mkDupableTerm env arg
         go env' False (kk . App arg') kont
 
-    go env top kk kont@(Case {})
-      -- Never duplicate cases! This is a marked departure from the original
-      -- simplifier, which goes to great lengths to inline case statements in
-      -- the hopes of making a case reduction possible. (For instance, this is
-      -- the purpose of the case-of-case transform.) However, we are much better
-      -- prepared than it is to detect known-branch conditions because we can
-      -- easily check whether an id is bound to a case (much as GHC uses
-      -- exprIsConApp_maybe to find whether one is bound to a constructor).
-      = return (env, Right (top, kk, kont)) 
+    -- Don't duplicate seq (see Note [Single-alternative cases] in GHC Simplify.lhs)
+    go env top kk (Case caseBndr [Alt _altCon bndrs _rhs])
+      | all isDeadBinder bndrs
+      , not (isUnLiftedType (idType caseBndr))
+      = return (env, Right (top, kk, kont))
 
-makeTrivial :: SimplEnv -> InTerm
+    go env top kk (Case caseBndr alts)
+      -- This is dual to the App case: We have several branches and we want to
+      -- bind each to a join point. 
+      = do
+        -- We're doing case-of-case in spirit by moving an outer continuation
+        -- into case branches.
+        tick (CaseOfCase caseBndr)
+        
+        -- NOTE: At this point, mkDupableCont in GHC Simplify.lhs calls
+        -- prepareCaseCont (ultimately a recursive call) on the outer
+        -- continuation. We have no outer continuation for a case; in the
+        -- equivalent situation, we would have already dealt with the outer
+        -- case. May be worth checking that we get the same result.
+        
+        let (altEnv, caseBndr') = enterScope env caseBndr
+        alts' <- mapM (simplAlt altEnv Nothing [] caseBndr) alts
+        (env', alts'') <- mkDupableAlts env caseBndr alts'
+        
+        return (env', Right (top, kk, Case caseBndr' alts''))
+
+mkDupableTerm :: SimplEnv -> InTerm
                         -> SimplM (SimplEnv, OutTerm)
-makeTrivial env term
-  -- TODO Can't do this, since term is an InTerm and may need to be simplified.
-  -- Maybe we should take an OutTerm instead?
+mkDupableTerm env term
+  -- TODO Can't check the term for triviality first, since it is an InTerm and
+  -- may need to be simplified. Maybe we should take an OutTerm instead?
   --  | isTrivialTerm term
   --  = return (env, term)
   --  | otherwise
@@ -899,6 +970,87 @@ makeTrivial env term
     env'' <- simplLazyBind env' bndr bndr (staticPart env') term NotTopLevel NonRecursive
     term_final <- simplVar env'' bndr
     return (env'', term_final)
+
+mkDupableAlts :: SimplEnv -> OutId -> [InAlt] -> SimplM (SimplEnv, [InAlt])
+mkDupableAlts env caseBndr = mapAccumLM (\env' -> mkDupableAlt env' caseBndr) env
+
+mkDupableAlt :: SimplEnv -> OutId -> InAlt -> SimplM (SimplEnv, InAlt)
+mkDupableAlt env caseBndr alt@(Alt altCon bndrs rhs)
+  | Nothing <- se_retId env
+  = pprPanic "mkDupableAlt" (ppr env $$ pprBndr LetBind caseBndr $$ ppr alt)
+  | otherwise
+  = do
+    dflags <- getDynFlags
+    if commandIsDupable dflags rhs
+      then return (env, alt)
+      else do
+        -- TODO Update definition of case binder!
+        
+        let used_bndrs | isDeadBinder caseBndr = filter abstract_over bndrs
+                       | otherwise = bndrs ++ [caseBndr]
+                  
+            abstract_over bndr
+                | isTyVar bndr = True -- Abstract over all type variables just in case
+                | otherwise    = not (isDeadBinder bndr)
+                -- The deadness info on the new Ids is preserved by simplBinders_
+        
+        if any isTyVar used_bndrs
+          -- We have no unboxed existentials, so we can't use continuations for
+          -- polymorphic join points. Worse, wrapping a command as a function
+          -- breaks linearity. TODO: Find a workaround. For the moment, we
+          -- duplicate the branch and hope for the best.
+          then return (env, alt)
+          
+          -- We have no unboxed existentials, so we can't use continuations
+          -- for polymorphic join points. Fall back to old method by
+          -- generating a lambda instead.
+          else do
+            let bndrTys = map idType used_bndrs
+                argTy   = mkTupleTy UnboxedTuple bndrTys
+            (_, join_bndr) <- mkFreshVar env (fsLit "*j") (mkKontTy argTy)
+                  -- Note [Funky mkPiTypes]
+
+            let join_rhs   = Case (mkWildValBinder argTy) [Alt DEFAULT used_bndrs rhs]
+                dataCon    = tupleCon UnboxedTuple (length bndrTys)
+                join_comm  = mkApp (Var (dataConWorkId dataCon))
+                                   (map Type bndrTys ++ map Var used_bndrs)
+                                   (Return join_bndr)
+            
+            when tracing $ liftCoreM $
+              putMsg (text "created join point" <+> pprBndr LetBind join_bndr $$
+                      ppr join_rhs $$
+                      ppr (Alt altCon bndrs join_comm))
+            
+            env' <- addPolyBind NotTopLevel env (NonRec (BindKont join_bndr join_rhs))
+            return (env', Alt altCon bndrs join_comm)
+            
+commandIsDupable :: DynFlags -> SeqCoreCommand -> Bool
+commandIsDupable dflags c
+  = isJust (go dupAppSize (C c))
+  where
+    go n (C c)             | null (cmdLet c)
+                           = go n  (T (cmdTerm c)) >>= \n' ->
+                             go n' (K (cmdKont c))
+  
+    go n (T (Type {}))     = Just n
+    go n (T (Coercion {})) = Just n
+    go n (T (Var {}))      = decrement n
+    go n (T (Lit lit))     | litIsDupable dflags lit = decrement n
+    
+    go n (K (Tick _ k))    = go n (K k)
+    go n (K (Cast _ k))    = go n (K k)
+    go n (K (App f k))     = go n  (T f) >>= \n' ->
+                             go n' (K k)
+    
+    go _ _ = Nothing
+
+    decrement :: Int -> Maybe Int
+    decrement 0 = Nothing
+    decrement n = Just (n-1)
+
+-- see GHC CoreUtils.lhs
+dupAppSize :: Int
+dupAppSize = 8
 
 kontIsCase :: SimplEnv -> InKont -> Bool
 kontIsCase _env (Case {}) = True
