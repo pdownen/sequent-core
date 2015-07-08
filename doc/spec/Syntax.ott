@@ -83,7 +83,8 @@ vs :: 'TermList_' ::= {{ com Term lists }}
   | </ vi // i />                                ::   :: Terms
 
 e {{ tex k }} :: 'Cont_' ::= {{ com Continuations, \coderef{Syntax.hs}{Kont} }}
-  | ret n                                        ::   :: Return {{ com Continuation variable }}
+  | ret kappa _ t                                ::   :: Return {{ com Continuation variable }}
+    {{ tex [[ret]] \, {[[kappa]]}^{[[t]]} }}
   | applyTo v ; e                                ::   :: App  {{ com Application }}
     {{ tex \$ \, [[v]] ; [[e]] }}
   | |> g ; e                                     ::   :: Cast {{ com Cast }}
@@ -93,10 +94,10 @@ e {{ tex k }} :: 'Cont_' ::= {{ com Continuations, \coderef{Syntax.hs}{Kont} }}
   | e subst                                      :: M :: Subst {{ com Substitution }}
   | applyToAll vs ; e                            :: M :: AppAll {{ com Multiple applications }}
                                                                 {{ tex \$ \, [[vs]] ; [[e]]] }}
+  | S ( n )                                      :: M :: Lookup {{ com Lookup in the runtime store }}
 
 c :: 'Command_' ::= {{ com Commands, \coderef{Syntax.hs}{Command} }}
-  | let bindings in < v | e >                    ::   :: Command {{ com Command }} 
-    {{ tex {\keyword{let}~[[bindings]]~\keyword{in}~\langle [[v]] \mid [[e]] \rangle} }}
+  | let </ bindingi // , // i /> in < v | e >    ::   :: Command {{ com Command }} 
   | < v | e >                                    :: M :: BareCommand {{ com Command (no bindings) }}
     {{ tex \langle [[v]] \mid [[e]] \rangle }}
   | let binding in c                             :: M :: BindOne {{ com Append one binding }}
@@ -239,7 +240,7 @@ O {{ tex \Omega }} :: 'VarEnv_Role_' ::= {{ com Mapping from type variables to r
   | O1 , O2                  :: M :: Concat    {{ com Concatenate two lists }}
 
 S {{ tex \Sigma }} :: 'St_' ::= {{ com Runtime store }}
-  | [ n |-> v ]            ::   :: Binding  {{ com Single binding }}
+  | [ n |-> r ]            ::   :: Binding  {{ com Single binding }}
   | </ Si // , // i />     ::   :: Concat   {{ com Store concatentation }}
 
 %% UTILITY %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -254,8 +255,7 @@ kinded_types {{ tex \overline{(\sigma_i : \kappa_i)}^i }} :: 'Kinded_Types_' ::=
 
 subst :: 'Subst_' ::= {{ com List of substitutions }}
   | [ n |-> t ]        ::   :: TyMapping
-  | [ n |-> v ]        ::   :: ValMapping
-  | [ n |-> e ]        ::   :: KontMapping
+  | [ n |-> r ]        ::   :: RhsMapping
   | </ substi // i />  ::   :: List
 
 liftingsubst :: 'LiftSubst_' ::= {{ com List of lifting substitutions }}
@@ -363,6 +363,9 @@ terminals :: 'terminals_' ::=
   | take         ::   :: take             {{ tex \textsf{take}\! }}
   | coaxrProves  ::   :: coaxrProves      {{ tex \textsf{coaxrProves} }}
   | Just         ::   :: Just             {{ tex \textsf{Just} }}
+  | <            ::   :: langle           {{ tex \langle }}
+  | >            ::   :: rangle           {{ tex \rangle }}
+  | '|'          ::   :: mid              {{ tex \mid }}
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%  Formulae  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -420,6 +423,7 @@ formula :: 'formula_' ::=
     {{ tex [[formula1]] \implies [[formula2]] }}
   | alt1 = alt2                        ::   :: alt_rewrite
   | v1 = v2                            ::   :: v_rewrite
+  | e1 = e2                            ::   :: e_rewrite
   | c1 = c2                            ::   :: command_rewrite
   | subst1 = subst2                    ::   :: subst_rewrite
   | no other case matches              ::   :: no_other_case
@@ -446,16 +450,15 @@ TyCon_AlgTyCon right Coercion_AppCo
 TyCon_PromotedDataCon right Coercion_AppCo
 TyCon_PromotedTyCon right Coercion_AppCo
 
+Environment_Concat <= Environment_Concat
+
 Subst_TyMapping <= Type_TySubstList
-Subst_ValMapping <= Type_TySubstList
+Subst_RhsMapping <= Type_TySubstList
 Subst_List <= Type_TySubstList
 
 Subst_TyMapping <= Type_TySubstListPost
-Subst_ValMapping <= Type_TySubstListPost
+Subst_RhsMapping <= Type_TySubstListPost
 
-%Subst_TyMapping <= Command_SubstList
-%Subst_ValMapping <= Command_SubstList
-%Subst_ContMapping <= Command_SubstList
 Subst_List <= Command_SubstList
 
 Term_Type <= formula_v_rewrite
@@ -463,4 +466,4 @@ Term_Coercion <= formula_v_rewrite
 
 Coercion_TyConAppCo <= Coercion_AppCo
 
-Term_Coercion <= Subst_ValMapping
+Term_Coercion <= Subst_RhsMapping

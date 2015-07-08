@@ -62,10 +62,7 @@ Sequent Core follows GHC's use of the same datatype to represent term-level
 variables and type-level variables:
 
 \gram{
-\ottz
-}
-
-\gram{
+\ottz\\
 \ottn
 }
 
@@ -79,7 +76,17 @@ continuation; in particular, a term \emph{produces} data that a continuation
 
 Terms largely correspond to WHNF terms in Core:
 
-\gram{\ottv}
+\gram{
+\ottrulehead{\ottnt{v}  ,\ \ottnt{w}}{::=}{\ottcom{Terms, \coderef{Syntax.hs}{Term}}}\ottprodnewline
+\ottfirstprodline{|}{[[x_t]]}{}{}{}{\ottcom{Variable}}\ottprodnewline
+\ottprodline{|}{[[K]]}{}{}{}{\ottcom{Constructor}}\ottprodnewline
+\ottprodline{|}{\textsf{lit}}{}{}{}{\ottcom{Literal}}\ottprodnewline
+\ottprodline{|}{\lambda  [[x_t]]  \ottsym{.}  \ottnt{v}}{}{}{}{\ottcom{Abstraction (term)}}\ottprodnewline
+\ottprodline{|}{\lambda  [[alpha_k]]  \ottsym{.}  \ottnt{v}}{}{}{}{\ottcom{Abstraction (type)}}\ottprodnewline
+\ottprodline{|}{\keyword{compute} \, [[kappa_t]]  \ottsym{.}  \ottnt{c}}{}{}{}{\ottcom{Computation}}\ottprodnewline
+\ottprodline{|}{\tau}{}{}{}{\ottcom{Type}}\ottprodnewline
+\ottprodline{|}{\gamma}{}{}{}{\ottcom{Coercion}}
+}
 
 Similarly to Core's \verb|Expr| type, types and coercions should only appear in
 terms that are either function arguments (see the continuation syntax) or
@@ -92,9 +99,17 @@ the literature, this is usually written as a $\mu$-abstraction.)
 
 Continuations represent strict Haskell contexts, only ``inside-out'':
 
-\gram{\otte}
-
-\gram{\ottalt}
+\gram{
+\ottrulehead{k}{::=}{\ottcom{Continuations, \coderef{Syntax.hs}{Kont}}}\ottprodnewline
+\ottfirstprodline{|}{ \keyword{ret}  \, { p }^{ \tau } }{}{}{}{\ottcom{Continuation variable}}\ottprodnewline
+\ottprodline{|}{ \$ \,  \ottnt{v}  ;  k }{}{}{}{\ottcom{Application}}\ottprodnewline
+\ottprodline{|}{ \triangleright  \,  \gamma  ;  k }{}{}{}{\ottcom{Cast}}\ottprodnewline
+\ottprodline{|}{\ottsym{\{}  \ottnt{tick}  \ottsym{\}}  ;  k}{}{}{}{\ottcom{Internal note}}\ottprodnewline
+\ottprodline{|}{\keyword{case} \, \ottkw{as} \, [[x_t]] \, \keyword{of} \, \ottcomp{\ottnt{alt_{\ottmv{i}}}}{\ottmv{i}}}{}{}{}{\ottcom{Pattern match}}
+\\
+\ottrulehead{\ottnt{alt}}{::=}{\ottcom{Case alternative, \coderef{Syntax.hs}{Alt}}}\ottprodnewline
+\ottfirstprodline{|}{[[ Kp </ alphai_ki // i /> </ xj_tj // j /> -> c ]]}{}{}{}{\ottcom{Constructor applied to fresh names}}
+}
 
 Each constructor (besides $[[ret]]$) in \verb|Kont| corresponds to a particular
 fragment of Core (Table \ref{tab:kont-vs-kont}).
@@ -107,7 +122,7 @@ Continuation & Context \\
 \([[applyTo v ; e]]\) & \( e [ \square~v ] \) \\
 \([[|> g ; e ]]\) & \( e [ \square [[|>]] \gamma ] \) \\
 \([[{ tick } ; e]]\) & \( e [ \square_{\{\mathit{tick}\}} ] \) \\
-\([[case as n of </ alti // i />]]\) & \( \keyword{case}~\square~\keyword{as}~n~\keyword{of}~\overline{alt_i}^{\;i} \)
+\([[case as x_t of </ alti // i />]]\) & \( \keyword{case}~\square~\keyword{as}~[[x_t]]~\keyword{of}~\overline{alt_i}^{\,i} \)
 \end{tabular}
 \caption{Continuations in Dual System FC and equivalent contexts in System FC.}
 \label{tab:kont-vs-kont}
@@ -116,13 +131,10 @@ Continuation & Context \\
 Finally, a \verb|Command| describes the interaction between a value and its
 continuation; in addition, it may introduce bindings into the context:
 
-\gram{\ottc}
-
-\gram{\ottbindings}
-
-\gram{\ottbinding}
-
-\gram{\ottr}
+\gram{
+\ottc\\
+\ottbinding\\
+\ottr}
 
 Some of the invariants in the Core datatypes carry over into Sequent Core:
 \begin{itemize}

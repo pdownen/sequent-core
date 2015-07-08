@@ -153,12 +153,12 @@ defn G  |- cm c ::   :: lintCoreCommand :: 'Cm_'
   {{ tex [[G]] \labeledjudge{cm} [[c]] }}
 by
 
-G |-binds bindings
-G' = G, vars_of_list bindings
+G |-binds </ bindingi // i />
+G' = G, vars_of_list </ bindingi // i />
 G' |-vl v : t
 G' |-ct e : t
 ------------- :: Cut
-G |-cm let bindings in < v | e >
+G |-cm let </ bindingi // i /> in < v | e >
 
 defn G  |- name n ok ::  :: lintSingleBinding_lintBinder :: 'Name_'
   {{ com Name consistency check, \coderef{coreSyn/CoreLint.lhs}{lintSingleBinding\#lintBinder} }}
@@ -454,13 +454,14 @@ G; t |-altern lit -> c
 T = dataConTyCon K
 not (isNewTyCon T)
 t1 = dataConRepType K
-t2 = t1 {</ sj // j />}
-</ G |-bnd ni ok // i />
-G' = G, </ ni // i />
-G' |-altbnd </ ni // i /> : t2 ~> T </ sj // j />
+t2 = t1 {</ skk // kk />}
+</ G |-bnd alphai_ki ok // i />
+</ G |-bnd xj_tj ok // j />
+G' = G, </ alphai_ki // i />, </ xj_tj // j />
+G' |-altbnd </ alphai_ki // i />, </ xj_tj // j /> : t2 ~> T </ skk // kk />
 G' |-cm c
 --------------------------------------- :: DataAlt
-G; T </ sj // j /> |-altern K </ ni // i /> -> c
+G; T </ skk // kk /> |-altern K </ alphai_ki // i /> </ xj_tj // j /> -> c
 
 defn t' = t { </ si // , // i /> } ::  :: applyTys :: 'ApplyTys_'
   {{ com Telescope substitution, \coderef{types/Type.lhs}{applyTys} }}
