@@ -25,6 +25,7 @@ import Language.SequentCore.Pretty ()
 import Language.SequentCore.Simpl.ExprSize
 import Language.SequentCore.Syntax
 import Language.SequentCore.Translate
+import Language.SequentCore.WiredIn
 
 import BasicTypes ( TopLevelFlag(..), RecFlag(..)
                   , isTopLevel, isNotTopLevel, isNonRec )
@@ -168,15 +169,19 @@ enterScope :: SimplEnv -> InVar -> (SimplEnv, OutVar)
 enterScope env x
   = (env', x')
   where
-    SimplEnv { se_idSubst = ids, se_tvSubst = tvs, se_cvSubst = cvs
+    SimplEnv { se_idSubst = ids, se_kvSubst = kvs
+             , se_tvSubst = tvs, se_cvSubst = cvs
              , se_inScope = ins, se_defs    = defs } = env
     x1    = uniqAway ins x
     x'    = substIdType env x1
     env'  | isTyVar x = env { se_tvSubst = tvs', se_inScope = ins', se_defs = defs' }
           | isCoVar x = env { se_cvSubst = cvs', se_inScope = ins', se_defs = defs' }
+          | isKontId x= env { se_kvSubst = kvs', se_inScope = ins', se_defs = defs' }
           | otherwise = env { se_idSubst = ids', se_inScope = ins', se_defs = defs' }
     ids'  | x' /= x   = extendVarEnv ids x (DoneId x')
           | otherwise = delVarEnv ids x
+    kvs'  | x' /= x   = extendVarEnv kvs x (DoneId x')
+          | otherwise = delVarEnv kvs x
     tvs'  | x' /= x   = extendVarEnv tvs x (Type.mkTyVarTy x')
           | otherwise = delVarEnv tvs x
     cvs'  | x' /= x   = extendVarEnv cvs x (Coercion.mkCoVarCo x')
@@ -274,14 +279,15 @@ extendKvSubst env x rhs
 zapSubstEnvs :: SimplEnv -> SimplEnv
 zapSubstEnvs env
   = env { se_idSubst = emptyVarEnv
+        , se_kvSubst = emptyVarEnv
         , se_tvSubst = emptyVarEnv
-        , se_cvSubst = emptyVarEnv
-        , se_retId   = Nothing }
+        , se_cvSubst = emptyVarEnv }
 
-setSubstEnvs :: SimplEnv -> SimplIdSubst -> TvSubstEnv -> CvSubstEnv
-             -> Maybe KontId -> SimplEnv
-setSubstEnvs env ids tvs cvs k
+setSubstEnvs :: SimplEnv -> SimplIdSubst -> SimplKvSubst
+             -> TvSubstEnv -> CvSubstEnv -> Maybe KontId -> SimplEnv
+setSubstEnvs env ids kvs tvs cvs k
   = env { se_idSubst = ids
+        , se_kvSubst = kvs
         , se_tvSubst = tvs
         , se_cvSubst = cvs
         , se_retId   = k }
@@ -314,9 +320,9 @@ setKont env k = env { se_retId = Just k }
 retType :: SimplEnv -> Type
 retType env
   | Just k <- se_retId env
-  = case Type.splitFunTy_maybe (idType k) of
-      Just (argTy, _) -> substTy env argTy
-      Nothing         -> pprPanic "retType" (pprBndr LetBind k)
+  = case isKontTy_maybe (idType k) of
+      Just argTy -> substTy env argTy
+      Nothing    -> pprPanic "retType" (pprBndr LetBind k)
   | otherwise
   = panic "retType at top level"
 
@@ -326,6 +332,7 @@ staticPart = StaticEnv
 setStaticPart :: SimplEnv -> StaticEnv -> SimplEnv
 setStaticPart dest (StaticEnv src)
   = dest { se_idSubst = se_idSubst src
+         , se_kvSubst = se_kvSubst src
          , se_tvSubst = se_tvSubst src
          , se_cvSubst = se_cvSubst src
          , se_retId   = se_retId   src }
