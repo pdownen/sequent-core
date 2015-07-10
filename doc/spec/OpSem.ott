@@ -27,8 +27,15 @@ S(n) = v
 ----------------- :: Var
 S |- < n | e > --> < v | e >
 
+S(kappa_t) = e
+----------------- :: Return
+S |- < v | ret kappa_t > --> < v | e >
+
 ----------------------------- :: Beta
 S |- < \ n . v | applyTo v' ; e > --> <v [ n |-> v' ] | e >
+
+----------------------------- :: Compute
+S |- < compute kappa_t . c | e > --> c [ kappa_t |-> e ]
 
 g0 = sym (nth 0 g)
 g1 = nth 1 g
@@ -48,16 +55,16 @@ g2 = nth 1 g
 S |- < v | |> g; applyTo g'; e > --> < v | applyTo (g0 ;; g' ;; g1); |> g2; e >
 
 ------------------------------------------------------------ :: LetNonRec
-S |- let n = w in c --> c [n |-> w]
+S |- let n = r in c --> c [n |-> r]
 
 
-S, </ [ ni |-> vi ] // i /> |- c --> c'
+S, </ [ ni |-> ri ] // i /> |- c --> c'
 --------------------------------------- :: LetRec
-S |- let rec </ ni = vi // i /> in c --> let rec </ ni = vi // i /> in c'
+S |- let rec </ ni = ri // i /> in c --> let rec </ ni = ri // i /> in c'
 
 fv(c) \inter </ ni // i /> = empty
 ------------------------------------------ :: LetRecReturn
-S |- let rec </ ni = vi // i /> in c --> c
+S |- let rec </ ni = ri // i /> in c --> c
 
 altbb = K </ alphaj_kj // j /> </ xkk_tkk // kk /> -> c
 subst = [n |-> v] </ [ alphaj_kj |-> sj ] // j /> </ [xkk_tkk |-> vkk] // kk />
@@ -75,6 +82,6 @@ S |- < v | case as n of </ alti // i /> > --> c [n |-> v]
 
 T </ taa // aa /> ~#k T </ t'aa // aa /> = coercionKind g
 forall </ alphaaa_kaa // aa />. forall </ betabb_k'bb // bb />. </ t1cc // cc /> @-> T </ alphaaa_kaa // aa /> = dataConRepType K
-</ v'cc = compute ncc . < vcc | |> (t1cc @ </ [alphaaa_kaa |-> nth aa g] // aa /> </ [betabb_k'bb |-> <sbb>_Nom] // bb />); ret ncc > // cc /> 
+</ v'cc = compute kappacc_t0cc . < vcc | |> (t1cc @ </ [alphaaa_kaa |-> nth aa g] // aa /> </ [betabb_k'bb |-> <sbb>_Nom] // bb />); ret kappacc_t0cc > // cc /> 
 --------------------------- :: CasePush
 S |- < K | applyToAll </ taa // aa /> </ sbb // bb /> </ vcc // cc /> ; |> g; case as n of </ alti // i /> > --> < K | applyToAll </ t'aa // aa /> </ sbb // bb /> </ v'cc // cc /> ; case as n of </ alti // i /> >
