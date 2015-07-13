@@ -158,7 +158,7 @@ simplTerm env (Coercion co)
 simplTerm env (Compute k comm)
   = do
     let (env', k') = enterScope env k
-    comm' <- simplCommandNoFloats (setKont env' k) comm
+    comm' <- simplCommandNoFloats (setKont env' k') comm
     return (env, mkCompute k' comm')
 simplTerm env v
   = do
