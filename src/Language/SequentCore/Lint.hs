@@ -60,7 +60,7 @@ extendLintEnv :: LintEnv -> BindPair Var -> LintEnv
 extendLintEnv env (BindTerm bndr _term)
   = mapTermLintEnv (\ent -> extendTvInScope ent bndr) env
 extendLintEnv env (BindKont bndr _kont)
-  = mapTermLintEnv (\enk -> extendTvInScope enk bndr) env
+  = mapKontLintEnv (\enk -> extendTvInScope enk bndr) env
 
 extendLintEnvList :: LintEnv -> [BindPair Var] -> LintEnv
 extendLintEnvList = foldr (flip extendLintEnv)
@@ -88,7 +88,7 @@ lintCoreBind env (NonRec pair)
         bndrTy = substTy (termEnv env) (idType bndr)
         bndr'  = bndr `setIdType` bndrTy
         pair'  = pair { binderOfPair = bndr' }
-        env'   = extendLintEnv env pair
+        env'   = extendLintEnv env pair'
     void $ lintCoreBindPair env pair'
     return env'
 lintCoreBind env (Rec pairs)
@@ -97,7 +97,7 @@ lintCoreBind env (Rec pairs)
         bndrTys = map (substTy (termEnv env) . idType) bndrs
         bndrs'  = zipWith setIdType bndrs bndrTys
         pairs'  = zipWith (\pair bndr' -> pair { binderOfPair = bndr' }) pairs bndrs'
-        env'    = extendLintEnvList env pairs
+        env'    = extendLintEnvList env pairs'
     rhsTys <- mapM (lintCoreBindPair env') pairs'
     forM_ (zip3 bndrs bndrTys rhsTys) $ \(bndr, bndrTy, rhsTy) ->
       checkRhsType bndr bndrTy rhsTy
@@ -204,7 +204,7 @@ lintCoreKont desc env ty (Return k)
       else Left $ desc <> colon <+> text "cont variable" <+> pprBndr LetBind k <+> text "bound as"
                                                          <+> pprBndr LetBind k'
   | otherwise
-  = Left $ text "not found in context:" <+> pprBndr LetBind k
+  = Left $ desc <> colon <+> text "not found in context:" <+> pprBndr LetBind k
 lintCoreKont desc env ty (App (Type tyArg) kont)
   | Just (tyVar, resTy) <- splitForAllTy_maybe (substTy (termEnv env) ty)
   = do
