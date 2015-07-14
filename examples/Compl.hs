@@ -1,4 +1,4 @@
-{-# OPTIONS_GHC -O0 -dcore-lint #-}
+{-# OPTIONS_GHC -O2 -dcore-lint #-}
 
 module Main (main, f, odd) where
 

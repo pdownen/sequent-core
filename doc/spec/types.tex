@@ -1,0 +1,740 @@
+\documentclass{article}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{proof}
+\usepackage{hyperref}
+\usepackage{preamble}
+
+\begin{document}
+
+\title{Typing Dual System FC and Sequent Core}
+
+\maketitle
+
+\section{Syntax}
+\label{sec:syntax}
+
+\begin{figure}[h]
+\centering
+\begin{gather*}
+\begin{aligned}
+  x, y, z, f, g, h, K &\in Var
+  \\
+  q, r &\in KontVar
+  \\
+  a, b, T &\in TypeVar
+  \\
+  \com &\in Command
+  &
+  &::= \mcut{\tm}{\ko}{\binds}
+  \\
+  \tm &\in Term
+  &
+  &::= x
+  \Alt \fn{\ann x \ty} \tm
+  \Alt \compute{\ann q \ty} \com
+  \Alt \lit
+  \Alt \ty
+  \Alt \cn
+  \\
+  \ko &\in Kont
+  &
+  &::= q
+  \Alt \app{\tm}{\ko}
+  \Alt \koerce{\cn}{\ko}
+  \Alt \caseas{\ann x \ty}{\alts}
+  \\
+  \binds &\in Bindings
+  &
+  &::= \vect[i]{\abind_i}
+  \\
+  \abind &\in Binding
+  &
+  &::= \bind{\ann x \ty}{\tm}
+  \Alt \Rec \vect[i]{\bind{\ann{x_i}{\ty_i}}{\tm_i}}
+  \Alt \bind{\ann q \ty}{\ko}
+  \Alt \Rec \vect[i]{\bind{\ann{q_i}{\ty_i}}{\ko_i}}
+  \\
+  \alts &\in Alternatives
+  &
+  &::= \vect[i]{\analt_i}
+  \\
+  \analt &\in Alternative
+  &
+  &::= \alt{\blank}{\com}
+  \Alt \alt{K ~ \vect[i]{\ann{b_i}{\ki_i}} ~ \vect[j]{\ann{x_j}{\ty_j}}}{\com}
+  \Alt \alt{\lit}{\com}
+  \\
+  \ty &\in Type
+  &
+  &::= \dots
+  \\
+  \ki &\in Kind
+  &
+  &::= \dots
+  \\
+  \cn &\in Coercion
+  &
+  &::= \dots
+  \\
+  \decls &\in Declarations
+  &
+  &::= \vect[i]{\decl_i}
+  \\
+  \decl &\in Declaration
+  &
+  &::= \dots
+  \\
+  \pgm &\in Program
+  &
+  &::= \decls; \com
+\end{aligned}
+\end{gather*}
+\caption{Syntax of Dual System FC}
+\label{fig:dual-fc-syntax}
+\end{figure}
+
+The syntax for Dual System FC are shown in Figure~\ref{fig:dual-fc-syntax}.
+Types, kinds, coercions, and declarations are unchanged by the sequent calculus
+representation, so they are elided here.  Note that data constructors, written
+$K$, are treated as a special sort of variable in the syntax, and additionally
+type constructors, written $T$, are treated as a special sort of type variable.
+We use some conventional shorthands to make programs easier to read:
+\begin{itemize}
+\item If the type annotations on variables, \emph{ie} the $\ty$ in $\ann x \ty$,
+  are not important to a particular example, we will often omit them.
+\item The function call constructor $\app{\blank}{\blank}$ associates to the
+  right, so $\app{1}{\app{2}{\app{3}{q}}}$ is the same as
+  $\app{1}{(\app{2}{(\app{3}{q})})}$.  Similarly, coercion continuations
+  associate to the right as well, so that $\koerce{\cn_1}{\koerce{\cn_2}{q}}$ is
+  the same as $\koerce{\cn_1}{(\koerce{\cn_2}{q})}$.  Both function calls and
+  coercions share the same precedence and may be intermixed, so that
+  $\app{1}{\koerce{\cn_2}{\app{3}{q}}}$ is the same as
+  $\app{1}{(\koerce{\cn_2}{(\app{3}{q})})}$.
+\item If a command does not have any associated bindings with it, so that
+  $\binds$ is empty in $\mcut{\binds}{\tm}{\ko}$, then we will omit the $\Let$
+  form altogether and just write $\cut{\tm}{\ko}$.
+\item We will not always write the binding variable $\ann x \ty$ in the case
+  continuation $\caseas{\ann x \ty}{\alts}$ when it turns out that $x$ is never
+  referenced in $\alts$ or $\alts$, instead writing $\Case\alts$.  If instead
+  $\ann x \ty$ is only referenced in the default alternative
+  $\alt{\blank}{\com}$ in $\alts$, we will prefer to write $\ann x \ty$ in place
+  of the wildcard $\blank$ pattern.  This often arises in a case continuation
+  with \emph{only} a default alternative,
+  $\caseas{\ann x \ty}{\alt{\blank}{\com}}$, which we write as the shortened
+  $\Case\alt{\ann x \ty}{\com}$.
+\end{itemize}
+
+\section{Scope and exit analysis}
+\label{sec:scope-analysis}
+
+\begin{figure}[h]
+\centering
+\begin{gather*}
+\begin{aligned}
+  \Gamma \in& Environment
+  &
+  &::= \mt
+  \Alt \Gamma, x
+  \Alt \Gamma, a
+  \\
+  \Delta \in& KoEnvironment
+  &
+  &::= \mt
+  \Alt \Delta, q
+\end{aligned}
+\end{gather*}
+
+Term scoping: $\Gamma \vdash \tm \Ok$
+\begin{gather*}
+  \infer
+  {\Gamma \vdash x \Ok}
+  {x \in \Gamma}
+  \qquad
+  \axiom{\Gamma \vdash \lit \Ok}
+  \qquad
+  \infer
+  {\Gamma \vdash \compute q \com \Ok}
+  {
+    \Gamma; q \vdash \com \Ok
+  }
+  \qquad
+  \infer
+  {\Gamma \vdash \fn x \tm \Ok}
+  {
+    \Gamma, x \vdash \tm \Ok
+  }
+  \qquad
+  \infer
+  {\Gamma \vdash \fn a \tm \Ok}
+  {
+    \Gamma, a \vdash \tm \Ok
+  }
+  % \qquad
+  % \infer
+  % {\Gamma \vdash \fn \cn \tm \Ok}
+  % {
+  %   \Gamma, \cn \vdash \tm \Ok
+  % }
+\end{gather*}
+
+Continuation scoping: $\Gamma; \Delta \vdash \ko \Ok$
+\begin{gather*}
+  \infer
+  {\Gamma;\Delta \vdash q \Ok}
+  {q \in \Delta}
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \app{\tm}{\ko} \Ok}
+  {
+    \Gamma \vdash \tm \Ok
+    &
+    \Gamma;\Delta \vdash \ko \Ok
+  }
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \app{\ty}{\ko} \Ok}
+  {
+    \Gamma \vdash \ty \Ok
+    &
+    \Gamma;\Delta \vdash \ko \Ok
+  }
+  % \qquad
+  % \infer
+  % {\Gamma;\Delta \vdash \app{\cn}{\ko} \Ok}
+  % {
+  %   \Gamma \vdash \cn \Ok
+  %   &
+  %   \Gamma;\Delta \vdash \ko \Ok
+  % }
+  \\\\
+  \infer
+  {\Gamma;\Delta \vdash \koerce{\cn}{\ko} \Ok}
+  {
+    \Gamma \vdash \cn \Ok
+    &
+    \Gamma;\Delta \vdash \ko \Ok
+  }
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \caseas{x}{\alts} \Ok}
+  {
+    \Gamma, x;\Delta \vdash \alts \Ok
+  }
+\end{gather*}
+
+Command scoping: $\Gamma; \Delta \vdash \com \Ok$
+\begin{gather*}
+  \infer
+  {\Gamma;\Delta \vdash \mcut{\tm}{\ko}{\binds} \Ok}
+  {
+    \Gamma;\Delta \vdash \binds : \Gamma';\Delta'
+    &
+    \Gamma,\Gamma' \vdash \tm \Ok
+    &
+    \Gamma,\Gamma'; \Delta,\Delta' \vdash \ko \Ok
+  }
+\end{gather*}
+
+
+\emph{Further rules for $\Gamma \vdash \ty \Ok$ and
+  $\Gamma \vdash \ki \Ok$, $\Gamma \vdash \cn \Ok$}
+\caption{Scope and exit analysis for terms, continuations, and commands}
+\label{fig:scoping-rules}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+
+Binding and alternative scoping:
+$\Gamma; \Delta \vdash \abind : \Gamma'; \Delta'$ and
+$\Gamma; \Delta \vdash \analt \Ok$
+\begin{gather*}
+  \axiom{\Gamma;\Delta \vdash \mt : \mt;\mt}
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \binds; \abind : \Gamma'';\Delta''}
+  {
+    \Gamma;\Delta \vdash \binds : \Gamma';\Delta'
+    &
+    \Gamma';\Delta' \vdash \abind : \Gamma'';\Delta''
+  }
+\end{gather*}
+\begin{gather*}
+  \infer
+  {\Gamma;\Delta \vdash \bind{x}{\tm} : \Gamma,x;\Delta}
+  {\Gamma \vdash \tm \Ok}
+  \qquad
+  \infer
+  {
+    \Gamma;\Delta
+    \vdash
+    \Rec\vect[i]{\bind{x_i}{\tm_i}}
+    :
+    \Gamma,\vect[i]{x_i};\Delta
+  }
+  {
+    \vect[i]
+    {
+      \Gamma, \vect[j]{x_j} \vdash \tm_i \Ok
+    }
+  }
+  \\\\
+  \infer
+  {\Gamma;\Delta \vdash \bind{q}{\ko} : \Gamma;\Delta,q}
+  {\Gamma;\Delta \vdash \ko \Ok}
+  \qquad
+  \infer
+  {
+    \Gamma;\Delta
+    \vdash
+    \Rec\vect[i]{\bind{q_i}{\ko_i}}
+    :
+    \Gamma;\Delta,\vect[i]{q_i}
+  }
+  {
+    \vect[i]
+    {
+      \Gamma;\Delta,\vect[j]{q_j} \vdash \ko_i \Ok
+    }
+  }  
+\end{gather*}
+\begin{gather*}
+  \infer
+  {\Gamma;\Delta \vdash \vect[i]{\analt_i} \Ok}
+  {
+    \vect[i]{\Gamma;\Delta \vdash \analt_i \Ok}
+  }
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \alt{\blank}{\com} \Ok}
+  {\Gamma;\Delta \vdash \com \Ok}
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \alt{K ~ \vect[i]{b_i} \vect[i]{x_i}}{\com} \Ok}
+  {\Gamma,\vect[i]{b_i},\vect[i]{x_i};\Delta \vdash \com \Ok}
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \alt{\lit}{\com} \Ok}
+  {\Gamma;\Delta \vdash \com \Ok}
+\end{gather*}
+
+Program scoping: $\Gamma;\Delta \vdash \pgm \Ok$
+\begin{gather*}
+  \infer
+  {\Gamma;\Delta \vdash \decls; c \Ok}
+  {
+    \Gamma \vdash \decls: \Gamma'
+    &
+    \Gamma';\Delta \vdash c \Ok
+  }
+\end{gather*}
+
+\emph{Further rules for $\Gamma \vdash \decls : \Gamma'$ and
+  $\Gamma \vdash \decl : \Gamma'$.}
+\caption{Scope and exit analysis for bindings, alternatives, and
+  programs}
+\label{fig:scoping-rules-binds}
+\end{figure}
+
+The scoping rules for variables are shown in Figures~\ref{fig:scoping-rules} and
+\ref{fig:scoping-rules-binds}, where the rules for scoping inside types, kinds,
+coercions, and declarations are elided.  Continuation variables are treated
+differently from the other sorts of variables, being placed in a separate
+environment $\Delta$, in order to prevent non-functional uses of control flow.
+
+Besides the normal rules for checking variable scope, these rules effectively
+also perform an \emph{exit analysis} on a program (bindings, terms, commands,
+\emph{etc}).  The one major restriction that we enforce is that terms must
+always have a \emph{unique} exit point and cannot jump outside their scope.  The
+intuition is:
+\begin{quote}
+  Terms cannot contain any references to free continuation variables.
+\end{quote}
+This restriction makes sure that $\lambda$-abstractions cannot close over
+continuation variables available from its context, so that bound continuations
+do not escape through a returned $\lambda$-abstraction.  Additionally, in all
+computations $\comp{r}\com$, the underlying command $c$ has precisely one unique
+exit point, namely $r$, which names the result of the computation.
+
+If the command $c$ inside the well-scoped term $\comp{r}\com$ stops execution
+with some value $V$ sent to some continuation variable $q$, then we know that:
+\begin{itemize}
+\item $q$ must be equal to $r$, due to the fact that $r$ is the only allowable
+  free continuation variable inside of $\com$, and
+\item $r$ does not appear free inside the resulting value $V$, again due to the
+  scoping rules for continuation variables inside of a command.
+\end{itemize}
+In the simple case, this means execution of the term $\comp{r}\com$ yields
+$\comp{r}\cut{V}{r}$, which $\eta$-reduces to just the value $V$ by the
+previously mentioned reasoning.  Thus, evaluating a term always results in a
+unique value.
+
+Notice that these scoping rules, while not very complex, still manage to tell us
+something about the expressive capabilities of the language.  For example,
+recursive bindings can be between only terms or only continuations.  But why not
+allow for is mutual recursion between both terms and continuations in the same
+binding block?  It turns out that these scoping rules disallow any sort of
+interesting mutual recursion between terms and continuations because terms are
+\emph{prevented} from referencing continuations within their surrounding (or
+same) binding environment.
+
+For example, in a simple case where we have the recursive bindings:
+\begin{gather*}
+  \Rec \{ \bind{f}{\fn x v}; \bind{q}{\Case\alt{y}{c}} \}
+\end{gather*}
+then by the scoping rules, $q$ may call $f$ through $c$, but $f$ cannot jump
+back to $q$ in $v$ because $\fn x v$ cannot contain the free reference to $q$.
+Therefore, since there is no true mutual recursion between both $f$ and $q$, we
+can break the recursive bindings into two separate blocks with the correct
+scope:
+\begin{gather*}
+  \Rec \{ \bind{f}{\fn x v} \}; \Rec \{ \bind{q}{\Case\alt{y}{c}} \}
+\end{gather*}
+So this limitation results in no loss of expressiveness.  Indeed, we could
+further the partitions into
+\begin{enumerate}
+\item first, the list of term bindings, and
+\item second, the list of continuation bindings,
+\end{enumerate}
+since continuations can refer to previously bound terms but not vice versa.
+However, we do not make this distinction here.
+
+\section{Type checking}
+\label{sec:typing}
+
+\begin{figure}[h]
+\centering
+\begin{align*}
+  \Gamma \in& Environment
+  &
+  &::= \mt
+  \Alt \Gamma, x : \ty
+  \Alt \Gamma, a : \ki
+  \\
+  \Delta \in& KoEnvironment
+  &
+  &::= \mt
+  \Alt \Delta, q : \ty
+\end{align*}
+
+Term typing: $\Gamma \vdash \tm : \ty$
+\begin{gather*}
+  \infer
+  {\Gamma \vdash x : \ty}
+  {
+    x:\ty \in \Gamma
+  }
+  \qquad
+  \infer
+  {\Gamma \vdash \lit : \ty}
+  {\ty = literalType(\lit)}
+  \qquad
+  \infer
+  {\Gamma \vdash \compute{\ann q \ty} \com : \ty}
+  {
+    \Gamma; q:\ty \vdash \com \Ok
+  }
+  \\\\
+  \infer
+  {\Gamma \vdash \fn{\ann x {\ty_1}} \tm : \ty_1 \to \ty_2}
+  {
+    \Gamma, x : \ty_1 \vdash \tm : \ty_2
+  }
+  \qquad
+  \infer
+  {\Gamma \vdash \fn{\ann a \ki} \tm : \forall \ann a \ki. \ty}
+  {
+    \Gamma, a:\ki \vdash \tm : \ty
+  }
+  % \qquad
+  % \infer
+  % {
+  %   \Gamma
+  %   \vdash
+  %   \fn{\ann \gamma {\eqty{\ty_1}{\ty_2}}} \tm
+  %   :
+  %   \eqty{\ty_1}{\ty_2} \gives \ty_3
+  % }
+  % {
+  %   \Gamma, \gamma :  \eqty{\ty_1}{\ty_2} \vdash \tm : \ty_3
+  % }
+\end{gather*}
+
+Continuation typing: $\Gamma; \Delta \vdash \ko : \ty$
+\begin{gather*}
+  \infer
+  {\Gamma;\Delta \vdash q : \ty}
+  {
+    q : \ty \in \Delta
+  }
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \app{\tm}{\ko} : \ty_1 \to \ty_2}
+  {
+    \Gamma \vdash \tm : \ty_1
+    &
+    \Gamma;\Delta \vdash \ko : \ty_2
+  }
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \app{\ty_1}{\ko} : \forall \ann a \ki. \ty_2}
+  {
+    \Gamma \vdash \ty_1 : \ki
+    &
+    \Gamma;\Delta \vdash \ko : \ty_2[\ty_1/a]
+  }
+  \\\\
+  % \infer
+  % {\Gamma;\Delta \vdash \app{\cn}{\ko} : \eqty{\ty_1}{\ty_2} \gives \ty_3}
+  % {
+  %   \Gamma \vdash \cn : \eqty{\ty_1}{\ty_2}
+  %   &
+  %   \Gamma;\Delta \vdash \ko : \ty_3
+  % }
+  % \qquad
+  \infer
+  {\Gamma;\Delta \vdash \koerce{\cn}{\ko} : \ty_1}
+  {
+    \Gamma \vdash \cn : \eqty{\ty_1}{\ty_2}
+    &
+    \Gamma;\Delta \vdash \ko : \ty_2
+  }
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \caseas{\ann x \ty}{\alts} : \ty}
+  {
+    \Gamma, x:\ty;\Delta \vdash \alts : \ty
+  }
+\end{gather*}
+
+Command typing: $\Gamma; \Delta \vdash \com \Ok$
+\begin{gather*}
+  \infer
+  {\Gamma;\Delta \vdash \mcut{\tm}{\ko}{\binds} \Ok}
+  {
+    \Gamma;\Delta \vdash \binds : \Gamma';\Delta'
+    &
+    \Gamma,\Gamma' \vdash \tm : \ty
+    &
+    \Gamma,\Gamma' \vdash \ty : \star
+    &
+    \Gamma,\Gamma'; \Delta,\Delta' \vdash \ko : \ty
+  }
+\end{gather*}
+
+\emph{Further rules for $\Gamma \vdash \ty : \ki$,
+  $\Gamma \vdash \ki : \delta$, and
+  $\Gamma \vdash \cn : \eqty{\ty_1}{\ty_2}$.}
+\caption{Type checking rules for terms, continuations, and commands}
+\label{fig:typing-rules}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+Binding typing: $\Gamma; \Delta \vdash \binds : \Gamma'; \Delta'$ and
+$\Gamma; \Delta \vdash \abind : \Gamma'; \Delta'$
+\begin{gather*}
+  \axiom{\Gamma;\Delta \vdash \mt : \mt;\mt}
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \binds; \abind : \Gamma'';\Delta''}
+  {
+    \Gamma;\Delta \vdash \binds : \Gamma';\Delta'
+    &
+    \Gamma';\Delta' \vdash \abind : \Gamma'';\Delta''
+  }
+\end{gather*}
+\begin{gather*}
+  \infer
+  {\Gamma;\Delta \vdash \bind{\ann x \ty}{\tm} : \Gamma,x:\ty;\Delta}
+  {\Gamma \vdash \tm : \ty}
+  \qquad
+  \infer
+  {
+    \Gamma;\Delta
+    \vdash
+    \Rec\vect[i]{\bind{\ann{x_i}{\ty_i}}{\tm_i}}
+    :
+    \Gamma,\vect[i]{x_i:\ty_i};\Delta
+  }
+  {
+    \vect[i]
+    {
+      \Gamma, \vect[j]{x_j:\ty_j} \vdash \tm_i : \ty_i
+    }
+  }
+  \\\\
+  \infer
+  {\Gamma;\Delta \vdash \bind{\ann q \ty}{\ko} : \Gamma;\Delta,q:\ty}
+  {\Gamma;\Delta \vdash \ko : \ty}
+  \qquad
+  \infer
+  {
+    \Gamma;\Delta
+    \vdash
+    \Rec\vect[i]{\bind{\ann{q_i}{\ty_i}}{\ko_i}}
+    :
+    \Gamma;\Delta,\vect[i]{q_i:\ty_i}
+  }
+  {
+    \vect[i]
+    {
+      \Gamma;\Delta,\vect[j]{q_j} \vdash \ko_i : \ty_i
+    }
+  }  
+\end{gather*}
+
+Alternative typing: $\Gamma; \Delta \vdash \analt : \ty$
+\begin{gather*}
+  \infer
+  {\Gamma;\Delta \vdash \vect[i]{\analt_i} : \ty}
+  {
+    \vect[i]{\Gamma;\Delta \vdash \analt_i : \ty}
+  }
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \alt{\blank}{\com} : \ty}
+  {\Gamma;\Delta \vdash \com \Ok}
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \alt{\lit}{\com} : \ty}
+  {
+    \Gamma \vdash \lit : \ty
+    &
+    \Gamma;\Delta \vdash \com \Ok
+  }
+  \\\\
+  \infer
+  {
+    \Gamma;\Delta
+    \vdash
+    \alt{K ~ \vect[i]{\ann{b_{j'}}{\theta(\ki'_{j'})}} \vect[i]{\ann{x_{i}}{\theta(\ty_{i})}}}{\com}
+    :
+    T ~ \vect[j]{\tau_j}
+  }
+  {
+    K
+    :
+    \vect[j]{\forall\ann{a_j}{\ki_j}.} \vect[j']{\forall\ann{b_{j'}}{\ki'_{j'}}.}
+      \vect[i]{\ty_{i} \to} T ~ \vect[j]{a_j}
+    \in
+    \Gamma
+    &
+    \theta = [\vect[j]{\tau_j/a_j}]
+    &
+    \Gamma,
+    \vect[j']{b_{j'}:\theta(\ki'_{j'})},
+    \vect[i]{x_{i}:\theta(\ty_{i})};
+    \Delta
+    \vdash
+    \com \Ok
+  }
+\end{gather*}
+
+Program typing: $\Gamma;\Delta \vdash \pgm \Ok$
+\begin{gather*}
+  \infer
+  {\Gamma; \Delta \vdash \decls; c \Ok}
+  {
+    \Gamma \vdash \decls : \Gamma'
+    &
+    \Gamma';\Delta \vdash c \Ok
+  }
+\end{gather*}
+
+\emph{Further rules for $\Gamma \vdash \decls : \Gamma'$ and
+  $\Gamma \vdash \decl : \Gamma'$.}
+\caption{Type checking rules for bindings, alternatives, and programs}
+\label{fig:typing-rules-binds}
+\end{figure}
+
+The typing rules for Dual System FC are given in Figures~\ref{fig:typing-rules}
+and \ref{fig:typing-rules-binds}.  The type of a term classifies the results
+that it might produce, and the type of a continuation classifies the results
+that it expects to consume.  Commands do not have a type; they are just $\Ok$ to
+run.  The eventual result of a command is ``escapes'' through one of its
+available continuation variables.  Likewise, a program is a consistent block of
+code that is capable of running, meaning that a program is a command that runs
+with respect to some top-level declarations that introduce type information
+(data types, type synonyms, and axioms).  The normal way to type-check a
+top-level program is $\Gamma_0;\tp:\ty \vdash \pgm \Ok$, where $\Gamma_0$
+specifies any primitive types and values provided by the run-time environment,
+and $\tp:\ty$ is the single, top-level exit path out of the program that expects
+a $\ty$ result.
+
+Compared with System FC, more of the typing rules enjoy the
+\emph{sub-formula property}, meaning that the types appearing in a premise above
+the line of a rule appear somewhere below the line.  This is a natural
+consequence of the sequent calculus as a logic, and was one of the primary
+motivations for its original development.  The expected rules violating the
+sub-formula property are the various \emph{cut} rules that cancel out arbitrary
+types, given by the rules for typing commands and bindings, which effectively
+perform multiple cuts simultaneously.  This is the reason that we must check
+that in the command $\mcut{\binds}{\tm}{\ko}$, not only do $\tm$ and $\ko$ agree
+on the same (inferred) type $\ty$, but that inferred type actually has to be of
+kind $\star$.  The other interesting violators of note are:
+\begin{itemize}
+\item The rule for a polymorphic call-stack,
+  $\app{\ty_1}{\ko} : \forall\ann{a}{\ki}.\ty_2$, which substitutes the
+  specified type $\ty_1$ in for the variable $a$ in $\ty_2$ to get the type for
+  the continuation.  This rule does not have the sub-formula property since
+  $\ty_2[\ty_1/a]$ is a new type generated by the substitution.
+
+  Since universal quantification is dual to existential quantification, the
+  polymorphic call-stack is dual to the existential pair
+  $(\tau_1,\tm) : \exists\ann{a}{\ki}.\tau_2$, and shares the same properties.
+  In particular, $\app{\tau_1}{\ko}$ does not have a \emph{unique} type.  For
+  example, given the continuation variable $r$ of type $Bool$, then the
+  polymorphic call-stack $\app{Int}{\app{1}{\app{2}{q}}}$ can be given the types
+  $\forall \ann{a}{\star}. a \to a \to Bool$,
+  $\forall \ann{a}{\star}. Int \to a \to Bool$, and so on.  So following the
+  bottom-up preference of a sequent calculus presentation, it is easy to type
+  check a polymorphic call-stack if we already know the type of function it
+  expects, but in general it is hard to guess its type.
+
+\item The rules for pattern matching on data types almost suffers from the same
+  issue as for polymorphic call-stacks, due to substitution of the choice for
+  polymorphic type variables.  However, the type annotations on variables bound
+  by pattern matching already specify the specialized types, so the issue is
+  avoided.
+
+  Also note that the problem with existential pairs (or in general, existential
+  data structures) mentioned in the previous point is avoided on the term side.
+  This is because we do not represent data structures directly, as a
+  fully-applied constructor like $(\ty, \tm)$, but rather we represent them
+  indirectly as a constructor evaluated with a polymorphic call-stack,
+  $\cut{(,)}{\app{\ty}{\app{\tm}{q}}}$.  That means that all the troubles with
+  checking existential structures is contained solely with polymorphic call
+  stacks.
+
+\item The rule for coercion continuations, $\koerce{\cn}{\ko} : \ty_1$, in which
+  the type of the continuation $\ko$ is hidden by the coercion.  Interestingly,
+  the typing rules for casting resembles a special sort of function application,
+  both with terms in System FC and continuations in Dual System FC.
+\end{itemize}
+
+Due to the difficulty of inferring the type of a polymorphic call-stack, the
+type checking algorithm for Sequent Core reveals some of its unsymmetrical bias.
+On the one hand, reading the type off of a Sequent Core term (including
+first-class coercions) is straightforward, since they are a subset of Core
+expressions.  On the other hand, checking that a continuation has a known type
+is also straightforward.  This flow of type-reading versus type-checking is
+captured in the structure of a command:
+\begin{itemize}
+\item If the command has any local bindings, gather the types for the bound
+  local variables and confirm that they are bound to well-typed terms and
+  continuations.
+\item Read the type off of the term in the command, confirming that the term is
+  well-typed.
+\item Check that the continuation in the command has the same type as the term.
+\end{itemize}
+This explicit flow of type information (from term to continuation) likely has
+something to do with bi-directional type checking.  Intuitively, this situation
+is identical to the problem with inferring the general existential tuples.  And
+by duality, the solution would be to flip the flow of type information the other
+way: read off the type of the \emph{continuation} that uses an existential
+tuple, and then check the tuple against the inferred type.
+
+\end{document}

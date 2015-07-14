@@ -129,6 +129,9 @@ noParens pp = pp
 instance OutputableBndr b => Outputable (Bind b) where
   ppr = ppr_bind
 
+instance OutputableBndr b => Outputable (BindPair b) where
+  ppr = ppr_binding
+
 instance OutputableBndr b => Outputable (Term b) where
   ppr = ppr_term noParens
 
