@@ -141,6 +141,12 @@ simplCommandNoFloats env comm
     (env', comm') <- simplCommand (zapFloats env) comm
     return $ wrapFloats env' comm'
 
+simplCommandNoKontFloats :: SimplEnv -> InCommand -> SimplM (SimplEnv, OutCommand)
+simplCommandNoKontFloats env comm
+  = do
+    (env', comm') <- simplCommand (zapKontFloats env) comm
+    return (zapKontFloats env', wrapKontFloats env' comm')
+
 simplCommand :: SimplEnv -> InCommand -> SimplM (SimplEnv, OutCommand)
 simplCommand env (Command { cmdLet = binds, cmdTerm = term, cmdKont = kont })
   = do
@@ -161,8 +167,11 @@ simplTerm env (Coercion co)
 simplTerm env (Compute k comm)
   = do
     let (env', k') = enterScope env k
-    comm' <- simplCommandNoFloats (setKont env' k') comm
-    return (env, mkCompute k' comm')
+    -- Terms are closed with respect to continuation variables, so they can
+    -- safely float past this binder. Continuations must *never* float past it,
+    -- however, because they necessarily invoke the continuation bound here.
+    (env'', comm') <- simplCommandNoKontFloats (zapFloats (setKont env' k')) comm
+    return (env `addFloats` env'', mkCompute k' comm')
 simplTerm env v
   = do
     (env', k) <- mkFreshKontId env (fsLit "*termk") ty
@@ -240,8 +249,7 @@ simplNonRecKont :: SimplEnv -> InVar -> StaticEnv -> InKont -> SimplM SimplEnv
 simplNonRecKont env_p p env_k k
   = do
     let (env_p', p') = enterScope env_p p
-    env_p'' <- simplKontBind env_p' p p' env_k k NonRecursive
-    return $ setKont env_p'' p'
+    simplKontBind env_p' p p' env_k k NonRecursive
 
 simplKontBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InKont
               -> RecFlag -> SimplM SimplEnv
@@ -290,30 +298,17 @@ simplKontBind env_p p p' env_k k isRec
     finish new_p new_p' env_k' k'
       = do
         (env_p', k'')
-          <- if not (doFloatKontFromRhs isRec False k' env_k')
-                then do k'' <- wrapFloatsAroundKont env_k' k'
-                        return (env_p, k'')
+          <- if isEmptyFloats env_p -- Can always float through a cont binding
+                then return (env_p, k')
                 else do tick LetFloatFromLet
                         return (env_p `addFloats` env_k', k')
         completeBind env_p' new_p new_p' (Right k'') NotTopLevel
 
-wrapFloatsAroundKont :: SimplEnv -> OutKont -> SimplM OutKont
-wrapFloatsAroundKont env kont
-  | isEmptyFloats env
-  = return kont
-  | otherwise
-  -- Remember, most nontrivial continuations are strict contexts. Therefore it's
-  -- okay to rewrite
-  --   E ==> case of [ a -> <a | E> ]
-  --  *except* when E is a Return or (less commonly) some Casts or Ticks before a
-  -- Return. However, we only call this when something's being floated from a
-  -- continuation, and it seems unlikely we'd be floating a let from a Return.
-  = do
-    let ty = kontType kont
-    (env', x) <- mkFreshVar env (fsLit "$in") ty
-    let comm = wrapFloats env' (mkCommand [] (Var x) kont)
-    return $ Case x [Alt DEFAULT [] comm]
-    
+bindAsCurrentKont :: SimplEnv -> InKontId -> StaticEnv -> InKont -> SimplM SimplEnv
+bindAsCurrentKont env_p p env_k k
+  = let env_p' = extendKvSubst env_p p (Susp env_k k)
+    in return $ env_p' `setKont` p
+
 wrapFloatsAroundTerm :: SimplEnv -> OutTerm -> SimplM OutTerm
 wrapFloatsAroundTerm env term
   | isEmptyFloats env
@@ -533,9 +528,12 @@ simplCut2 env_v term env_k (Case case_bndr [Alt _ bndrs rhs])
       -- Could allow for let bindings,
       -- but the original code in Simplify suggests doing so would be expensive
 
-simplCut2 env_v (Compute k c) env_k kont
+simplCut2 env_v (Compute p c) env_k kont
   = do
-    env_v' <- simplNonRecKont env_v k env_k kont
+    -- TODO This duplicates the continuation, which we emphatically do NOT want
+    -- if it's too big. Need occurrence analysis to figure out whether to
+    -- duplicate.
+    env_v' <- bindAsCurrentKont env_v p env_k kont
     simplCommand env_v' c
 simplCut2 env_v term@(Lit {}) env_k kont
   = simplKontWith (env_v `setStaticPart` env_k) term kont
@@ -567,12 +565,6 @@ matchCase env_v value (_ : alts)
   = matchCase env_v value alts
 matchCase _ _ []
   = Nothing
-
-simplKontNoFloats :: SimplEnv -> InKont -> SimplM OutKont
-simplKontNoFloats env kont
-  = do
-    (env', kont') <- simplKont (zapFloats env) kont
-    wrapFloatsAroundKont env' kont'
 
 simplKont :: SimplEnv -> InKont -> SimplM (SimplEnv, OutKont)
 simplKont env kont
@@ -651,16 +643,6 @@ simplVar env x
     DoneId x' -> return $ Var x'
     Done v -> return v
     Susp stat v -> simplTermNoFloats (env `setStaticPart` stat) v
-
-simplKontId :: SimplEnv -> KontId -> SimplM OutKont
-simplKontId env k
-  | isKontId k
-  = case substKv env k of
-      DoneId k'           -> return $ Return k'
-      Done kont           -> return kont
-      Susp stat kont      -> simplKontNoFloats (env `setStaticPart` stat) kont
-  | otherwise
-  = pprPanic "simplKontId: not a kont id" (ppr k)
 
 -- Based on preInlineUnconditionally in SimplUtils; see comments there
 preInlineUnconditionally :: SimplEnv -> StaticEnv -> InBindPair
@@ -865,7 +847,7 @@ data KontSplitting
   | DupeSome (OutKont -> OutKont) InKont
 
 instance Outputable KontSplitting where
-  ppr (DupeAll kont) = text "Duplicate all"
+  ppr (DupeAll _kont) = text "Duplicate all"
   ppr (DupeNone nodup) = hang (text "Duplicate none:") 2 (ppr nodup)
   ppr (DupeSome dupk nodup)
     = hang (text "Split:") 2 (ppr (dupk dummy) $$ text "----" $$ ppr nodup)
@@ -873,7 +855,7 @@ instance Outputable KontSplitting where
       dummy = Return (mkLamKontId (mkTupleTy BoxedTuple []))
 
 -- | Divide a continuation into some (floated) bindings, a simplified
--- continuation we'll happily copy into many case branches, and possibly an
+-- continuation we'll happily copy into many case branches, and an
 -- unsimplified continuation that we'll keep in a let binding and invoke from
 -- each branch.
 --
@@ -939,12 +921,10 @@ splitDupableKont env kont
 
     go env top kk (Case caseBndr alts)
       -- This is dual to the App case: We have several branches and we want to
-      -- bind each to a join point. 
+      -- bind each to a join point. Even though we're not going to duplicate
+      -- the case itself, we may still later perform a known-constructor
+      -- reduction that effectively duplicates one of the branches.
       = do
-        -- We're doing case-of-case in spirit by moving an outer continuation
-        -- into case branches.
-        tick (CaseOfCase caseBndr)
-        
         -- NOTE: At this point, mkDupableCont in GHC Simplify.lhs calls
         -- prepareCaseCont (ultimately a recursive call) on the outer
         -- continuation. We have no outer continuation for a case; in the
@@ -976,15 +956,16 @@ mkDupableAlts env caseBndr = mapAccumLM (\env' -> mkDupableAlt env' caseBndr) en
 
 mkDupableAlt :: SimplEnv -> OutId -> InAlt -> SimplM (SimplEnv, InAlt)
 mkDupableAlt env caseBndr alt@(Alt altCon bndrs rhs)
-  | Nothing <- se_retId env
-  = pprPanic "mkDupableAlt" (ppr env $$ pprBndr LetBind caseBndr $$ ppr alt)
   | otherwise
   = do
     dflags <- getDynFlags
     if commandIsDupable dflags rhs
       then return (env, alt)
       else do
-        -- TODO Update definition of case binder!
+        -- TODO Update definition of case binder! Importantly, we should update
+        -- the unfolding attached to the lambda-bound version of the case binder
+        -- because, unlike most unfoldings, that one cannot be recreated from
+        -- context.
         
         let used_bndrs | isDeadBinder caseBndr = filter abstract_over bndrs
                        | otherwise = bndrs ++ [caseBndr]
@@ -1008,7 +989,6 @@ mkDupableAlt env caseBndr alt@(Alt altCon bndrs rhs)
             let bndrTys = map idType used_bndrs
                 argTy   = mkTupleTy UnboxedTuple bndrTys
             (_, join_bndr) <- mkFreshVar env (fsLit "*j") (mkKontTy argTy)
-                  -- Note [Funky mkPiTypes]
 
             let join_rhs   = Case (mkWildValBinder argTy) [Alt DEFAULT used_bndrs rhs]
                 dataCon    = tupleCon UnboxedTuple (length bndrTys)

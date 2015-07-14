@@ -22,6 +22,7 @@ Nothing `consMaybe` xs = xs
 pprTraceShort :: String -> SDoc -> a -> a
 -- ^ If debug output is on, show some 'SDoc' on the screen
 pprTraceShort str doc x
+   | True = pprTrace str doc x
    | opt_NoDebugOutput = x
    | otherwise         = pprAndThen unsafeGlobalDynFlags trace str doc x
    
