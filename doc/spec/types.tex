@@ -45,7 +45,7 @@
   \Alt \app{\tm}{\ko}
   \Alt \koerce{\cn}{\ko}
   \Alt \caseas{\ann x \ty}{\alts}
-  \Alt \fnk{\vect[i]{\ann{a_i}{\ki_i}}~\vect[j]{\ann{x_j}{\ty_j}}}{\com}
+  \Alt \fnk{\paks{\vect[i]{\ann{a_i}{\ki_i}}}{\vect[j]{\ann{x_j}{\ty_j}}}}{\com}
   \\
   \binds &\in Bindings
   &
@@ -225,7 +225,7 @@ Continuation scoping: $\Gamma; \Delta \vdash \ko \Ok$
   }
   \qquad
   \infer
-  {\Gamma;\Delta \vdash \fnk{\vect[i]{a_i}~\vect[j]{x_j}} \com \Ok}
+  {\Gamma;\Delta \vdash \fnk{\paks{\vect[i]{a_i}}{\vect[j]{x_j}}} \com \Ok}
   {
     \Gamma,\vect[i]{a_i},\vect[j]{x_j};\Delta \vdash \com \Ok
   }
@@ -517,7 +517,7 @@ Continuation typing: $\Gamma; \Delta \vdash \ko : \sty$
   {
     \Gamma;\Delta
     \vdash
-    \fnk{\vect[i]{a_i:\ki_i}~\vect[j]{x_j:\ty_j}} \com
+    \fnk{\paks{\vect[i]{a_i:\ki_i}}{\vect[j]{x_j:\ty_j}}} \com
     :
     \stackty{\vect[i]{a_i:\ki_i}}{\vect[j]{\ty_j}}
   }
@@ -764,5 +764,205 @@ is identical to the problem with inferring the general existential tuples.  And
 by duality, the solution would be to flip the flow of type information the other
 way: read off the type of the \emph{continuation} that uses an existential
 tuple, and then check the tuple against the inferred type.
+
+\section{Design discussion}
+\label{sec:design-discussion}
+
+\subsection{Join points}
+
+One of the goals of Sequent Core is to provide a good represenation for naming
+join points in a program.  A \emph{join point} is a specified point in the
+control flow of a program where to different possible execution paths join back
+up again.  The purpose of giving a name to these join points is to avoid
+excessive duplication of code and keep code size small.  Since a join point
+represents the future execution path of a program, we would like to model them
+as continuations, and so named join points become named continuations.
+
+The main place where new join points are named are in the branches of a case
+expression.  For example, consider the Core expression
+\begin{align*}
+  e &= \Case e_0 \Of \{ K_1 ~ x ~ y \to e_1; K_2 \to e_2 \}
+\end{align*}
+In Sequent Core, $e$ would be represented as the term $v$:
+\begin{align*}
+  v
+  &=
+  \comp{r}
+    \cut
+    {\comp{q}\com_0}
+    {\Case\Of \{ K_1 ~ x ~ y \to \com_1; K_2 \to \com_2 \}}
+\end{align*}
+where the term $\comp{q}\com_0$ corresponds to the expression $e_0$, and the
+commands $\com_1$ and $\com_2$ correspond to the expressions $e_1$ and $e_2$ run
+in the context of the continuation $r$ which expects the end result returned by
+$e$.  Now, it would be semantically correct to inline the case continuation for
+$q$ inside of $\com_0$, which could open up further simplification.  For
+example, suppose that $\com_0$ is:
+\begin{align*}
+  \com_0
+  &=
+  \cut{z}{\Case\Of \{ True \to \cut{K_1}{\app{5}{\app{10}{q}}}; False \to \cut{z'}{q} \}}
+\end{align*}
+Inlining for $q$ everywhere in $\com_0$ then corresponds to the case-of-case
+transformation performed by GHC on Core expressions.
+
+However, inlining for $q$ everywhere can duplicate the commands $\com_1$ and
+$\com_2$, leading to larger code size!  We only want to inline selectively in
+places where we are confident that inlining the case continuation would lead to
+further simplification, but not elsewhere.  We can achieve selective inlining by
+assigning the continuation to its name, $q$:
+\begin{align*}
+  v
+  &=
+  \comp{r}
+  \Let q = \Case\Of \{ K_1 ~ x ~ y \to \com_1; K_2 \to \com_2 \}
+  \In \com_0
+\end{align*}
+and then follow heuristics to inline for $q$ only in those places that matter.
+In particular, we could just inline inside of the one branch in $\com_0$ which
+provides $q$ with a constructed result, leading to the command:
+\begin{align*}
+  \com_0
+  &=
+  \cut{z}{\Case\Of \{ True \to \com_1[5/x,10/y]; False \to \cut{z'}{q} \}}
+\end{align*}
+In effect, selective inlining has eliminated case analysis on a known case by
+duplicating the command $\com_1$, but not duplicating $\com_2$.
+
+There is still a problem, though: what if the command $\com_1$ is so large that
+this simplification is not worth the duplication?  In that case, we would like
+to form a \emph{new} join point that gives a name to the command $\com_1$, so
+that we may refer to it by name rather than duplicating the entire command.
+Since $\com_1$ is an open command referring to local variables introduced by the
+case analysis, we must first abstract over these local variables.  This is the
+role of the polyadic form of continuation, which is able to recieve multiple
+inputs before running.  In our example, we would move $\com_1$ and $\com_2$ into
+a named, polyadic continuations:
+\begin{gather*}
+\begin{aligned}
+  v
+  &=
+  \comp{r}
+  &
+    \Let
+      p_1 &= \fnk{\pak{x}{y}} \com_1;
+  \\
+  &&
+      p_2 &= \fnk{\pak{}{}} \com_2;
+  \\
+  &&
+      q &= \Case\Of \{
+          K_1 ~ x ~ y \to \cut{\pak{x}{y}}{p_1};
+          K_2 \to \cut{\pak{}{}}{p_2}
+          \}
+  \\
+  &&
+    \In
+    \com_0
+\end{aligned}
+\end{gather*}
+Now, $q$ stands for a small continuation, and so it can be inlined much more
+aggressively.  For example, we can perform a more lightweight inlining into
+$\com_0$:
+\begin{align*}
+  \com_0
+  &=
+  \cut{z}{\Case\Of \{ True \to \cut{\pak{5}{10}}{p_1}; False \to \cut{z'}{q} \}}
+\end{align*}
+which avoids duplicating $\com_1$ at all.
+
+\subsection{Polymorphic-polyadic continuations and the existential stack}
+
+Due to the fact that some constructors to data types contain existentially
+quantified types, it is important that we be able to abstract over a command
+with free type variables as a polymorphic continuation.  Thus, the more general
+form of the $\lambda$-continuation may introduce several type variables in
+addition to term variables.  This means that the stacks which are provided to
+these continuations are effectively a form of existential tuple.  Currently, we
+represent these polymorphic continuations and continuations expecting multiple
+inputs as an uncurried $\lambda$-abstraction.  However, there are multiple other
+design choices which are possible for this purpose:
+\begin{itemize}
+\item Unboxed tuples: Morally, the stack $\pak{1}{\pak{2}{3}}$ for a polyadic
+  continuation is the same as the unboxed tuple $(\# 1, 2, 3 \#)$.  Why then do
+  we bother to introduce a new form of term, and a new type, instead of just
+  using unboxed tuples for this purpose?  The reason is the above-mentioned
+  existentially-quantified types, which lie outside the form of unboxed tuples
+  supported by Core.  We cannot represent
+  $\pak{Int}{\pak{1}{\pak{2}{3}}} : \stackty{a:\star}{a, a, a}$ as an unboxed
+  tuple.
+
+  As a minor advantage, having the special form for existential stacks lets us
+  (actually, requires us to) translate them back into Core as a calling context
+  rather than a value, so $\cut{\pak{1}{\pak{2}{3}}}{q}$ becomes $q ~ 1 ~ 2 ~ 3$
+  instead of $q (\# 1, 2, 3 \#)$.  This results in Core expressions for join
+  points looking closer to what the current GHC simplifier actually produces.
+
+\item Curried vs uncurried: Currently, the continuations which accept
+  existential stacks are written in a totally-uncurried form.  By listing all
+  the paramters that abstract over a command, we are forced to spell out
+  \emph{exactly} the number of inputs that are required by the continuation
+  before any work can be done.
+
+  An alternative design would be to give a curried form of continuations which
+  accept existential stacks.  These would have one of two forms:
+  \begin{itemize}
+  \item $\fnk{\ann x \ty}k$: accept the first element of the stack, which is a
+    term of type $\ty$, as $x$, then pass the rest of the stack to $k$ (i.e.,
+    pop the top element of the stack as $x$ and then continue as $k$)
+  \item $\fnk{\ann a \ki}k$: accept the first element of the stack, which is a
+    type of kind $\ki$, as $a$, and then pass the rest of the stack to $k$
+    (i.e., specialize the type variable $a$ for the continuation $k$)
+  \end{itemize}
+  which could be collapsed like ordinary $\lambda$-abstractions.  To model a
+  unary continuation, like the continuation which accepts the ``end'' of the
+  stack, we could introduce the dual to general computation abstractions.  These
+  are continuations of the form $\letin{\ann x \ty}\com$ which accept an input
+  named $x$ before performing some arbitrary computation $\com$, and correspond
+  to the context $\Let x:\ty = \hole \in e$ in Core.  However, these
+  fundamentally introduce \emph{non-strict} continuations, which is a whole can
+  of worms we have been avoiding thus far.  In the end, it may be worthwhile to
+  introduce these general input continuations for independent reasons, but we
+  leave them out for now.
+
+\item Case alternative: Instead of introducing a special new form of
+  continuations for accepting existential stacks, we could also have added a
+  form of case alternative for matching on the stack.  That way the special
+  continuations $\fnk{\paks{\vect{\ann a \ki}}{\vect{\ann x \ty}}}\com$ would
+  just be written as another form of case continuation
+  $\Case\Of{\paks{\ann a \ki}{\ann x \ty} \to \com}$.  This unification might
+  make sense following the story that existential stacks are just a sort of
+  unboxed data type that are not available in Core, so it makes sense that we
+  would pattern match on them.
+
+  For now we don't fold continuations for existential stacks, but it is unclear
+  if doing so would be a benefit (one less type of continuation to consider) or
+  a hinderance (if they need to be treated differently in enough of the compiler
+  that we effectively special case them anyways).  It is worth keeping this
+  alternative design in mind, to evaluate which of the two options would pan out
+  better in practice.
+\end{itemize}
+
+\subsection{Continuation-closed terms}
+
+Currently, we make the scope and type restriction that forces all terms to never
+reference free continuation variables.  This kind of restriction is necessary to
+ensure that Sequent Core programs correspond directly to Core programs, and do
+not introduce new kinds of control flow that would require a full
+continuation-passin style (CPS) translation back into Core.  However, it is
+probably sufficient to impose this scoping restriction on \emph{values} (and in
+particular, $\lambda$-abstractions).  This would allow for general computation
+terms ($\mu$-abstractions $\comp{q}\com$) to reference continuations in its
+scope in order to produce a (continuation-closed) value.  Since general
+computations cannot escape their scope, due to call-by-need semantics, this
+should be fine and should not require a full CPS translation back into Core.
+
+The scope restriction on general computation terms comes up during translation
+from Core to Sequent Core.  Currently, the restriction forces the continuation
+representing the context of a case expression be let-bound, rather than use a
+$\mu$-abstraction.  This forces more continuations to be abstracted into the
+local let bindings, which in effect introduces more named join points back in
+Core world.  This is probably not bad, since we want to be introducing join
+points anyway, but it is something to keep in mind.
 
 \end{document}
