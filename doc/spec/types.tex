@@ -37,6 +37,7 @@
   \Alt \lit
   \Alt \ty
   \Alt \cn
+  \Alt \paks{\vect[i]{\ty_i}}{\vect[j]{\tm_j}}
   \\
   \ko &\in Kont
   &
@@ -44,6 +45,7 @@
   \Alt \app{\tm}{\ko}
   \Alt \koerce{\cn}{\ko}
   \Alt \caseas{\ann x \ty}{\alts}
+  \Alt \fnk{\vect[i]{\ann{a_i}{\ki_i}}~\vect[j]{\ann{x_j}{\ty_j}}}{\com}
   \\
   \binds &\in Bindings
   &
@@ -53,8 +55,8 @@
   &
   &::= \bind{\ann x \ty}{\tm}
   \Alt \Rec \vect[i]{\bind{\ann{x_i}{\ty_i}}{\tm_i}}
-  \Alt \bind{\ann q \ty}{\ko}
-  \Alt \Rec \vect[i]{\bind{\ann{q_i}{\ty_i}}{\ko_i}}
+  \Alt \bind{\ann q \sty}{\ko}
+  \Alt \Rec \vect[i]{\bind{\ann{q_i}{\sty_i}}{\ko_i}}
   \\
   \alts &\in Alternatives
   &
@@ -69,6 +71,11 @@
   \ty &\in Type
   &
   &::= \dots
+  \\
+  \sty &\in SequentType
+  &
+  &::= \ty
+  \Alt \stackty{\vect[i]{a_i:\ki_i}}{\vect[j]{\ty_j}}
   \\
   \ki &\in Kind
   &
@@ -159,7 +166,7 @@ Term scoping: $\Gamma \vdash \tm \Ok$
   {
     \Gamma; q \vdash \com \Ok
   }
-  \qquad
+  \\\\
   \infer
   {\Gamma \vdash \fn x \tm \Ok}
   {
@@ -171,12 +178,14 @@ Term scoping: $\Gamma \vdash \tm \Ok$
   {
     \Gamma, a \vdash \tm \Ok
   }
-  % \qquad
-  % \infer
-  % {\Gamma \vdash \fn \cn \tm \Ok}
-  % {
-  %   \Gamma, \cn \vdash \tm \Ok
-  % }
+  \qquad
+  \infer
+  {\Gamma \vdash \paks{\vect[i]{\ty_i}}{\vect[j]{\tm_j}} \Ok}
+  {
+    \vect[i]{\Gamma \vdash \ty_i \Ok}
+    &
+    \vect[j]{\Gamma \vdash \tm_j \Ok}
+  }
 \end{gather*}
 
 Continuation scoping: $\Gamma; \Delta \vdash \ko \Ok$
@@ -200,14 +209,6 @@ Continuation scoping: $\Gamma; \Delta \vdash \ko \Ok$
     &
     \Gamma;\Delta \vdash \ko \Ok
   }
-  % \qquad
-  % \infer
-  % {\Gamma;\Delta \vdash \app{\cn}{\ko} \Ok}
-  % {
-  %   \Gamma \vdash \cn \Ok
-  %   &
-  %   \Gamma;\Delta \vdash \ko \Ok
-  % }
   \\\\
   \infer
   {\Gamma;\Delta \vdash \koerce{\cn}{\ko} \Ok}
@@ -221,6 +222,12 @@ Continuation scoping: $\Gamma; \Delta \vdash \ko \Ok$
   {\Gamma;\Delta \vdash \caseas{x}{\alts} \Ok}
   {
     \Gamma, x;\Delta \vdash \alts \Ok
+  }
+  \qquad
+  \infer
+  {\Gamma;\Delta \vdash \fnk{\vect[i]{a_i}~\vect[j]{x_j}} \com \Ok}
+  {
+    \Gamma,\vect[i]{a_i},\vect[j]{x_j};\Delta \vdash \com \Ok
   }
 \end{gather*}
 
@@ -416,10 +423,10 @@ However, we do not make this distinction here.
   \Delta \in& KoEnvironment
   &
   &::= \mt
-  \Alt \Delta, q : \ty
+  \Alt \Delta, q : \sty
 \end{align*}
 
-Term typing: $\Gamma \vdash \tm : \ty$
+Term typing: $\Gamma \vdash \tm : \sty$
 \begin{gather*}
   \infer
   {\Gamma \vdash x : \ty}
@@ -448,26 +455,32 @@ Term typing: $\Gamma \vdash \tm : \ty$
   {
     \Gamma, a:\ki \vdash \tm : \ty
   }
-  % \qquad
-  % \infer
-  % {
-  %   \Gamma
-  %   \vdash
-  %   \fn{\ann \gamma {\eqty{\ty_1}{\ty_2}}} \tm
-  %   :
-  %   \eqty{\ty_1}{\ty_2} \gives \ty_3
-  % }
-  % {
-  %   \Gamma, \gamma :  \eqty{\ty_1}{\ty_2} \vdash \tm : \ty_3
-  % }
+  \qquad
+  \infer
+  {
+    \Gamma
+    \vdash
+    \paks{\vect[i]{\ty_i}}{\vect[j]{\tm_j}}
+    :
+    \stackty{\vect[i]{a_i:\ki_i}}{\vect[j]{\ty'_j}}
+  }
+  {
+    \vect[i]{
+      \Gamma \vdash \ty_i : \ki_i
+    }
+    &
+    \vect[j]{
+      \Gamma \vdash \tm_j : \ty'_j[\vect[i]{\ty_i/a_i}]
+    }
+  }
 \end{gather*}
 
-Continuation typing: $\Gamma; \Delta \vdash \ko : \ty$
+Continuation typing: $\Gamma; \Delta \vdash \ko : \sty$
 \begin{gather*}
   \infer
-  {\Gamma;\Delta \vdash q : \ty}
+  {\Gamma;\Delta \vdash q : \sty}
   {
-    q : \ty \in \Delta
+    q : \sty \in \Delta
   }
   \qquad
   \infer
@@ -486,14 +499,6 @@ Continuation typing: $\Gamma; \Delta \vdash \ko : \ty$
     \Gamma;\Delta \vdash \ko : \ty_2[\ty_1/a]
   }
   \\\\
-  % \infer
-  % {\Gamma;\Delta \vdash \app{\cn}{\ko} : \eqty{\ty_1}{\ty_2} \gives \ty_3}
-  % {
-  %   \Gamma \vdash \cn : \eqty{\ty_1}{\ty_2}
-  %   &
-  %   \Gamma;\Delta \vdash \ko : \ty_3
-  % }
-  % \qquad
   \infer
   {\Gamma;\Delta \vdash \koerce{\cn}{\ko} : \ty_1}
   {
@@ -507,6 +512,18 @@ Continuation typing: $\Gamma; \Delta \vdash \ko : \ty$
   {
     \Gamma, x:\ty;\Delta \vdash \alts : \ty
   }
+  \\\\
+  \infer
+  {
+    \Gamma;\Delta
+    \vdash
+    \fnk{\vect[i]{a_i:\ki_i}~\vect[j]{x_j:\ty_j}} \com
+    :
+    \stackty{\vect[i]{a_i:\ki_i}}{\vect[j]{\ty_j}}
+  }
+  {
+    \Gamma,\vect[i]{a_i:\ki_i},\vect[j]{x_j:\ty_j};\Delta \vdash \com \Ok
+  }
 \end{gather*}
 
 Command typing: $\Gamma; \Delta \vdash \com \Ok$
@@ -516,11 +533,11 @@ Command typing: $\Gamma; \Delta \vdash \com \Ok$
   {
     \Gamma;\Delta \vdash \binds : \Gamma';\Delta'
     &
-    \Gamma,\Gamma' \vdash \tm : \ty
+    \Gamma,\Gamma' \vdash \tm : \sty
     &
-    \Gamma,\Gamma' \vdash \ty : \star
+    \Gamma,\Gamma' \vdash \sty : \star
     &
-    \Gamma,\Gamma'; \Delta,\Delta' \vdash \ko : \ty
+    \Gamma,\Gamma'; \Delta,\Delta' \vdash \ko : \sty
   }
 \end{gather*}
 
@@ -533,6 +550,17 @@ Command typing: $\Gamma; \Delta \vdash \com \Ok$
 
 \begin{figure}[h]
 \centering
+Sequent type kinding: $\Gamma \vdash \sty : \ki$
+\begin{gather*}
+  \infer
+  {\Gamma \vdash \stackty{\vect[i]{a_i:\ki_i}}{\vect[j]{\ty_j}} : \star}
+  {
+    \vect[j]{
+      \Gamma, \vect[i]{a_i:\ki_i} \vdash \ty_j : \star
+    }
+  }
+\end{gather*}
+
 Binding typing: $\Gamma; \Delta \vdash \binds : \Gamma'; \Delta'$ and
 $\Gamma; \Delta \vdash \abind : \Gamma'; \Delta'$
 \begin{gather*}
@@ -567,21 +595,21 @@ $\Gamma; \Delta \vdash \abind : \Gamma'; \Delta'$
   }
   \\\\
   \infer
-  {\Gamma;\Delta \vdash \bind{\ann q \ty}{\ko} : \Gamma;\Delta,q:\ty}
-  {\Gamma;\Delta \vdash \ko : \ty}
+  {\Gamma;\Delta \vdash \bind{\ann q \sty}{\ko} : \Gamma;\Delta,q:\sty}
+  {\Gamma;\Delta \vdash \ko : \sty}
   \qquad
   \infer
   {
     \Gamma;\Delta
     \vdash
-    \Rec\vect[i]{\bind{\ann{q_i}{\ty_i}}{\ko_i}}
+    \Rec\vect[i]{\bind{\ann{q_i}{\sty_i}}{\ko_i}}
     :
-    \Gamma;\Delta,\vect[i]{q_i:\ty_i}
+    \Gamma;\Delta,\vect[i]{q_i:\sty_i}
   }
   {
     \vect[i]
     {
-      \Gamma;\Delta,\vect[j]{q_j} \vdash \ko_i : \ty_i
+      \Gamma;\Delta,\vect[j]{q_j:\sty_i} \vdash \ko_i : \sty_i
     }
   }  
 \end{gather*}
