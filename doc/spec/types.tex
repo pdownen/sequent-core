@@ -701,8 +701,8 @@ motivations for its original development.  The expected rules violating the
 sub-formula property are the various \emph{cut} rules that cancel out arbitrary
 types, given by the rules for typing commands and bindings, which effectively
 perform multiple cuts simultaneously.  This is the reason that we must check
-that in the command $\mcut{\binds}{\tm}{\ko}$, not only do $\tm$ and $\ko$ agree
-on the same (inferred) type $\ty$, but that inferred type actually has to be of
+that in the command $\mcut{\tm}{\ko}{\binds}$, not only do $\tm$ and $\ko$ agree
+on the same (inferred) type $\sty$, but that inferred type actually has to be of
 kind $\star$.  The other interesting violators of note are:
 \begin{itemize}
 \item The rule for a polymorphic call-stack,
@@ -722,6 +722,11 @@ kind $\star$.  The other interesting violators of note are:
   bottom-up preference of a sequent calculus presentation, it is easy to type
   check a polymorphic call-stack if we already know the type of function it
   expects, but in general it is hard to guess its type.
+
+\item The rules for the terms and continuations of existential stacks exhibit
+  exactly the dual issues that are raised for polymorphic call stacks.  This is
+  expected, as they are designed to be a ``dualish'' form of fully-general call
+  stacks.
 
 \item The rules for pattern matching on data types almost suffers from the same
   issue as for polymorphic call-stacks, due to substitution of the choice for
@@ -744,27 +749,44 @@ kind $\star$.  The other interesting violators of note are:
   both with terms in System FC and continuations in Dual System FC.
 \end{itemize}
 
-Due to the difficulty of inferring the type of a polymorphic call-stack, the
-type checking algorithm for Sequent Core reveals some of its unsymmetrical bias.
-On the one hand, reading the type off of a Sequent Core term (including
-first-class coercions) is straightforward, since they are a subset of Core
-expressions.  On the other hand, checking that a continuation has a known type
-is also straightforward.  This flow of type-reading versus type-checking is
-captured in the structure of a command:
+Due to the difficulty of inferring the type of a polymorphic call-stack or an
+existential stack, the type checking algorithm for Sequent Core reveals some
+conditional bias towards terms or continuations.  On the one hand, reading the
+type off of a Sequent Core term is straightforward if it has a Core type, since
+those terms correspond to a subset of Core expressions.  Then, checking that a
+continuation has a known Core type is easy.  On the other hand, reading the type
+off a Sequent Core continuation accepting an existential stack is is
+straightforward for exactly the dual reason.  Then, checking that a term has a
+known existential stack type is easy. This flow of type-reading versus
+type-checking is captured in the structure of a command:
 \begin{itemize}
 \item If the command has any local bindings, gather the types for the bound
   local variables and confirm that they are bound to well-typed terms and
   continuations.
-\item Read the type off of the term in the command, confirming that the term is
-  well-typed.
-\item Check that the continuation in the command has the same type as the term.
+\item Determine whether the main term and continuation of the command share some
+  (as of yet unknown) Core type or share some (as of yet unknown) existential
+  stack type.  This is a simple syntactic check on the structure of the term and
+  continuation.  If they both share some Core type:
+  \begin{itemize}
+  \item Read the type off of the term, thereby confirming that it is well-typed.
+  \item Check that the continuation has the same type as the term.
+  \end{itemize}
+  If they both share some existential stack type:
+  \begin{itemize}
+  \item Read off the type of the continuation, thereby confirming that it is
+    well-typed.
+  \item Check that the term has the same type as the continuation.
+  \end{itemize}
+  Otherwise, the command is clearly ill-typed, since there is no way for the
+  term and continuation to share some common type.
 \end{itemize}
-This explicit flow of type information (from term to continuation) likely has
-something to do with bi-directional type checking.  Intuitively, this situation
-is identical to the problem with inferring the general existential tuples.  And
-by duality, the solution would be to flip the flow of type information the other
-way: read off the type of the \emph{continuation} that uses an existential
-tuple, and then check the tuple against the inferred type.
+This explicit flow of type information (from term to continuation or
+continuation to term, depending) likely has something to do with bi-directional
+type checking.  Intuitively, the problem with inferring the type of polymorphic
+call stacks is identical to the problem with inferring the general existential
+tuples in the sequent calculus.  Thus, solving the problem with forall gives us
+a solution for exists by duality in the sequent calculus.  Symmetry saves the
+day!
 
 \section{Translation}
 \label{sec:translation}
