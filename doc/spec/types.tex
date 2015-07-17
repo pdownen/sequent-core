@@ -2,6 +2,7 @@
 
 \usepackage{amsmath}
 \usepackage{amssymb}
+\usepackage{stmaryrd}
 \usepackage{proof}
 \usepackage{hyperref}
 \usepackage{preamble}
@@ -764,6 +765,458 @@ is identical to the problem with inferring the general existential tuples.  And
 by duality, the solution would be to flip the flow of type information the other
 way: read off the type of the \emph{continuation} that uses an existential
 tuple, and then check the tuple against the inferred type.
+
+\section{Translation}
+\label{sec:translation}
+
+An important aspect of Sequent Core is that it can be translated both to and
+from Core, which has some benefits:
+\begin{itemize}
+\item We are sure that Sequent Core are at least as expressive as Core, so that
+  it can represent every Core program and type.
+\item We are sure that Sequent Core is not \emph{more} expressive than Core,
+  which is a prevailing concern since the sequent calculus (like
+  continuation-passing style) is a natural setting for first-class control.  We
+  don't want to introduce unusual control flow that can't be represented at
+  least somewhat directly in Core.
+\item The compiler can process a program represented in Core for a bit, then
+  represented in Sequent Core, then back in Core again.  This capability is what
+  makes our use of the plugin architecture possible, so that we can add Sequent
+  Core to GHC without modifying GHC itself!
+\end{itemize}
+
+Let's start with the simplest translation of Core into Sequent Core: a typed,
+compositional translation of Core expressions into Sequent Core terms,
+$Seq\trans{\expr : \ty}$.  Translating apparent%
+\footnote{We say ``apparent'' because the structures of a data type are not
+  expressed directly in Core, but are written as a chain of function
+  applications with a constructor (a special sort of variable identifier) at the
+  head.  Since $K~x~y~z$ ``looks like'' a function application at first glance,
+  it is apparently not a value even though in actuality it is.}
+ %
+values from Core is not hard:
+\begin{align*}
+  Seq\trans{x : \ty} &= x
+  \\
+  Seq\trans{\lit : \ty} &= \lit
+  \\
+  Seq\trans{(\fn{\ann{x}{\ty}} \expr) : \ty \to \ty'}
+  &=
+  \fn{\ann{x}{\ty}} Seq\trans{\expr : \ty'}
+  \\
+  Seq\trans{(\fn{\ann{a}{\ki}} \expr) : \forall \ann{a}{\ki}. \ty}
+  &=
+  \fn{\ann{a}{\ki}} Seq\trans{\expr : \ty}
+  \\
+  Seq\trans{\cn : \eqty{\ty}{\ty'}} &= \cn
+  \\
+  Seq\trans{\ty : \ki} &= \ty
+\end{align*}
+Rather, most of the work of translating Core into Sequent Core is in handling
+the apparent computation.  In the compositional translation, apparent
+computation expressions all correspond to computation $\mu$-abstractions.  Note
+that we now actually use the given type for a Core expression in order to record
+the type of the continuation variable introduced by the computation.
+\begin{align*}
+  Seq\trans{\expr_1 ~ \expr_2 : \ty}
+  &=
+  \comp{\ann r \ty}
+    \cut
+    {Seq\trans{\expr_1 : \ty' \to \ty}}
+    {\app{Seq\trans{\expr_2 : \ty'}}{r}}
+  \\
+  \Where
+    \expr_1 &: \ty' \to \ty
+  \\
+  Seq\trans{\expr_1 ~ \ty_2 : \ty}
+  &=
+  \comp{\ann{r}{\ty}}
+    \cut
+    {Seq\trans{\expr : \forall \ann a \ki. \ty_2}}
+    {\app{\ty_1}{r}}
+  \\
+  \Where
+    \expr_1 &: \forall \ann a \ki. \ty_1
+  \\
+    \ty &= \ty_1[\ty_2/a]
+  \\
+  Seq\trans{\Let \abind \In \expr : \ty}
+  &=
+  \comp{\ann r \ty}\Let Seq\trans{\abind} \In \cut{\expr : \ty}{r}
+  \\
+  Seq\trans{\Case \expr \As \ann{x}{\ty'} \Of \alts : \ty}
+  &=
+  \comp{\ann{r}{\ty}}
+    \cut
+    {Seq\trans{\expr : \ty'}}
+    {\caseas{\ann{x}{\ty'}}{Seq\trans{\alts : \ty'}{r:\ty}}}
+  \\
+  Seq\trans{\coerce{\expr}{\cn} : \ty}
+  &=
+  \comp{\ann{r}{\ty}}\cut{Seq\trans{\expr : \ty'}}{\koerce{\cn}{r}}
+  \\
+  \Where
+    \cn &: \eqty{\ty'}{\ty}
+\end{align*}
+We also need to translate the binding of a let expression and alternatives of a
+case expression:
+\begin{align*}
+  Seq\trans{\ann x \ty = \expr}
+  &=
+  (\ann x \ty = Seq\trans{\expr : \ty})
+  \\
+  Seq\trans{\Rec \{ \vect[i]{\ann{x_i}{\ty_i} = \expr_i} \}}
+  &=
+  (\Rec \{ \vect[i]{\ann{x_i}{\ty_i} = Seq\trans{\expr_i : \ty_i}} \})
+\end{align*}
+\begin{align*}
+  Seq\trans{\blank \to \expr}_{r:\ty}
+  &=
+  \blank \to \cut{Seq\trans{\expr : \ty}}{r}
+  \\
+  Seq\trans{
+    K ~ \vect[i]{\ann{b_i}{\ki_i}} ~ \vect[j]{\ann{x_j}{\ty_j}} \to \expr
+  }_{r:\ty}
+  &=
+  K ~ \vect[i]{\ann{b_i}{\ki_i}} ~ \vect[j]{\ann{x_j}{\ty_j}}
+  \to
+  \cut{Seq\trans{\expr : \ty}}{r}
+  \\
+  Seq\trans{\lit \to \expr}_{r:\ty}
+  &=
+  \lit \to \cut{Seq\trans{\expr : \ty}}{r}
+\end{align*}
+Note that because case alternatives in Sequent Core point to self-contained
+commands, we explicitly spell out the common continuation that every alternative
+``returns'' to, which was introduced as the return continuation for the case
+expression itself.  Finally, we can translate a whole program from Core to
+Sequent Core by giving some chosen continuation variable on which we expect to
+recieve the final result of the program:
+\begin{align*}
+  Seq\trans{\decls; e}_{r:\ty} &= \decls; \cut{Seq\trans{e:\ty}}{r}
+\end{align*}
+
+While the compositional translation is simple, it creates unnecessarily large
+terms due to the fact that every apparent computation gets its own
+$\mu$-abstraction.  We can then take the observation on the difference between
+apparent values and apparent computations in Core to write a better, more
+compacting translation into Sequent Core.  This more compacting translation is
+closer to the implemented one, but still quite simplified.%
+\footnote{The implemented translation handles the renaming necessary to avoid
+  static variable capture and also attemps to translate functions which
+  represent continuations as continuations (i.e., it performs some
+  \emph{re-contification}).}
+ %
+For apparent values (variables, literals, lambda abstractions, coercions, and
+types), the translation is much the same:
+\begin{align*}
+  Seq\trans{x : \ty} &= x
+  \\
+  Seq\trans{\lit : \ty} &= \lit
+  \\
+  Seq\trans{(\fn{\ann{x}{\ty}} \expr) : \ty \to \ty'}
+  &=
+  \fn{\ann{x}{\ty}} Seq\trans{\expr : \ty'}
+  \\
+  Seq\trans{(\fn{\ann{a}{\ki}} \expr) : \forall \ann{a}{\ki}. \ty}
+  &=
+  \fn{\ann{a}{\ki}} Seq\trans{\expr : \ty}
+  \\
+  Seq\trans{\cn : \eqty{\ty}{\ty'}} &= \cn
+  \\
+  Seq\trans{\ty : \ki} &= \ty
+  \\
+  Seq\trans{\expr : \ty}
+  &= \comp{q:\ty} Seq\trans{\expr : \ty} ~ q ~ \mt
+  \\
+  &
+  \Where \expr \text{ is an apparent computation}
+\end{align*}
+The main difference is when we find an apparent computation (an application, let
+expression, case expression, or cast), identified by the last clause above.  In
+this case, we introduce \emph{one} $\mu$-abstraction, and then begin to collect
+the outer-most continuation and bindings of the computation:
+\begin{align*}
+  Seq\trans{\expr_1 ~ \expr_2 : \ty} \ko ~ \binds
+  &=
+  Seq\trans{\expr_1 : \ty' \to \ty} (\app{Seq\trans{\expr_2 : \ty'}}{\ko}) ~ \binds
+  \\
+  \Where
+    \expr_1 &: \ty' \to \ty
+  \\
+  Seq\trans{\expr_1 ~ \ty_2 : \ty} \ko ~ \binds
+  &=
+  Seq\trans{\expr : \forall \ann a \ki. \ty_2} (\app{\ty_1}{\ko}) ~ \binds
+  \\
+  \Where
+    \expr_1 &: \forall \ann a \ki. \ty_1
+  \\
+    \ty &= \ty_1[\ty_2/a]
+  \\
+  Seq\trans{\Let \abind \In \expr : \ty} \ko ~ \binds
+  &=
+  Seq\trans{\expr : \ty} \ko ~ (\binds; Seq\trans{\abind})
+  \\
+  \Where
+  \emptyset &= BV(\abind) \cap FV(\ko)
+  \\
+  Seq\trans{\Case \expr \As \ann{x}{\ty'} \Of \alts : \ty} \ko ~ \binds
+  &=
+  Seq\trans{\expr : \ty'} \ko' ~ \binds'
+  \\
+  \Where
+  \ko' &= \caseas{\ann{x}{\ty'}}{Seq\trans{\alts} (q:\ty) ~ \mt}
+  \\
+  \binds' &= (\binds; \ann{q}{\ty} = \ko)
+  \\
+  Seq\trans{\coerce{\expr}{\cn} : \ty} \ko ~ \binds
+  &=
+  Seq\trans{\expr : \ty'} (\koerce{\cn}{\ko}) ~ \binds
+  \\
+  \Where
+  \cn &: \eqty{\ty'}{\ty}
+  \\
+  Seq\trans{\expr : \ty} \ko ~ \binds
+  &=
+  \Let \binds \In \cut{Seq\trans{\expr : \ty}}{\ko}
+  \\
+  \Where
+  \expr & \text{ is an apparent value }
+\end{align*}
+When we reach an apparent value again, in the last clause above, we write down
+the entire continuation and list of bindings found during translation.
+\begin{align*}
+  Seq\trans{\ann x \ty = \expr}
+  &=
+  (\ann x \ty = Seq\trans{\expr : \ty})
+  \\
+  Seq\trans{\Rec \{ \vect[i]{\ann{x_i}{\ty_i} = \expr_i} \}}
+  &=
+  (\Rec \{ \vect[i]{\ann{x_i}{\ty_i} = Seq\trans{\expr_i : \ty_i}} \})
+\end{align*}
+The more compacting translation of bindings, alternatives, and whole programs
+are effectively the same as before, except that for a binding we begin expecting
+the bound expression to be value-like, and for an alternative and whole program
+we begin expecting the resulting expression to be computation-like:
+\begin{align*}
+  Seq\trans{\blank \to \expr} (\ko:\ty) ~ \binds
+  &=
+  \blank \to Seq\trans{\expr : \ty} \ko ~ \binds
+  \\
+  Seq\trans{
+    K ~ \vect[i]{\ann{b_i}{\ki_i}} ~ \vect[j]{\ann{x_j}{\ty_j}} \to \expr
+  } (\ko:\ty) ~ \binds
+  &=
+  K ~ \vect[i]{\ann{b_i}{\ki_i}} ~ \vect[j]{\ann{x_j}{\ty_j}}
+  \to
+  Seq\trans{\expr : \ty} \ko ~ \binds
+  \\
+  Seq\trans{\lit \to \expr} (\ko:\ty) ~ \binds
+  &=
+  \lit \to Seq\trans{\expr : \ty} \ko ~ \binds
+\end{align*}
+\begin{align*}
+  Seq\trans{\decls; \expr}_{r:\ty} &= \decls; Seq\trans{\expr : \ty} r ~ \mt
+\end{align*}
+
+Translating Sequent Core back into Core brings up a twist: Sequent Core has
+types that don't exist in Core!  In particular, the existential stack values
+don't exist directly as a Core expression.  Therefore, we have to perform some
+selective \emph{negation}%
+\footnote{But only a single negation.  Using a double negation means doing a
+  full-blown continuation-passing style translation into Core, which is exactly
+  what we are trying to avoid.}
+ % during translation to handle types that don't directly
+correspond to anything in Core.  We represent the negation of a type $\ty$ as
+the normal encoding $\ty \to \ty'$, where the ultimate result type $\ty'$ stands
+in for ``false.''  Thus, every Sequent Core type $\sigma$ at least has a negated
+meaning in Core with respect to some result type $\ty'$,
+$Core^\neg\trans{\sigma}_{\ty'}$:
+\begin{align*}
+  Core^\neg\trans{\stackty{\vect[i]{a_i:\ki_i}}{\vect[j]{\ty_j}}}_{\ty'}
+  &=
+  \vect[i]{\forall a_i:\ki_i.} \vect[j]{\ty_j \to } \ty'
+  \\
+  Core^\neg\trans{\ty}_{\ty'}
+  &=
+  \ty \to \ty'
+\end{align*}
+where we negate ``exists'' into ``forall'' and a stack producing a bunch of
+values to a function consuming a bunch of values.
+
+By distinguishing Sequent Core types that exist in Core from ones that don't, we
+can get a mostly direct-style translation back to Core.  For Sequent Core terms
+$\tm$ of a Core type $\ty$, we have the direct translation to Core,
+$Core\trans{\tm : \ty}$:
+\begin{align*}
+  Core\trans{x : \ty} &= x
+  \\
+  Core\trans{\comp{\ann r \ty}\com : \ty}
+  &=
+  Core\trans{\com}_{r:\ty}
+  \\
+  Core\trans{\lit : \ty} &= \lit
+  \\
+  Core\trans{(\fn{\ann x \ty} \tm) : \ty \to \ty'}
+  &=
+  \fn{\ann x \ty} Core\trans{\tm : \ty'}
+  \\
+  Core\trans{(\fn{\ann a \ki} \tm) : \forall \ann a \ki. \ty}
+  &=
+  \fn{\ann a \ki} Core\trans{\tm : \ty}
+  \\
+  Core\trans{\cn : \eqty{\ty}{\ty'}} &= \cn
+  \\
+  Core\trans{\ty : \ki} &= \ty
+\end{align*}
+Most clauses straightforward; the interesting one is for $\mu$-abstractions,
+$\comp{\ann r \ty}\com$, where we translate the underlying command $\com$ and
+``read off'' the result returned to the continuation variable $r$.
+
+Likewise, Sequent Core continuations of a Core type $\ty$ have a direct
+translation to Core evaluation contexts, $Seq\trans{\ko : \ty}_{\ann{r}{\ty'}}$,
+which is parameterized by the return continuation variable $r$ for the entire
+local computation:
+\begin{align*}
+  Core\trans{q : \ty}_{\ann{r}{\ty'}}
+  &=
+  \begin{cases}
+    \hole & \text{ if } q = r
+    \\
+    q ~ \hole & \text{ if } q \neq r
+  \end{cases}
+  \\
+  Core\trans{\app{\tm}{\ko} : \ty_1 \to \ty_2}_{\ann{r}{\ty'}}
+  &=
+  Core\trans{\ko : \ty_2}_{\ann{r}{\ty'}}[\hole ~ Core\trans{\tm : \ty_1}]
+  \\
+  Core\trans{\app{\ty_1}{\ko} : \forall \ann a \ki. \ty_2}_{\ann{r}{\ty'}}
+  &=
+  Core\trans{\ko : \ty_2[\ty_1/a]}_{\ann{r}{\ty'}}[\hole ~ \ty_1]
+  \\
+  Core\trans{\koerce{\cn}{\ko} : \ty_1}_{\ann{r}{\ty'}}
+  &=
+  Core\trans{\ko : \ty_2}_{\ann{r}{\ty'}}[\coerce{\hole}{\cn}]
+  \\
+  \Where \cn &: \eqty{\ty_1}{\ty_2}
+  \\
+  Core\trans{\caseas{\ann{x}{\ty}}{\alts} : \ty}_{\ann{r}{\ty'}}
+  &=
+  \Case \hole \As \ann{x}{\ty} \Of Core\trans{\alts}_{\ann{r}{\ty'}}
+\end{align*}
+\begin{align*}
+  Core\trans{\blank \to \com}_{\ann{r}{\ty'}}
+  &=
+  \blank \to Core\trans{\com}_{\ann{r}{\ty'}}
+  \\
+  Core\trans{K ~ \vect[i]{b_i:\ki_i} ~ \vect[j]{x_j:\ty_j} \to \com}_{\ann{r}{\ty'}}
+  &=
+  K ~ \vect[i]{b_i:\ki_i} ~ \vect[j]{x_j:\ty_j} \to Core\trans{\com}_{\ann{r}{\ty'}}
+  \\
+  Core\trans{\lit \to \com}_{\ann{r}{\ty'}}
+  &=
+  \lit \to Core\trans{\com}_{\ann{r}{\ty'}}
+\end{align*}
+
+To translate the terms and continuations of non-Core types, we need to employ
+one level of negation which reverses their roles.  The negated translation of
+terms, $Core^\neg\trans{\tm : \sty}$, and continuations
+$Core^\neg\trans{\ko : \sty}_{r:\ty'}$, turns terms into Core evaluation
+contexts and continuations into Core expressions (specifically functions):
+\begin{align*}
+  Core^\neg\trans{
+    \packs{\vect[i]{\ty'_i}}{\vect[j]{\tm_j}}
+  : \stackty{\vect[i]{\ann{a_i}{\ki_i}}}{\vect[j]{\ty_j}}
+  }
+  &=
+  \hole ~ \vect[i]{\ty_i} ~ \vect[j]{Core\trans{\tm_j}}
+  \\
+  Core^\neg\trans{\tm : \ty}
+  &=
+  \hole ~ Core\trans{\tm : \ty}
+\end{align*}
+\begin{align*}
+  Core^\neg\trans{
+    \fnk{\packs{\vect[i]{\ann{a_i}{\ki_i}}}{\vect[j]{\ann{x_j}{\ty_j}}}} \com
+  : \stackty{\vect[i]{\ann{a_i}{\ki_i}}}{\vect[j]{\ty_j}}
+  }_{\ann{r}{\ty'}}
+  &=
+  \vect[i]{\fn{\ann{a_i}{\ki_i}}}\vect[j]{\fn{\ann{x_j}{\ty_j}}}
+    Core\trans{\com}_{\ann{r}{\ty'}}
+  \\
+  Core^\neg\trans{\ko : \ty}_{\ann{r}{\ty'}}
+  &=
+  \fn{\ann x \ty} Core\trans{\ko : \ty}_{\ann{r}{\ty'}}[x]
+\end{align*}
+
+All of the interesting decisions on when to negate and when to be direct comes
+in the heart of a command.  When translating a command into a Core expression,
+we must look at the type of the interacting term and continuation.  If they have
+a Core type, then we can perform the direct translation whereby the term becomes
+an expression and a continuation its evaluation context.  If they don't have a
+Core type, then we perform the negated translation whereby the term becomes an
+evaluation context for the continuation as a function.
+\begin{align*}
+  Core\trans{\Let \binds \In \cut{\tm}{\ko}}_{\ann{r}{\ty'}}
+  &= Core\trans{\binds}_{\ann{r}{\ty'}}[\expr]
+  \\
+  \Where
+  e
+  &=
+  \begin{cases}
+    Core\trans{\ko : \ty}_{\ann{r}{\ty'}}[Core\trans{\tm : \ty}]
+    & \text{ if } \exists \ty. \tm : \ty \wedge \ko : \ty
+    \\
+    Core^\neg\trans{\tm : \sty}[Core^\neg\trans{\ko : \sty}_{\ann{r}{\ty'}}]
+    & \text{ if } \exists \sty. \tm : \sty \wedge \ko : \sty
+  \end{cases}
+\end{align*}
+
+With bindings, we don't have much of a choice: all bindings (for both terms and
+continuations) must become Core expression bindings.  Thus, we always translate
+Sequent Core term bidings directly (which is possible since all term variables
+must have a Core type), and we always translate Sequent Core continuation
+bindings negatively (which converts them into functions).
+\begin{align*}
+  Core\trans{\mt}_{\ann{r}{\ty'}} &= \hole
+  \\
+  Core\trans{\binds; \abind}_{\ann{r}{\ty'}}
+  &=
+  Core\trans{\binds}_{\ann{r}{\ty'}}[Core\trans{\abind}_{\ann{r}{\ty'}}]
+  \\\\
+  Core\trans{\ann x \ty = \tm}_{\ann{r}{\ty'}}
+  &=
+  \Let \ann x \ty = Core\trans{\tm : \ty} \In \hole
+  \\
+  Core\trans{\Rec \{ \vect[i]{\ann{x_i}{\ty_i} = \tm_i} \}}_{\ann{r}{\ty'}}
+  &=
+  \Let
+    \Rec \{ \vect[i]{\ann{x_i}{\ty_i} = Core\trans{\tm_i : \ty_i}} \}
+  \In
+    \hole
+  \\
+  Core\trans{\ann q \sty = \ko}_{\ann{r}{\ty'}}
+  &=
+  \Let \ann{q}{Core^\neg\trans{\sty}_{\ty'}} = Core^\neg\trans{\ko}_{\ann{r}{\ty'}} \In \hole
+  \\
+  Core\trans{\Rec \{ \vect[i]{\ann{q_i}{\sty_i} = \ko_i} \}}_{\ann{r}{\ty'}}
+  &=
+  \Let
+    \Rec \{
+      \vect[i]{\ann{q_i}{Core^\neg\trans{\sty_i}_{\ty'}}
+      =
+      Core^\neg\trans{\ko}_{\ann{r}{\ty'}}}
+    \}
+  \In
+    \hole
+\end{align*}
+
+To translate the whole Sequent Core program back into Core, we just translate
+the main command with respect to the continuation on which we expect to receive
+the program's result.
+\begin{align*}
+  Core\trans{\decls; \com}_{r:\ty} &= \decls; Core\trans{\com}_{r:\ty}
+\end{align*}
 
 \section{Design discussion}
 \label{sec:design-discussion}
