@@ -7,26 +7,26 @@ import GHC.Exts
 case1 :: () -> Int#
 case1 ()
   = let {-# NOINLINE k #-}
-        k x = 1# +# x -- doesn't translate as a continuation
+        k x = 1# +# x
     in k 3#
 
 case2 :: () -> Int#
 case2 ()
   = let {-# NOINLINE k #-}
-        k x = case x of { 0# -> True; _ -> False } -- translates ...
-    in if k 3# then 1# else 2#                     -- ... but used as function
+        k x = case x of { 0# -> True; _ -> False }
+    in if k 3# then 1# else 2#
         
 case2b :: () -> Int#
 case2b ()
   = let {-# NOINLINE _k #-}
-        _k f = f 1# -- translates as a continuation ...
-    in 3#           -- ... but isn't used at all
+        _k f = f 1#
+    in 3#
 
 case3 :: Bool
 case3
   = let {-# NOINLINE k #-}
-        k x = case x of { 0# -> True; _ -> False } -- translates ...
-    in k (if k 3# then 1# else 2#)                 -- ... but used inconsistently
+        k x = case x of { 0# -> True; _ -> False }
+    in k (if k 3# then 1# else 2#)
 
 {-# NOINLINE flag #-}
 flag :: Bool
@@ -35,16 +35,16 @@ flag = False
 case4 :: Bool
 case4
   = let {-# NOINLINE k #-}
-        k x = case x of { 0# -> True; _ -> False } -- translates ...
+        k x = case x of { 0# -> True; _ -> False }
         {-# NOINLINE g #-}
-        g y = k (y 5#)                             -- as does this one ...
-    in if flag && k 3# then True else g (+# 1#)            -- ... but k fails, cascading
+        g y = k (y 5#)
+    in if flag && k 3# then True else g (+# 1#)
 
 case5 :: Bool
 case5
   = let {-# NOINLINE k #-}
-        k x = case x of { 0# -> True; _ -> False } -- translates unconditionally ...
-    in if flag then True else k 1#                -- ... and is used only as cont
+        k x = case x of { 0# -> True; _ -> False }
+    in if flag then True else k 1#
 
 main :: IO ()
 main = return ()

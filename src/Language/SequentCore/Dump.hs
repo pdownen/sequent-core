@@ -29,7 +29,8 @@ import Language.SequentCore.Syntax
 import Language.SequentCore.Plugin
 import Language.SequentCore.Pretty (pprTopLevelBinds)
 
-import Outputable ( pprPanic )
+import Outputable ( pprPanic
+                  , withPprStyle, defaultUserStyle )
 
 -- | The plugin. A GHC plugin is a module that exports a value called @plugin@
 -- with the type 'Plugin'.
@@ -53,5 +54,6 @@ showSequentCore :: [SeqCoreBind] -> CoreM [SeqCoreBind]
 showSequentCore bs = do
   putMsg (pprTopLevelBinds bs)
   case lintCoreBindings bs of
-    Just err -> pprPanic "showSequentCore" err
+    Just err -> pprPanic "lint error in dumped code" $
+                  withPprStyle defaultUserStyle err
     Nothing  -> return bs

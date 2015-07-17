@@ -17,7 +17,7 @@ main :: IO ()
 main = if fib 10 == fibs !! 10 then putStrLn "Yay!" else putStrLn "Boo!"
 
 sum :: [Int] -> Int
-sum               = sum' 0
+sum xs            = sum' 0 xs
   where
     sum' :: Int -> [Int] -> Int
     sum' a []     = a
