@@ -913,7 +913,7 @@ commands, we explicitly spell out the common continuation that every alternative
 ``returns'' to, which was introduced as the return continuation for the case
 expression itself.  Finally, we can translate a whole program from Core to
 Sequent Core by giving some chosen continuation variable on which we expect to
-recieve the final result of the program:
+receive the final result of the program:
 \begin{align*}
   Seq\trans{\decls; e}_{r:\ty} &= \decls; \cut{Seq\trans{e:\ty}}{r}
 \end{align*}
@@ -925,7 +925,7 @@ apparent values and apparent computations in Core to write a better, more
 compacting translation into Sequent Core.  This more compacting translation is
 closer to the implemented one, but still quite simplified.%
 \footnote{The implemented translation handles the renaming necessary to avoid
-  static variable capture and also attemps to translate functions which
+  static variable capture and also attempts to translate functions which
   represent continuations as continuations (i.e., it performs some
   \emph{re-contification}).}
  %
@@ -1196,7 +1196,7 @@ evaluation context for the continuation as a function.
 
 With bindings, we don't have much of a choice: all bindings (for both terms and
 continuations) must become Core expression bindings.  Thus, we always translate
-Sequent Core term bidings directly (which is possible since all term variables
+Sequent Core term bindings directly (which is possible since all term variables
 must have a Core type), and we always translate Sequent Core continuation
 bindings negatively (which converts them into functions).
 \begin{align*}
@@ -1245,7 +1245,7 @@ the program's result.
 
 \subsection{Join points}
 
-One of the goals of Sequent Core is to provide a good represenation for naming
+One of the goals of Sequent Core is to provide a good representation for naming
 join points in a program.  A \emph{join point} is a specified point in the
 control flow of a program where to different possible execution paths join back
 up again.  The purpose of giving a name to these join points is to avoid
@@ -1310,7 +1310,7 @@ to form a \emph{new} join point that gives a name to the command $\com_1$, so
 that we may refer to it by name rather than duplicating the entire command.
 Since $\com_1$ is an open command referring to local variables introduced by the
 case analysis, we must first abstract over these local variables.  This is the
-role of the polyadic form of continuation, which is able to recieve multiple
+role of the polyadic form of continuation, which is able to receive multiple
 inputs before running.  In our example, we would move $\com_1$ and $\com_2$ into
 a named, polyadic continuations:
 \begin{gather*}
@@ -1375,7 +1375,7 @@ design choices which are possible for this purpose:
 
 \item Curried vs uncurried: Currently, the continuations which accept
   existential stacks are written in a totally-uncurried form.  By listing all
-  the paramters that abstract over a command, we are forced to spell out
+  the parameters that abstract over a command, we are forced to spell out
   \emph{exactly} the number of inputs that are required by the continuation
   before any work can be done.
 
