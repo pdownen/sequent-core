@@ -37,7 +37,7 @@
   \Alt \lit
   \Alt \ty
   \Alt \cn
-  \Alt \paks{\vect[i]{\ty_i}}{\vect[j]{\tm_j}}
+  \Alt \packs{\vect[i]{\ty_i}}{\vect[j]{\tm_j}}
   \\
   \ko &\in Kont
   &
@@ -45,7 +45,7 @@
   \Alt \app{\tm}{\ko}
   \Alt \koerce{\cn}{\ko}
   \Alt \caseas{\ann x \ty}{\alts}
-  \Alt \fnk{\paks{\vect[i]{\ann{a_i}{\ki_i}}}{\vect[j]{\ann{x_j}{\ty_j}}}}{\com}
+  \Alt \fnk{\packs{\vect[i]{\ann{a_i}{\ki_i}}}{\vect[j]{\ann{x_j}{\ty_j}}}}{\com}
   \\
   \binds &\in Bindings
   &
@@ -180,7 +180,7 @@ Term scoping: $\Gamma \vdash \tm \Ok$
   }
   \qquad
   \infer
-  {\Gamma \vdash \paks{\vect[i]{\ty_i}}{\vect[j]{\tm_j}} \Ok}
+  {\Gamma \vdash \packs{\vect[i]{\ty_i}}{\vect[j]{\tm_j}} \Ok}
   {
     \vect[i]{\Gamma \vdash \ty_i \Ok}
     &
@@ -225,7 +225,7 @@ Continuation scoping: $\Gamma; \Delta \vdash \ko \Ok$
   }
   \qquad
   \infer
-  {\Gamma;\Delta \vdash \fnk{\paks{\vect[i]{a_i}}{\vect[j]{x_j}}} \com \Ok}
+  {\Gamma;\Delta \vdash \fnk{\packs{\vect[i]{a_i}}{\vect[j]{x_j}}} \com \Ok}
   {
     \Gamma,\vect[i]{a_i},\vect[j]{x_j};\Delta \vdash \com \Ok
   }
@@ -460,7 +460,7 @@ Term typing: $\Gamma \vdash \tm : \sty$
   {
     \Gamma
     \vdash
-    \paks{\vect[i]{\ty_i}}{\vect[j]{\tm_j}}
+    \packs{\vect[i]{\ty_i}}{\vect[j]{\tm_j}}
     :
     \stackty{\vect[i]{a_i:\ki_i}}{\vect[j]{\ty'_j}}
   }
@@ -517,7 +517,7 @@ Continuation typing: $\Gamma; \Delta \vdash \ko : \sty$
   {
     \Gamma;\Delta
     \vdash
-    \fnk{\paks{\vect[i]{a_i:\ki_i}}{\vect[j]{x_j:\ty_j}}} \com
+    \fnk{\packs{\vect[i]{a_i:\ki_i}}{\vect[j]{x_j:\ty_j}}} \com
     :
     \stackty{\vect[i]{a_i:\ki_i}}{\vect[j]{\ty_j}}
   }
@@ -845,15 +845,15 @@ a named, polyadic continuations:
   \comp{r}
   &
     \Let
-      p_1 &= \fnk{\pak{x}{y}} \com_1;
+      p_1 &= \fnk{\pack{x}{y}} \com_1;
   \\
   &&
-      p_2 &= \fnk{\pak{}{}} \com_2;
+      p_2 &= \fnk{\packs{}{}} \com_2;
   \\
   &&
       q &= \Case\Of \{
-          K_1 ~ x ~ y \to \cut{\pak{x}{y}}{p_1};
-          K_2 \to \cut{\pak{}{}}{p_2}
+          K_1 ~ x ~ y \to \cut{\pack{x}{y}}{p_1};
+          K_2 \to \cut{\packs{}{}}{p_2}
           \}
   \\
   &&
@@ -867,7 +867,7 @@ $\com_0$:
 \begin{align*}
   \com_0
   &=
-  \cut{z}{\Case\Of \{ True \to \cut{\pak{5}{10}}{p_1}; False \to \cut{z'}{q} \}}
+  \cut{z}{\Case\Of \{ True \to \cut{\pack{5}{10}}{p_1}; False \to \cut{z'}{q} \}}
 \end{align*}
 which avoids duplicating $\com_1$ at all.
 
@@ -883,18 +883,18 @@ represent these polymorphic continuations and continuations expecting multiple
 inputs as an uncurried $\lambda$-abstraction.  However, there are multiple other
 design choices which are possible for this purpose:
 \begin{itemize}
-\item Unboxed tuples: Morally, the stack $\pak{1}{\pak{2}{3}}$ for a polyadic
+\item Unboxed tuples: Morally, the stack $\pack{1}{\pack{2}{3}}$ for a polyadic
   continuation is the same as the unboxed tuple $(\# 1, 2, 3 \#)$.  Why then do
   we bother to introduce a new form of term, and a new type, instead of just
   using unboxed tuples for this purpose?  The reason is the above-mentioned
   existentially-quantified types, which lie outside the form of unboxed tuples
   supported by Core.  We cannot represent
-  $\pak{Int}{\pak{1}{\pak{2}{3}}} : \stackty{a:\star}{a, a, a}$ as an unboxed
+  $\pack{Int}{\pack{1}{\pack{2}{3}}} : \stackty{a:\star}{a, a, a}$ as an unboxed
   tuple.
 
   As a minor advantage, having the special form for existential stacks lets us
   (actually, requires us to) translate them back into Core as a calling context
-  rather than a value, so $\cut{\pak{1}{\pak{2}{3}}}{q}$ becomes $q ~ 1 ~ 2 ~ 3$
+  rather than a value, so $\cut{\pack{1}{\pack{2}{3}}}{q}$ becomes $q ~ 1 ~ 2 ~ 3$
   instead of $q (\# 1, 2, 3 \#)$.  This results in Core expressions for join
   points looking closer to what the current GHC simplifier actually produces.
 
@@ -928,9 +928,9 @@ design choices which are possible for this purpose:
 \item Case alternative: Instead of introducing a special new form of
   continuations for accepting existential stacks, we could also have added a
   form of case alternative for matching on the stack.  That way the special
-  continuations $\fnk{\paks{\vect{\ann a \ki}}{\vect{\ann x \ty}}}\com$ would
+  continuations $\fnk{\packs{\vect{\ann a \ki}}{\vect{\ann x \ty}}}\com$ would
   just be written as another form of case continuation
-  $\Case\Of{\paks{\ann a \ki}{\ann x \ty} \to \com}$.  This unification might
+  $\Case\Of{\packs{\ann a \ki}{\ann x \ty} \to \com}$.  This unification might
   make sense following the story that existential stacks are just a sort of
   unboxed data type that are not available in Core, so it makes sense that we
   would pattern match on them.
