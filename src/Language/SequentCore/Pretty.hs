@@ -82,6 +82,10 @@ ppr_term add_par (Compute kbndr comm)
   = add_par $
       hang (text "compute" <+> pprBndr LambdaBind kbndr)
         2 (pprCoreComm comm)
+ppr_term add_par (KArgs ty vs)
+  = add_par $
+      text "(!" <+> sep (punctuate comma (map pprCoreTerm vs)) <+> text "!)" <+>
+      text "::" <+> ppr ty
 
 ppr_kont_frames :: OutputableBndr b => Kont b -> [SDoc]
 ppr_kont_frames (App v k)
@@ -89,6 +93,9 @@ ppr_kont_frames (App v k)
 ppr_kont_frames (Case var alts)
   = [hang (text "case as" <+> pprBndr LetBind var <+> text "of") 2 $
       vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)]
+ppr_kont_frames (KLam bndrs body)
+  = [hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs) <+> arrow)
+      2 (pprCoreComm body)]
 ppr_kont_frames (Cast _ k)
   = text "cast ..." : ppr_kont_frames k
 ppr_kont_frames (Tick _ k)

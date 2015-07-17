@@ -17,7 +17,7 @@ module Language.SequentCore.Syntax (
   addLetsToTerm, addNonRec,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
-  partitionTypes, isLambda,
+  partitionTypes,
   isValueArg, isTypeTerm, isCoTerm, isErasedTerm, isRuntimeTerm,
   isTrivial, isTrivialTerm, isTrivialKont, isReturnKont,
   termIsConstruction, termAsConstruction, splitConstruction,
@@ -25,13 +25,14 @@ module Language.SequentCore.Syntax (
   rhsOfPair, mkBindPair, destBindPair, bindsTerm, bindsKont,
   flattenBind, flattenBinds, bindersOf, bindersOfBinds,
   -- * Calculations
-  termArity, termType, kontType,
+  termArity, termType,
   termIsBottom, commandIsBottom,
   needsCaseBinding,
   termOkForSpeculation, commandOkForSpeculation, kontOkForSpeculation,
   termOkForSideEffects, commandOkForSideEffects, kontOkForSideEffects,
   termIsCheap, kontIsCheap, commandIsCheap,
   termIsExpandable, kontIsExpandable, commandIsExpandable,
+  freeInTerm, freeInKont, freeInCommand, freeInAlt, freeInBind,
   -- * Continuation ids
   isKontId, asKontId, Language.SequentCore.WiredIn.mkKontTy, kontTyArg,
   -- * Alpha-equivalence
@@ -41,7 +42,7 @@ module Language.SequentCore.Syntax (
 import {-# SOURCE #-} Language.SequentCore.Pretty ()
 import Language.SequentCore.WiredIn
 
-import Coercion  ( Coercion, coercionType, coercionKind )
+import Coercion  ( Coercion, coercionType, tyCoVarsOfCo )
 import CoreSyn   ( AltCon(..), Tickish, tickishCounts, isRuntimeVar
                  , isEvaldUnfolding )
 import DataCon   ( DataCon, dataConTyCon, dataConRepArity
@@ -53,17 +54,16 @@ import IdInfo    ( IdDetails(..) )
 import Literal   ( Literal, isZeroLit, litIsTrivial, literalType )
 import Maybes    ( orElse )
 import Outputable
-import Pair
 import PrimOp    ( PrimOp(..), primOpOkForSpeculation, primOpOkForSideEffects
                  , primOpIsCheap )
 import TyCon
-import Type      ( Type, KindOrType )
+import Type      ( Type, KindOrType, TyVar )
 import qualified Type
 import TysPrim
 import Var       ( Var, isId )
 import VarEnv
+import VarSet
 
-import Control.Exception ( assert )
 import Data.Maybe
 
 --------------------------------------------------------------------------------
@@ -82,6 +82,8 @@ data Term b     = Lit Literal       -- ^ A primitive literal value.
                 | Compute b (Command b)
                                     -- ^ A value produced by a computation.
                                     -- Binds a continuation.
+                | KArgs Type [Term b]
+                                    -- ^ Gathers arguments for a join point.
                 | Type Type         -- ^ A type. Used to pass a type as an
                                     -- argument to a type-level lambda.
                 | Coercion Coercion -- ^ A coercion. Used to pass evidence
@@ -94,6 +96,9 @@ data Kont b     = App  {- expr -} (Term b) (Kont b)
                   -- ^ Apply the value to an argument.
                 | Case {- expr -} b [Alt b]
                   -- ^ Perform case analysis on the value.
+                | KLam [b] (Command b)
+                  -- ^ A join point. Takes a sequence of term arguments and
+                  -- continues as a command.
                 | Cast {- expr -} Coercion (Kont b)
                   -- ^ Cast the value using the given coercion.
                 | Tick (Tickish Id) {- expr -} (Kont b)
@@ -227,6 +232,8 @@ addLetsToTerm binds term = mkCompute k (mkCommand binds term (Return k))
 -- Deconstructors
 --------------------------------------------------------------------------------
 
+-- | Divide a term into a sequence of lambda-bound variables and a body. If @v@
+-- is not a lambda, then @lambdas v == ([], v)@.
 lambdas :: Term b -> ([b], Term b)
 lambdas (Lam x body) = (x : xs, body')
   where (xs, body')  = lambdas body
@@ -280,14 +287,8 @@ partitionTypes (Type ty : vs) = (ty : tys, vs')
   where (tys, vs') = partitionTypes vs
 partitionTypes vs = ([], vs)
 
--- | True if the given command is a simple lambda, with no let bindings and no
--- continuation.
-isLambda :: Command b -> Bool
-isLambda (Command { cmdLet = [], cmdKont = Return {}, cmdTerm = Lam {} })
-  = True
-isLambda _
-  = False
-
+-- | True if the given term constitutes a value argument rather than a type
+-- argument (see 'Type').
 isValueArg :: Term b -> Bool
 isValueArg (Type _) = False
 isValueArg _ = True
@@ -327,17 +328,19 @@ isTrivial c
 isTrivialTerm :: HasId b => Term b -> Bool
 isTrivialTerm (Lit l)     = litIsTrivial l
 isTrivialTerm (Lam x t)   = not (isRuntimeVar (identifier x)) && isTrivialTerm t
-isTrivialTerm (Compute _ c) = isTrivial c
+isTrivialTerm (Compute _ c)  = isTrivial c
+isTrivialTerm (KArgs _ vs)= all isErasedTerm vs
 isTrivialTerm _           = True
 
 -- | True if the given continuation is so simple we can duplicate it freely.
 -- This is true of casts and of applications of erased arguments (types and
 -- coercions). Ticks are not considered trivial, since this would cause them to
 -- be inlined.
-isTrivialKont :: Kont b -> Bool
+isTrivialKont :: HasId b => Kont b -> Bool
 isTrivialKont (Return _) = True
 isTrivialKont (Cast _ k) = isTrivialKont k
 isTrivialKont (App v k)  = isErasedTerm v && isTrivialKont k
+isTrivialKont (KLam xs c)= not (any isRuntimeVar (identifiers xs)) && isTrivial c
 isTrivialKont _          = False
 
 -- | True if the given continuation is a return continuation, @Return _@.
@@ -450,18 +453,9 @@ termType (Lit l)        = literalType l
 termType (Var x)        = idType x
 termType (Lam x t)      = Type.mkPiType (identifier x) (termType t)
 termType (Compute k _)  = kontTyArg (idType (identifier k))
+termType (KArgs ty _)   = ty
 -- see exprType in GHC CoreUtils
 termType _other         = alphaTy
-
--- | Compute the type a continuation accepts. If @kontType kont@ is Foo and @kont@ is bound
--- to @k@, then @k@'s @idType@ will be @!Foo@.
-kontType :: HasId b => Kont b -> Type
-kontType (Return k)   = kontTyArg (idType k)
-kontType (App arg k)  = Type.mkFunTy (termType arg) (kontType k)
-kontType (Cast co k)  = let Pair fromTy toTy = coercionKind co
-                        in assert (toTy `Type.eqType` kontType k) fromTy
-kontType (Case b _)   = idType (identifier b)
-kontType (Tick _ k)   = kontType k
 
 -- | Compute (a conservative estimate of) the arity of a term.
 termArity :: HasId b => Term b -> Int
@@ -513,6 +507,7 @@ kontOkForSideEffects = kontOk primOpOkForSideEffects
 termOk :: (PrimOp -> Bool) -> Term b -> Bool
 termOk primOpOk (Var id)         = appOk primOpOk id []
 termOk primOpOk (Compute _ comm) = commOk primOpOk comm
+termOk _        (KArgs {})       = False
 termOk _ _                       = True
 
 commOk :: (PrimOp -> Bool) -> Command b -> Bool
@@ -541,6 +536,7 @@ kontOk primOpOk (Case _bndr alts)
           DataAlt dc -> 1 + length alts == tyConFamilySize (dataConTyCon dc)
       | otherwise
       = False
+kontOk _primOpOk (KLam {}) = True
 kontOk primOpOk (Tick ti kont)
   = not (tickishCounts ti) && kontOk primOpOk kont
 kontOk primOpOk (Cast _ kont)
@@ -595,6 +591,7 @@ termCheap _        (Coercion _) = True
 termCheap appCheap (Lam x t)    = isRuntimeVar (identifier x)
                                || termCheap appCheap t
 termCheap appCheap (Compute _ c)= commCheap appCheap c
+termCheap _        (KArgs _ vs) = all isErasedTerm vs
 
 kontCheap :: HasId b => CheapMeasure -> Kont b -> Bool
 kontCheap _        (Return _)      = True
@@ -605,6 +602,8 @@ kontCheap appCheap (Tick ti kont)  = not (tickishCounts ti)
                                    && kontCheap appCheap kont
 kontCheap appCheap (App arg kont)  = isErasedTerm arg
                                    && kontCheap appCheap kont
+kontCheap appCheap (KLam xs comm)  = all isRuntimeVar (identifiers xs)
+                                   || commCheap appCheap comm
 
 commCheap :: HasId b => CheapMeasure -> Command b -> Bool
 commCheap appCheap (Command { cmdLet = binds, cmdTerm = term, cmdKont = kont})
@@ -651,6 +650,83 @@ isExpandableApp fid valArgCount = isConLikeId fid
       , Type.isPredTy argTy = allPreds (n-1) ty'
       | otherwise = False
 
+freeInTerm :: HasId b => Var -> Term b -> Bool
+freeInTerm x term            | Type.isTyVar x = x `tyVarFreeInTerm` term
+freeInTerm x (Var x')        = x == x'
+freeInTerm x (Lam x' body)   = x /= identifier x' && freeInTerm x body
+freeInTerm x (Compute p c)   = x /= identifier p && freeInCommand x c
+freeInTerm x (KArgs _ vs)    = any (freeInTerm x) vs
+freeInTerm _ _               = False
+
+freeInKont :: HasId b => Var -> Kont b -> Bool
+freeInKont x kont            | Type.isTyVar x = x `tyVarFreeInKont` kont
+freeInKont x (Return p)      = x == p
+freeInKont x (App v k)       = freeInTerm x v || freeInKont x k
+freeInKont x (Case x' alts)  = x /= identifier x' && any (freeInAlt x) alts
+freeInKont x (KLam xs c)     = x `notElem` identifiers xs && freeInCommand x c
+freeInKont x (Cast _ k)      = freeInKont x k
+freeInKont x (Tick _ k)      = freeInKont x k
+
+freeInCommand :: HasId b => Var -> Command b -> Bool
+freeInCommand x comm         | Type.isTyVar x = x `tyVarFreeInCommand` comm
+freeInCommand x (Command { cmdLet = binds, cmdTerm = term, cmdKont = kont })
+  = any (freeInBind x) binds || freeInTerm x term || freeInKont x kont
+
+freeInBind :: HasId b => Var -> Bind b -> Bool
+freeInBind x bind            | Type.isTyVar x = x `tyVarFreeInBind` bind
+freeInBind x bind = any freeInBindPair (flattenBind bind)
+  where
+    freeInBindPair pair = x /= identifier (binderOfPair pair)
+                        && either (freeInTerm x) (freeInKont x) (rhsOfPair pair)
+
+freeInAlt :: HasId b => Var -> Alt b -> Bool
+freeInAlt x (Alt _altCon bndrs rhs)
+  = x `notElem` map identifier bndrs && freeInCommand x rhs
+
+freeInType :: TyVar -> Type -> Bool
+a `freeInType` ty = a `elemVarSet` Type.tyVarsOfType ty
+
+freeInIdType :: HasId b => TyVar -> b -> Bool
+a `freeInIdType` id = a `freeInType` idType (identifier id)
+
+tyVarFreeInTerm :: HasId b => TyVar -> Term b -> Bool
+tyVarFreeInTerm _ (Lit _)       = False
+tyVarFreeInTerm a (Var x)       = a `freeInIdType` x
+tyVarFreeInTerm a (Lam x body)  = a `freeInIdType` x
+                                || tyVarFreeInTerm a body
+tyVarFreeInTerm a (Compute p c) = a `freeInIdType` p
+                                || tyVarFreeInCommand a c
+tyVarFreeInTerm a (KArgs ty vs) = a `freeInType` ty
+                                || any (tyVarFreeInTerm a) vs
+tyVarFreeInTerm a (Type ty)     = a `freeInType` ty
+tyVarFreeInTerm a (Coercion co) = a `elemVarSet` tyCoVarsOfCo co
+
+tyVarFreeInKont :: HasId b => TyVar -> Kont b -> Bool
+tyVarFreeInKont a (App v k) = tyVarFreeInTerm a v || tyVarFreeInKont a k
+tyVarFreeInKont a (Case x alts) = a `freeInIdType` x
+                                || any (tyVarFreeInAlt a) alts
+tyVarFreeInKont a (KLam xs c)   = any (a `freeInIdType`) xs
+                                || tyVarFreeInCommand a c
+tyVarFreeInKont a (Cast co k)    = a `elemVarSet` tyCoVarsOfCo co
+                                 || tyVarFreeInKont a k
+tyVarFreeInKont a (Tick _ k)     = tyVarFreeInKont a k
+tyVarFreeInKont a (Return p)     = a `freeInIdType` p
+
+tyVarFreeInCommand :: HasId b => TyVar -> Command b -> Bool
+tyVarFreeInCommand a (Command { cmdLet = binds, cmdTerm = term, cmdKont = kont })
+  = any (tyVarFreeInBind a) binds || tyVarFreeInTerm a term || tyVarFreeInKont a kont
+
+tyVarFreeInAlt :: HasId b => TyVar -> Alt b -> Bool
+tyVarFreeInAlt a (Alt _altCon bndrs rhs)
+  = any (a `freeInIdType`) (map identifier bndrs) || tyVarFreeInCommand a rhs
+
+tyVarFreeInBindPair :: HasId b => TyVar -> BindPair b -> Bool
+tyVarFreeInBindPair a pair = a `freeInIdType` identifier (binderOfPair pair)
+                           || either (tyVarFreeInTerm a) (tyVarFreeInKont a)
+                                     (rhsOfPair pair)
+tyVarFreeInBind :: HasId b => TyVar -> Bind b -> Bool
+tyVarFreeInBind a bind = any (tyVarFreeInBindPair a) (flattenBind bind)
+
 --------------------------------------------------------------------------------
 -- Continuation ids
 --------------------------------------------------------------------------------
@@ -677,9 +753,14 @@ kontTyArg ty = isKontTy_maybe ty `orElse` pprPanic "kontTyArg" (ppr ty)
 class HasId a where
   -- | The identifier contained by the type @a@.
   identifier :: a -> Id
+  
+  -- | Extract the identifiers from a list of @a@.
+  identifiers :: [a] -> [Id]
+  identifiers = map identifier
 
 instance HasId Var where
   identifier x = x
+  identifiers xs = xs
 
 -- | The type of the environment of an alpha-equivalence comparison. Only needed
 -- by user code if two terms need to be compared under some assumed
@@ -722,6 +803,8 @@ instance HasId b => AlphaEq (Term b) where
     = env `rnOccL` x1 == env `rnOccR` x2
   aeqIn env (Compute k1 c1) (Compute k2 c2)
     = aeqIn (rnBndr2 env (identifier k1) (identifier k2)) c1 c2
+  aeqIn env (KArgs _ vs1) (KArgs _ vs2)
+    = and (zipWith (aeqIn env) vs1 vs2)
   aeqIn _ _ _
     = False
 
@@ -731,6 +814,9 @@ instance HasId b => AlphaEq (Kont b) where
   aeqIn env (Case x1 as1) (Case x2 as2)
     = aeqIn env' as1 as2
       where env' = rnBndr2 env (identifier x1) (identifier x2)
+  aeqIn env (KLam xs1 c1) (KLam xs2 c2)
+    = aeqIn env' c1 c2
+      where env' = rnBndrs2 env (identifiers xs1) (identifiers xs2)
   aeqIn env (Cast co1 k1) (Cast co2 k2)
     = aeqIn env co1 co2 && aeqIn env k1 k2
   aeqIn env (Tick ti1 k1) (Tick ti2 k2)

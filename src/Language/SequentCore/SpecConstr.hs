@@ -205,6 +205,10 @@ specInTerm env (Compute kb c)
   = do
     (usage, c') <- specInCommand env c
     return (usage, Compute kb c')
+specInTerm env (KArgs ty args)
+  = do
+    (usage, args') <- mapAndUnzipM (specInTerm env) args
+    return (mconcat usage, KArgs ty args')
 specInTerm _ v
   = return (emptyScUsage, v)
 
@@ -218,6 +222,14 @@ specInKont env (Case x as)
   = do
     (usages, as') <- mapAndUnzipM (specInAlt env) as
     return (mconcat usages, Case x as')
+specInKont env (KLam xs c)
+  = do
+    (usage, c') <- specInCommand env' c
+    return (usage, KLam xs c')
+  where
+    env' = env { sc_how_bound = extendVarEnvList hb [(x, SpecArg) | x <- xs] }
+    hb   = sc_how_bound env
+    
 specInKont env (Cast co k)
   = do
     (usage, k') <- specInKont env k

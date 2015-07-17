@@ -11,7 +11,7 @@ module Language.SequentCore.Simpl.Env (
   initialEnv, mkSuspension, enterScope, enterScopes, mkFreshVar, mkFreshKontId,
   substId, substKv, substTy, substTyVar, substCo, substCoVar,
   extendIdSubst, extendKvSubst, zapSubstEnvs, staticPart, setStaticPart,
-  inDynamicScope, zapKont, bindKont, bindKontAs, pushKont, setKont, retType,
+  inDynamicScope, zapKont, setKont, retType,
   
   Floats, emptyFloats, addNonRecFloat, addRecFloats, zapFloats, zapKontFloats,
   mapFloats, extendFloats, addFloats, wrapFloats, wrapKontFloats, isEmptyFloats,
@@ -35,7 +35,7 @@ import CoreSyn    ( Unfolding(..), UnfoldingGuidance(..), UnfoldingSource(..)
 import CoreUnfold ( mkCoreUnfolding, mkDFunUnfolding  )
 import DataCon    ( DataCon )
 import DynFlags   ( DynFlags, ufCreationThreshold )
-import FastString ( FastString, fsLit )
+import FastString ( FastString )
 import Id
 import IdInfo
 import Maybes
@@ -287,27 +287,6 @@ zapSubstEnvs env
         , se_kvSubst = emptyVarEnv
         , se_tvSubst = emptyVarEnv
         , se_cvSubst = emptyVarEnv }
-
-bindKont :: MonadUnique m => SimplEnv -> StaticEnv -> InKont -> m SimplEnv
-bindKont env stat kont
-  = do
-    k <- mkSysLocalM (fsLit "k") (kontType kont)
-    let k' = uniqAway (se_inScope env) k
-    return $ bindKontAs env k' stat kont
-
--- | Put a continuation into the environment as the new current continuation.
--- This adds the continuation to the substitution, effectively pre-inlining it.
--- Usefully, this defers simplification until later.
-bindKontAs :: SimplEnv -> KontId -> StaticEnv -> InKont -> SimplEnv
-bindKontAs env k stat kont
-  = env { se_kvSubst = extendVarEnv (se_kvSubst env) k (Susp stat kont)
-        , se_retId   = Just k
-        , se_retKontDupable 
-                     = False }
-
-pushKont :: MonadUnique m => SimplEnv -> InKont -> m SimplEnv
-pushKont env kont
-  = bindKont env (staticPart env) kont
 
 zapKont :: SimplEnv -> SimplEnv
 zapKont env = env { se_retId = Nothing

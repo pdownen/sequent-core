@@ -109,12 +109,15 @@ bodySize dflags cap topArgs expr
       where 
         (xs, body)          = lambdas term
         erased              = all (\x -> not (isId x) || isRealWorldId x) xs
+    size (T (KArgs _ args)) = foldr (addSizeNSD . size . T) sizeZero args
     
     size (K (Return _))     = sizeZero
     size (K (Cast _ kont))  = size (K kont)
     size (K (Tick _ kont))  = size (K kont)
     size (K (App arg kont)) = sizeArg arg `addSizeNSD` size (K kont)
     size (K (Case _ alts))  = sizeAlts alts
+    size (K (KLam _ comm))  = -- Unclear that the scrutinee discount makes sense
+                              size (C comm)
 
     size (C comm)           = sizeLets (cmdLet comm) `addSizeNSD`
                               sizeCut (cmdTerm comm) (cmdKont comm)
