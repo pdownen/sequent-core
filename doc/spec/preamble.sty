@@ -2,10 +2,12 @@
 
 \usepackage{esvect}
 
+\newcommand{\expr}{e}
 \newcommand{\com}{c}
 \newcommand{\tm}{v}
 \newcommand{\ko}{k}
 \newcommand{\ty}{\tau}
+\newcommand{\sty}{\sigma}
 \newcommand{\ki}{\kappa}
 \newcommand{\cn}{\gamma}
 \newcommand{\lit}{lit}
@@ -24,6 +26,7 @@
 \newcommand{\keywordstyle}[1]{\operatorname{\mathbf{#1}}}
 \newcommand{\newkeyword}[2]{\newcommand{#1}{\keywordstyle{#2}}}
 
+\newkeyword{\Where}{where}
 \newkeyword{\Let}{let}
 \newkeyword{\In}{in}
 \newkeyword{\Case}{case}
@@ -36,6 +39,15 @@
 \newcommand{\ann}[2]{#1{:}{#2}}
 \newcommand{\vect}[2][]{{\vv{#2}}^{#1}}
 
+\newcommand{\hole}{\square}
+
+\newcommand{\trans}[1]{\left\llbracket{#1}\right\rrbracket}
+
+\newcommand{\stackty}[2]{\exists{#1}.({#2})}
+\newcommand{\pack}{\app}
+\newcommand{\packs}{\pack}
+\newcommand{\fnk}{\fn}
+
 \newcommand{\eqty}[2]{#1 \sim #2}
 \newcommand{\gives}{\Rightarrow}
 
@@ -47,6 +59,7 @@
 \newcommand{\fn}[1]{\lambda{#1}.}
 \newcommand{\coerce}[2]{{#1}\triangleright{#2}}
 
+\newcommand{\letin}{\compute}
 \newcommand{\app}[2]{{#1}\cdot{#2}}
 \newcommand{\koerce}[2]{{#1}\triangleleft{#2}}
 \newcommand{\caseas}[2]{\Case\As{#1}\Of{#2}}
