@@ -165,15 +165,19 @@ lintCoreTerm env (Compute bndr comm)
 
 lintCoreTerm env (KArgs ty args)
   = do
-    let (tyArgs, valArgs) = partitionTypes args
-    ty' <- case applysUbxExists_maybe ty tyArgs of
+    ty' <- case isKontArgsTy_maybe ty of
              Just ty' -> return ty'
+             Nothing  -> Left $ text "expected ContArgs# type:" <+> ppr ty <+>
+                                text "with continuation args:" <+> ppr args
+    let (tyArgs, valArgs) = partitionTypes args
+    ty'' <- case applysUbxExists_maybe ty' tyArgs of
+             Just ty'' -> return ty''
              Nothing  -> Left $ text "expected unboxed existentials:" <+>
-                                text "type" <+> ppr ty <> comma <+>
+                                text "type" <+> ppr ty' <> comma <+>
                                 text "args" <+> ppr tyArgs
-    unless (isUnboxedTupleType ty') $
-      Left $ text "not an unboxed tuple type:" <+> ppr ty
-    let (_, tys) = splitTyConApp ty'
+    unless (isUnboxedTupleType ty'') $
+      Left $ text "not an unboxed tuple type:" <+> ppr ty''
+    let (_, tys) = splitTyConApp ty''
     forM_ (zip3 [1..] tys valArgs) $ \(n, argTy, arg) ->
       checkingType (speakNth n <+> text "continuation argument") argTy $
         lintCoreTerm env arg
@@ -260,12 +264,15 @@ lintCoreKont desc env ty (Case bndr alts)
       return $ substTy (termEnv env) (idType bndr)
 lintCoreKont desc env ty (KLam xs comm)
   = do
-    let (tyBndrs, valBndrs) = span isTyVar xs
-    ty' <- case applysUbxExists_maybe ty (map mkTyVarTy tyBndrs) of
+    ty' <- case isKontArgsTy_maybe ty of
              Just ty' -> return ty'
-             Nothing -> Left $ desc <> colon <+> text "not enough unboxed exists:" <+> ppr ty
+             Nothing -> Left $ desc <> colon <+> text "not a ContArgs# type:" <+> ppr ty
+    let (tyBndrs, valBndrs) = span isTyVar xs
+    ty'' <- case applysUbxExists_maybe ty' (map mkTyVarTy tyBndrs) of
+             Just ty'' -> return ty''
+             Nothing -> Left $ desc <> colon <+> text "not enough unboxed exists:" <+> ppr ty'
     let argTys = map idType valBndrs
-    void $ checkingType (desc <> colon <+> text "argument type for cont lambda") ty' $
+    void $ checkingType (desc <> colon <+> text "argument type for cont lambda") ty'' $
       return (mkTupleTy UnboxedTuple argTys)
     let (ent, enk) = env
         (ent', _)  = mapAccumL lintBindInTermEnv ent xs
@@ -289,8 +296,11 @@ mkError desc ex act = Left (desc $$ text "expected:" <+> ex
   
 checkRhsType :: Var -> Type -> Type -> LintM ()
 checkRhsType bndr bndrTy rhsTy
-  = unless (bndrTy `eqType` rhsTy) $
-      mkError (text "type of RHS of" <+> ppr bndr) (ppr bndrTy) (ppr rhsTy)
+  = do unless (bndrTy `eqType` rhsTy) $
+         mkError (text "type of RHS of" <+> ppr bndr) (ppr bndrTy) (ppr rhsTy)
+       let bndrKi = typeKind bndrTy
+       unless (isSubOpenTypeKind bndrKi) $
+         mkError (text "kind of RHS of" <+> ppr bndr) (ppr openTypeKind) (ppr bndrKi)
 
 checkingType :: SDoc -> Type -> LintM Type -> LintM Type
 checkingType desc ex go

@@ -1,9 +1,12 @@
 module Language.SequentCore.WiredIn (
-  kontKindTyCon, kontTyCon, ubxExistsTyCon,
+  kontKindTyCon, kontArgsKindTyCon, kontTyCon, kontArgsTyCon, ubxExistsTyCon,
   
-  mkKontKind, mkKontTy, mkUbxExistsTy,
-  isKontTy, isKontTy_maybe, isUbxExistsTy, isUbxExistsTy_maybe,
+  mkKontKind, kontArgsKind, mkKontTy, mkKontArgsTy, mkUbxExistsTy,
+  isKontKind, isKontKind_maybe, isKontArgsKind,
+  isKontTy, isKontTy_maybe, isKontArgsTy, isKontArgsTy_maybe,
+  isUbxExistsTy, isUbxExistsTy_maybe,
   applyUbxExists_maybe, applysUbxExists_maybe,
+  
   sequentCoreTag, sequentCoreWiredInTag,
   
   mkLamKontId, mkLetKontId, mkArgKontId, mkCaseKontId, mkKontArgId
@@ -27,10 +30,10 @@ sequentCoreTag, sequentCoreWiredInTag :: Char
 sequentCoreTag        = 'Q'
 sequentCoreWiredInTag = 'q'
 
-kontKindKey, kontTypeKey, ubxExistsTypeKey,
-  lamKontKey, argKontKey, letKontKey, caseKontKey, kontArgKey :: Unique
-kontKindKey: kontTypeKey: ubxExistsTypeKey:
-  lamKontKey: argKontKey: letKontKey: caseKontKey: kontArgKey: _
+kontKindKey, kontArgsKindKey, kontTypeKey, kontArgsTypeKey, ubxExistsTypeKey,
+  lamKontKey, argKontKey, letKontKey, kontArgKey, caseKontKey :: Unique
+kontKindKey: kontArgsKindKey: kontTypeKey: kontArgsTypeKey: ubxExistsTypeKey:
+  lamKontKey: argKontKey: letKontKey: kontArgKey: caseKontKey: _
   = map (mkUnique sequentCoreWiredInTag) [1..]
 
 lamKontName, argKontName, letKontName, caseKontName, kontArgName :: Name
@@ -39,10 +42,12 @@ lamKontName, argKontName, letKontName, caseKontName, kontArgName :: Name
     [lamKontKey,    argKontKey,    letKontKey,    caseKontKey,    kontArgKey]
     [fsLit "*lamk", fsLit "*argk", fsLit "*letk", fsLit "*casek", fsLit "karg"]
 
-kontKindTyConName, kontTyConName, ubxExistsTyConName :: Name
-kontKindTyConName  = mkPrimTyConName (fsLit "ContKind") kontKindKey      kontKindTyCon
-kontTyConName      = mkPrimTyConName (fsLit "Cont#")    kontTypeKey      kontTyCon
-ubxExistsTyConName = mkPrimTyConName (fsLit "Exists#")  ubxExistsTypeKey ubxExistsTyCon
+kontKindTyConName, kontArgsKindTyConName, kontTyConName, kontArgsTyConName, ubxExistsTyConName :: Name
+kontKindTyConName     = mkPrimTyConName (fsLit "ContKind")     kontKindKey      kontKindTyCon
+kontArgsKindTyConName = mkPrimTyConName (fsLit "ContArgsKind") kontArgsKindKey  kontArgsKindTyCon
+kontTyConName         = mkPrimTyConName (fsLit "Cont#")        kontTypeKey      kontTyCon
+kontArgsTyConName     = mkPrimTyConName (fsLit "ContArgs#")    kontArgsTypeKey  kontArgsTyCon
+ubxExistsTyConName    = mkPrimTyConName (fsLit "Exists#")      ubxExistsTypeKey ubxExistsTyCon
 
 mkLamKontId, mkArgKontId, mkLetKontId, mkCaseKontId :: Type -> Var
 [mkLamKontId, mkArgKontId, mkLetKontId, mkCaseKontId]
@@ -52,8 +57,8 @@ mkLamKontId, mkArgKontId, mkLetKontId, mkCaseKontId :: Type -> Var
 mkKontArgId :: Type -> Id
 mkKontArgId ty = mkLocalId kontArgName ty
 
-kontKindTyCon, kontTyCon, ubxExistsTyCon :: TyCon
-kontKindTyCon = mkKindTyCon kontKindTyConName superKind
+kontKindTyCon, kontTyCon, ubxExistsTyCon, kontArgsKindTyCon, kontArgsTyCon :: TyCon
+kontKindTyCon = mkKindTyCon kontKindTyConName (superKind `mkArrowKind` superKind)
 
 -- TODO VoidRep isn't really right, but does it matter? This type should never
 -- appear in Core anyway.
@@ -62,6 +67,12 @@ kontTyCon = mkPrimTyCon kontTyConName kind roles VoidRep
     kKi   = mkTyVarTy kKiVar
     kind  = mkPiTypes [kKiVar] (mkFunTy kKi (mkKontKind kKi))
     roles = [Representational, Representational]
+
+kontArgsKindTyCon = mkKindTyCon kontArgsKindTyConName superKind
+
+kontArgsTyCon = mkPrimTyCon kontArgsTyConName kind [Representational] VoidRep
+  where
+    kind  = unliftedTypeKind `mkArrowKind` kontArgsKind
 
 -- TODO We might be able to finagle unboxed existentials by calling mkTupleTyCon
 -- with a special DataCon
@@ -78,13 +89,35 @@ mkKontTy ty = mkTyConApp kontTyCon [typeKind ty, ty]
 mkUbxExistsTy :: TyVar -> Type -> Type
 mkUbxExistsTy a ty = mkTyConApp ubxExistsTyCon [mkForAllTy a ty]
 
-isKontTy, isUbxExistsTy :: Type -> Bool
+kontArgsKind :: Kind
+kontArgsKind = mkTyConTy kontArgsKindTyCon
+
+mkKontArgsTy :: Type -> Type
+mkKontArgsTy ty = mkTyConApp kontArgsTyCon [ty]
+
+isKontKind, isKontArgsKind :: Kind -> Bool
+isKontKind = isJust . isKontKind_maybe
+
+isKontArgsKind ki | Just [] <- matchTyConApp ki kontArgsTyCon
+                  = True
+isKontArgsKind _  = False
+
+isKontKind_maybe :: Kind -> Maybe Kind
+isKontKind_maybe ki = do [arg] <- matchTyConApp ki kontKindTyCon
+                         return arg
+
+isKontTy, isKontArgsTy, isUbxExistsTy :: Type -> Bool
 isKontTy      = isJust . isKontTy_maybe
+isKontArgsTy  = isJust . isKontArgsTy_maybe
 isUbxExistsTy = isJust . isUbxExistsTy_maybe
 
 isKontTy_maybe :: Type -> Maybe Type
 isKontTy_maybe ty = do [_, arg] <- matchTyConApp ty kontTyCon
                        return arg
+
+isKontArgsTy_maybe :: Type -> Maybe Type
+isKontArgsTy_maybe ty = do [arg] <- matchTyConApp ty kontArgsTyCon
+                           return arg
 
 isUbxExistsTy_maybe :: Type -> Maybe (TyVar, Type)
 isUbxExistsTy_maybe ty = do [arg] <- matchTyConApp ty ubxExistsTyCon
