@@ -4,9 +4,9 @@ module Language.SequentCore.Simpl.Env (
   SimplEnv(..), StaticEnv, SimplIdSubst, SubstAns(..), IdDefEnv, Definition(..),
   Guidance(..),
 
-  InCommand, InTerm, InArg, InKont, InPKont, InAlt, InBind, InBindPair, InRhs,
+  InCommand, InTerm, InArg, InKont, InPKont, InAlt, InBind, InBindPair, InRhs, InValue,
   InId, InKontId, InPKontId, InVar, InTyVar, InCoVar,
-  OutCommand, OutTerm, OutArg, OutKont, OutPKont, OutAlt, OutBind, OutBindPair, OutRhs,
+  OutCommand, OutTerm, OutArg, OutKont, OutPKont, OutAlt, OutBind, OutBindPair, OutRhs, OutValue,
   OutId, OutKontId, OutPKontId, OutVar, OutTyVar, OutCoVar,
   
   mkBoundTo, mkBoundToPKont, findDef, setDef,
@@ -141,6 +141,7 @@ type InAlt      = SeqCoreAlt
 type InBind     = SeqCoreBind
 type InBindPair = SeqCoreBindPair
 type InRhs      = SeqCoreRhs
+type InValue    = SeqCoreValue
 type InId       = Id
 type InKontId   = KontId
 type InPKontId  = PKontId
@@ -158,6 +159,7 @@ type OutAlt     = SeqCoreAlt
 type OutBind    = SeqCoreBind
 type OutBindPair = SeqCoreBindPair
 type OutRhs     = SeqCoreRhs
+type OutValue   = SeqCoreValue
 type OutId      = Id
 type OutKontId  = KontId
 type OutPKontId = PKontId

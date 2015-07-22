@@ -14,6 +14,7 @@
 module Language.SequentCore.Simpl (plugin) where
 
 import Language.SequentCore.Lint
+import Language.SequentCore.OccurAnal
 import Language.SequentCore.Pretty (pprTopLevelBinds)
 import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Simpl.Monad
@@ -35,9 +36,9 @@ import DynFlags    ( DynFlags, gopt, GeneralFlag(..), ufKeenessFactor, ufUseThre
 import FastString
 import Id
 import HscTypes    ( ModGuts(..) )
-import Literal     ( Literal, litIsDupable )
+import Literal     ( litIsDupable )
+import Maybes      ( whenIsJust )
 import MonadUtils
-import OccurAnal   ( occurAnalysePgm )
 import Outputable
 import Pair
 import qualified PprCore as Core
@@ -80,53 +81,55 @@ plugin = defaultPlugin {
 
 runSimplifier :: Int -> SimplifierMode -> ModGuts -> CoreM ModGuts
 runSimplifier iters mode guts
-  = go 1 guts
+  = do
+    let coreBinds = mg_binds guts
+        binds = fromCoreModule coreBinds
+    when linting $ whenIsJust (lintCoreBindings binds) $ \err ->
+      pprPgmError "Sequent Core Lint error (pre-simpl)"
+        (withPprStyle defaultUserStyle $ err
+                                      $$ pprTopLevelBinds binds 
+                                      $$ text "--- Original Core: ---"
+                                      $$ Core.pprCoreBindings coreBinds)
+    binds' <- go 1 binds
+    return $ guts { mg_binds = bindsToCore binds' }
   where
-    go n guts
+    go n binds
       | n > iters
       = do
         errorMsg  $  text "Ran out of gas after"
                  <+> int iters
                  <+> text "iterations."
-        return guts
+        return binds
       | otherwise
       = do
         let globalEnv = SimplGlobalEnv { sg_mode = mode }
             mod       = mg_module guts
-            coreBinds = mg_binds guts
-            occBinds  = runOccurAnal mod coreBinds
-            binds     = fromCoreModule occBinds
-        when linting $ case lintCoreBindings binds of
-          Just err -> pprPgmError "Sequent Core Lint error (pre-simpl)"
-            (withPprStyle defaultUserStyle $ err $$ pprTopLevelBinds binds $$ Core.pprCoreBindings occBinds)
-          Nothing -> return ()
+            occBinds  = runOccurAnal mod binds
         when dumping $ putMsg  $ text "BEFORE" <+> int n
-                              $$ text "--------" $$ pprTopLevelBinds binds
-        (binds', count) <- runSimplM globalEnv $ simplModule binds
+                              $$ text "--------" $$ pprTopLevelBinds occBinds
+        (binds', count) <- runSimplM globalEnv $ simplModule occBinds
         when linting $ case lintCoreBindings binds' of
           Just err -> pprPanic "Sequent Core Lint error"
             (withPprStyle defaultUserStyle $ err $$ pprTopLevelBinds binds')
           Nothing -> return ()
-        when dumping $ putMsg  $ text "AFTER" <+> int n
-                              $$ text "-------" $$ pprTopLevelBinds binds'
-        let coreBinds' = bindsToCore binds'
-            guts'      = guts { mg_binds = coreBinds' }
         when dumping $ putMsg  $ text "SUMMARY" <+> int n
-                              $$ text "---------" $$ pprSimplCount count
-                              $$ text "CORE AFTER" <+> int n
-                              $$ text "------------" $$ ppr coreBinds'
+                              $$ text "---------"
+                              $$ pprSimplCount count
+                              $$ text "AFTER" <+> int n
+                              $$ text "-------"
+                              $$ pprTopLevelBinds binds'
         if isZeroSimplCount count
           then do
             when tracing $ putMsg  $  text "Done after"
                                   <+> int n <+> text "iterations"
-            return guts'
-          else go (n+1) guts'
-    runOccurAnal mod core
+            return binds'
+          else go (n+1) binds'
+    runOccurAnal mod binds
       = let isRuleActive = const False
             rules        = []
             vects        = []
             vectVars     = emptyVarSet
-        in occurAnalysePgm mod isRuleActive rules vects vectVars core
+        in occurAnalysePgm mod isRuleActive rules vects vectVars binds
 
 simplModule :: [InBind] -> SimplM [OutBind]
 simplModule binds
@@ -1052,29 +1055,3 @@ commandIsDupable dflags c
 -- see GHC CoreUtils.lhs
 dupAppSize :: Int
 dupAppSize = 8
-
--- TODO This might be generally useful; move to Syntax.hs?
-data Value b
-  = LitVal Literal
-  | LamVal [b] (Term b)
-  | ConsVal DataCon [Type] [Term b]
-  
-type SeqCoreValue = Value SeqCoreBndr
-type InValue = SeqCoreValue
-type OutValue = SeqCoreValue
-  
-splitValue :: Term b -> Kont b -> Maybe (Value b, Kont b)
-splitValue (Lit lit) kont = Just (LitVal lit, kont)
-splitValue term@(Lam {}) kont = Just (uncurry LamVal (lambdas term), kont)
-splitValue (Var fid) kont
-  | Just dc <- isDataConWorkId_maybe fid
-  , length valArgs == dataConRepArity dc
-  = Just (ConsVal dc tyArgs valArgs, kont')
-  where
-    (tyArgs, valArgs, kont') = collectTypeAndOtherArgs kont
-splitValue _ _               = Nothing
-
-valueToTerm :: SeqCoreValue -> SeqCoreTerm
-valueToTerm (LitVal lit)          = Lit lit
-valueToTerm (LamVal xs t)         = mkLambdas xs t
-valueToTerm (ConsVal dc tys vals) = mkConstruction dc tys vals

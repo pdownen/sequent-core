@@ -31,6 +31,7 @@ library
                        Language.SequentCore.Dump
                        Language.SequentCore.Inspect
                        Language.SequentCore.Lint
+                       Language.SequentCore.OccurAnal
                        Language.SequentCore.Plugin
                        Language.SequentCore.Pretty
                        Language.SequentCore.Simpl
