@@ -35,6 +35,8 @@
 \newkeyword{\Ret}{ret}
 \newkeyword{\Rec}{rec}
 
+\newcommand{\hash}{\#}
+
 \newcommand{\blank}{{\rule{1ex}{0.5pt}}}
 \newcommand{\ann}[2]{#1{:}{#2}}
 \newcommand{\vect}[2][]{{\vv{#2}}^{#1}}
@@ -44,8 +46,10 @@
 \newcommand{\trans}[1]{\left\llbracket{#1}\right\rrbracket}
 
 \newcommand{\stackty}[2]{\exists{#1}.({#2})}
+\newcommand{\packrets}[2][]
+{\ifthenelse{\equal{#1}{}}{#2}{#2:#1}}
 \newcommand{\pack}{\app}
-\newcommand{\packs}{\pack}
+\newcommand{\packs}[3][]{\packrets[#1]{\pack{#2}{#3}}}
 \newcommand{\fnk}{\fn}
 
 \newcommand{\eqty}[2]{#1 \sim #2}
