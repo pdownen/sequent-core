@@ -964,7 +964,7 @@ mkDupableAlt env caseBndr alt@(Alt altCon bndrs rhs)
         
         let (tyBndrs, valBndrs) = span isTyVar used_bndrs
             bndrTys = map idType valBndrs
-            argTy   = foldr mkUbxExistsTy (mkTupleTy UnboxedTuple bndrTys) tyBndrs
+            argTy   = mkKontArgsTy $ foldr mkUbxExistsTy (mkTupleTy UnboxedTuple bndrTys) tyBndrs
         
         (_, join_bndr) <- mkFreshVar env (fsLit "*j") (mkKontTy argTy)
         

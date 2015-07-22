@@ -1,4 +1,4 @@
-{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE MagicHash, GADTs #-}
 
 module Main where
 
@@ -45,6 +45,20 @@ case5
   = let {-# NOINLINE k #-}
         k x = case x of { 0# -> True; _ -> False }
     in if flag then True else k 1#
+
+data Stringy where Stringy :: a -> (a -> String) -> Stringy
+
+{-# NOINLINE stringy #-}
+stringy :: Stringy
+stringy = Stringy (3 :: Int) show
+
+case6 :: String
+case6
+  = let {-# NOINLINE k #-}
+        k x = case x of { [] -> "Empty!"; s -> s }
+        {-# NOINLINE g #-}
+        g y f = k (f y)
+    in case stringy of Stringy y f -> g y f
 
 main :: IO ()
 main = return ()
