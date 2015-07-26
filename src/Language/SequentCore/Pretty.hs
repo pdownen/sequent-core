@@ -46,20 +46,26 @@ ppr_binds_with open mid close binds = vcat $ intersperse space $ ppr_block open 
 ppr_binding :: OutputableBndr b => BindPair b -> SDoc
 ppr_binding pair
   = pprBndr LetBind val_bdr $$
-    hang (ppr val_bdr <+> equals) 2 (either pprCoreTerm pprCoreKont (rhsOfPair pair))
-  where val_bdr = binderOfPair pair
+    hang (ppr val_bdr <+> equals) 2 body
+  where
+    val_bdr = binderOfPair pair
+    body = either pprCoreTerm pprCorePKont (rhsOfPair pair)
 
 ppr_comm :: OutputableBndr b => (SDoc -> SDoc) -> Command b -> SDoc
 ppr_comm add_par comm
-  = maybe_add_par $ ppr_let <+> cut (cmdTerm comm) (cmdKont comm)
+  = maybe_add_par $ ppr_let <+> ppr_cut
   where
+    (binds, cut) = flattenCommand comm
     ppr_let
-      = case cmdLet comm of
-          [] -> empty
-          binds -> hang (text "let") 2 (ppr_binds binds) $$ text "in"
-    maybe_add_par = if null (cmdLet comm) then noParens else add_par
-    cut val kont
-      = cat [text "<" <> pprCoreTerm val, vcat $ ppr_block "|" ";" ">" $ ppr_kont_frames kont]
+      | null binds = empty
+      | otherwise  = hang (text "let") 2 (ppr_binds binds) $$ text "in"
+    maybe_add_par = if null binds then noParens else add_par
+    ppr_cut
+      = case cut of
+          Left (term, kont) -> cat [text "<" <> pprCoreTerm term,
+                                    vcat $ ppr_block "|" ";" ">" $ ppr_kont_frames kont]
+          Right (args, j)   -> sep [text "<jump", parens (sep $ punctuate comma (map pprCoreTerm args)),
+                                    text "|", ppr j <> text ">"]
 
 ppr_term :: OutputableBndr b => (SDoc -> SDoc) -> Term b -> SDoc
 ppr_term _ (Var name) = ppr name
@@ -82,10 +88,6 @@ ppr_term add_par (Compute kbndr comm)
   = add_par $
       hang (text "compute" <+> pprBndr LambdaBind kbndr)
         2 (pprCoreComm comm)
-ppr_term add_par (KArgs ty vs)
-  = add_par $
-      text "(!" <+> sep (punctuate comma (map pprCoreTerm vs)) <+> text "!)" <+>
-      text "::" <+> ppr ty
 
 ppr_kont_frames :: OutputableBndr b => Kont b -> [SDoc]
 ppr_kont_frames (App v k)
@@ -93,9 +95,6 @@ ppr_kont_frames (App v k)
 ppr_kont_frames (Case var alts)
   = [hang (text "case as" <+> pprBndr LetBind var <+> text "of") 2 $
       vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)]
-ppr_kont_frames (KLam bndrs body)
-  = [hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs) <+> arrow)
-      2 (pprCoreComm body)]
 ppr_kont_frames (Cast _ k)
   = text "cast ..." : ppr_kont_frames k
 ppr_kont_frames (Tick _ k)
@@ -110,6 +109,13 @@ ppr_kont add_par k
   | otherwise
   = add_par $ sep $ punctuate semi (ppr_kont_frames k)
   where frames = ppr_kont_frames k
+
+ppr_pkont :: OutputableBndr b => (SDoc -> SDoc) -> PKont b -> SDoc
+ppr_pkont add_par (PKont bndrs body)
+  = add_par $
+      hang (char '\\' <+> parens (sep (punctuate comma $ map (pprBndr LambdaBind) bndrs))
+                      <+> arrow)
+        2 (pprCoreComm body)
 
 pprCoreAlt :: OutputableBndr b => Alt b -> SDoc
 pprCoreAlt (Alt con args rhs)
@@ -127,8 +133,8 @@ pprCoreComm comm = ppr_comm noParens comm
 pprCoreTerm :: OutputableBndr b => Term b -> SDoc
 pprCoreTerm val = ppr_term noParens val
 
-pprCoreKont :: OutputableBndr b => Kont b -> SDoc
-pprCoreKont kont = ppr_kont noParens kont
+pprCorePKont :: OutputableBndr b => PKont b -> SDoc
+pprCorePKont pkont = ppr_pkont noParens pkont
 
 noParens :: SDoc -> SDoc
 noParens pp = pp
@@ -147,6 +153,9 @@ instance OutputableBndr b => Outputable (Command b) where
 
 instance OutputableBndr b => Outputable (Kont b) where
   ppr = ppr_kont noParens
+  
+instance OutputableBndr b => Outputable (PKont b) where
+  ppr = ppr_pkont noParens
 
 instance OutputableBndr b => Outputable (Alt b) where
   ppr = pprCoreAlt

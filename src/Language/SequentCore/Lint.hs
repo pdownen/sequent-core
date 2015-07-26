@@ -3,7 +3,6 @@ module Language.SequentCore.Lint ( lintCoreBindings, lintTerm ) where
 import Language.SequentCore.Syntax
 import Language.SequentCore.WiredIn
 
-import BasicTypes   ( TupleSort(..) )
 import Coercion     ( coercionKind, coercionType )
 import Id
 import Kind
@@ -11,7 +10,6 @@ import Literal
 import Outputable
 import Pair
 import Type
-import TysWiredIn   ( mkTupleTy )
 import VarEnv
 
 import Control.Monad
@@ -62,7 +60,7 @@ emptyLintEnv = mkLintEnv emptyTvSubst emptyTvSubst
 extendLintEnv :: LintEnv -> BindPair Var -> LintEnv
 extendLintEnv env (BindTerm bndr _term)
   = mapTermLintEnv (\ent -> extendTvInScope ent bndr) env
-extendLintEnv env (BindKont bndr _kont)
+extendLintEnv env (BindPKont bndr _pk)
   = mapKontLintEnv (\enk -> extendTvInScope enk bndr) env
 
 extendLintEnvList :: LintEnv -> [BindPair Var] -> LintEnv
@@ -90,7 +88,7 @@ lintCoreBind env (NonRec pair)
     let bndr   = binderOfPair pair
         bndrTy = substTy (termEnv env) (idType bndr)
         bndr'  = bndr `setIdType` bndrTy
-        pair'  = pair { binderOfPair = bndr' }
+        pair'  = pair `setPairBinder` bndr'
         env'   = extendLintEnv env pair'
     lintCoreBindPair env pair'
     return env'
@@ -99,7 +97,7 @@ lintCoreBind env (Rec pairs)
     let bndrs   = map binderOfPair pairs
         bndrTys = map (substTy (termEnv env) . idType) bndrs
         bndrs'  = zipWith setIdType bndrs bndrTys
-        pairs'  = zipWith (\pair bndr' -> pair { binderOfPair = bndr' }) pairs bndrs'
+        pairs'  = zipWith setPairBinder pairs bndrs'
         env'    = extendLintEnvList env pairs'
     mapM_ (lintCoreBindPair env') pairs'
     return env'
@@ -131,11 +129,36 @@ lintCoreBindPair env (BindTerm bndr term)
   = do
     termTy <- lintCoreTerm (termEnv env) term
     checkRhsType bndr (idType bndr) termTy
-lintCoreBindPair env (BindKont bndr kont)
+lintCoreBindPair env (BindPKont bndr (PKont xs comm))
   = do
-    kontTy <- kontIdTyOrError (termEnv env) bndr
-    lintCoreKont (text "in RHS for cont id" <+> ppr bndr)
-                 env kontTy kont
+    lintKontBndrTypes (termEnv env) bndr xs
+    let (ent, _) = mapAccumL lintBindInTermEnv (termEnv env) xs
+    lintCoreCommand (mkLintEnv ent (kontEnv env)) comm
+
+lintKontBndrTypes :: TermEnv -> SeqCoreBndr -> [SeqCoreBndr] -> LintM ()
+lintKontBndrTypes env bndr argBndrs
+  = do
+    bndrTy <- kontIdTyOrError env bndr
+    argsTy <- case isKontArgsTy_maybe bndrTy of
+                Just argsTy -> return argsTy
+                Nothing     -> Left $ text "binder should have Cont# (ContArgs# _) type:" <+>
+                                      pprBndr LetBind bndr
+    go argsTy argBndrs
+  where
+    go ty bndrs
+      | isUbxExistsTy ty
+      = case bndrs of
+          [] -> Left $ text "not enough binders for existential:" <+> pprBndr LetBind bndr
+                    $$ text "binders:" <+> sep (map (pprBndr LambdaBind) argBndrs)
+          bndr:bndrs' -> go (applyUbxExists ty (substTy env (mkTyVarTy bndr))) bndrs'
+      | isUnboxedTupleType ty
+      , Just (_, argTys) <- splitTyConApp_maybe ty
+      , and $ zipWith eqType argTys (map (substTy env . idType) bndrs)
+      = return ()
+      | otherwise
+      = Left $ text "wrong binder types for continuation binder:" <+> pprBndr LetBind bndr
+            $$ text "binders:" <+> sep (map (pprBndr LambdaBind) argBndrs)
+            $$ text "as of:" <+> ppr ty $$ text "and:" <+> ppr bndrs
 
 lintCoreTerm :: TermEnv -> SeqCoreTerm -> LintM Type
 lintCoreTerm env (Var x)
@@ -163,26 +186,6 @@ lintCoreTerm env (Compute bndr comm)
   where
     enk = extendTvInScope emptyTvSubst (substTyInId env bndr)
 
-lintCoreTerm env (KArgs ty args)
-  = do
-    ty' <- case isKontArgsTy_maybe ty of
-             Just ty' -> return ty'
-             Nothing  -> Left $ text "expected ContArgs# type:" <+> ppr ty <+>
-                                text "with continuation args:" <+> ppr args
-    let (tyArgs, valArgs) = partitionTypes args
-    ty'' <- case applysUbxExists_maybe ty' tyArgs of
-             Just ty'' -> return ty''
-             Nothing  -> Left $ text "expected unboxed existentials:" <+>
-                                text "type" <+> ppr ty' <> comma <+>
-                                text "args" <+> ppr tyArgs
-    unless (isUnboxedTupleType ty'') $
-      Left $ text "not an unboxed tuple type:" <+> ppr ty''
-    let (_, tys) = splitTyConApp ty''
-    forM_ (zip3 [1..] tys valArgs) $ \(n, argTy, arg) ->
-      checkingType (speakNth n <+> text "continuation argument") argTy $
-        lintCoreTerm env arg
-    return ty
-
 lintCoreTerm _env (Lit lit)
   = return $ literalType lit
 
@@ -203,16 +206,45 @@ lintBindInTermEnv env x
     env' = extendTvInScope env x'
 
 lintCoreCommand :: LintEnv -> SeqCoreCommand -> LintM ()
-lintCoreCommand env (Command { cmdLet = binds, cmdTerm = term, cmdKont = kont })
+lintCoreCommand env (Let bind comm)
   = do
-    env' <- foldM lintCoreBind env binds
-    lintCoreCut env' term kont
+    env' <- lintCoreBind env bind
+    lintCoreCommand env' comm
+lintCoreCommand env (Eval term kont)
+  = lintCoreCut env term kont
+lintCoreCommand env (Jump args j)
+  = lintCoreJump env args j
 
 lintCoreCut :: LintEnv -> SeqCoreTerm -> SeqCoreKont -> LintM ()
 lintCoreCut env term kont
   = do
     ty <- lintCoreTerm (termEnv env) term
     lintCoreKont (text "in continuation of" <+> ppr term) env ty kont
+
+lintCoreJump :: LintEnv -> [SeqCoreArg] -> PKontId -> LintM ()
+lintCoreJump env args j
+  = do
+    ty <- kontIdTyOrError (termEnv env) j
+    argsTy <- case isKontArgsTy_maybe (substTy (termEnv env) ty) of
+                Just argsTy -> return argsTy
+                Nothing     -> Left $ text "target of jump should have type Cont# (ContArgs# _):" <+>
+                                      pprBndr LetBind j
+    go args argsTy args
+  where
+    go (Type argTy : args') ty topArgs
+      = case applyUbxExists_maybe ty (substTy (termEnv env) argTy) of
+          Just ty' -> go args' ty' topArgs
+          Nothing  -> mkError (text "type of polymorphic jump")
+                              (text "existential type") (ppr ty)
+    go args' ty topArgs
+      | isUnboxedTupleType ty
+      , Just (_, argTys) <- splitTyConApp_maybe ty
+      = forM_ (zip3 [1..] argTys args') $ \(n, argTy, arg) ->
+          checkingType (speakNth n <+> text "argument of jump") argTy $
+            lintCoreTerm (termEnv env) arg
+      | otherwise
+      = Left $ text "bad parameterized continuation type in binder:" <+> pprBndr LetBind j
+            $$ text "for args:" <+> ppr topArgs
 
 lintCoreKont :: SDoc -> LintEnv -> Type -> SeqCoreKont -> LintM ()
 lintCoreKont desc env ty (Return k)
@@ -262,22 +294,6 @@ lintCoreKont desc env ty (Case bndr alts)
       lintCoreCommand (mapTermLintEnv (\ent' -> extendTvInScopeListSubsted ent' bndrs) env') rhs
     void $ checkingType (desc <> colon <+> text "type of case binder") ty $
       return $ substTy (termEnv env) (idType bndr)
-lintCoreKont desc env ty (KLam xs comm)
-  = do
-    ty' <- case isKontArgsTy_maybe ty of
-             Just ty' -> return ty'
-             Nothing -> Left $ desc <> colon <+> text "not a ContArgs# type:" <+> ppr ty
-    let (tyBndrs, valBndrs) = span isTyVar xs
-    ty'' <- case applysUbxExists_maybe ty' (map mkTyVarTy tyBndrs) of
-             Just ty'' -> return ty''
-             Nothing -> Left $ desc <> colon <+> text "not enough unboxed exists:" <+> ppr ty'
-    let argTys = map idType valBndrs
-    void $ checkingType (desc <> colon <+> text "argument type for cont lambda") ty'' $
-      return (mkTupleTy UnboxedTuple argTys)
-    let (ent, enk) = env
-        (ent', _)  = mapAccumL lintBindInTermEnv ent xs
-        env' = (ent', enk)
-    lintCoreCommand env' comm
 
 extendTvInScopeSubsted :: TvSubst -> Var -> TvSubst
 extendTvInScopeSubsted tvs var
