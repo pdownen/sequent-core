@@ -498,7 +498,10 @@ termType _other         = alphaTy
 termArity :: HasId b => Term b -> Int
 termArity (Var x)
   | isId x = idArity x
-termArity (Lam _ t)
+termArity (Lam x t)
+  | Type.isTyVar (identifier x)
+  = termArity t
+  | otherwise
   = 1 + termArity t
 termArity _
   = 0
