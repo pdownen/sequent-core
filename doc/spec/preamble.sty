@@ -3,7 +3,7 @@
 \usepackage{esvect}
 
 \newcommand{\expr}{e}
-\newcommand{\com}{c}
+\newcommand{\cmd}{c}
 \newcommand{\tm}{v}
 \newcommand{\ko}{k}
 \newcommand{\ty}{\tau}
@@ -20,6 +20,35 @@
 \newcommand{\decl}{decl}
 \newcommand{\pgm}{pgm}
 \newcommand{\rhs}{rhs}
+\newcommand{\bp}{bp}
+\newcommand{\atick}{tick}
+
+\newcommand{\typecmd}[3]{#1; #2 \vdash_{cmd} #3 \Ok}
+\newcommand{\typetm}[3]{#1 \vdash_{tm} #2 : #3}
+\newcommand{\typejmptm}[3]{#1 \vdash_{jtm} \Jump #2 : #3}
+\newcommand{\typeko}[4]{#1; #2 \vdash_{ko} #3 : #4}
+\newcommand{\typejmpko}[4]{#1; #2 \vdash_{jko} #3 : #4}
+\newcommand{\typebind}[5]{#1; #2 \vdash_{bind} #3 : (#4; #5)}
+\newcommand{\typebp}[5]{#1; #2 \vdash_{bp} #3 : (#4; #5)}
+\newcommand{\typealt}[4]{#1; #2 \vdash_{alt} #3 : #4}
+\newcommand{\typety}[3]{#1 \vdash_{ty} #2 : #3}
+\newcommand{\typeki}[3]{#1 \vdash_{ki} #2 : #3}
+\newcommand{\typecn}[3]{#1 \vdash_{cn} #2 : #3}
+\newcommand{\typedecl}[3]{#1 \vdash_{decl} #2 : #3}
+\newcommand{\typepgm}[3]{#1; #2 \vdash_{pgm} #3 \Ok}
+
+\newcommand{\scopecmd}{\typecmd}
+\newcommand{\scopetm}[2]{#1 \vdash_{tm} #2 \Ok}
+\newcommand{\scopejmp}[2]{#1 \vdash_{jmp} #2 \Ok}
+\newcommand{\scopeko}[3]{#1; #2 \vdash_{ko} #3 \Ok}
+\newcommand{\scopebind}{\typebind}
+\newcommand{\scopebp}{\typebp}
+\newcommand{\scopealt}[3]{#1; #2 \vdash_{alt} #3 \Ok}
+\newcommand{\scopety}[2]{#1 \vdash_{ty} #2 \Ok}
+\newcommand{\scopeki}[2]{#1 \vdash_{ki} #2 \Ok}
+\newcommand{\scopecn}[2]{#1 \vdash_{cn} #2 \Ok}
+\newcommand{\scopedecl}{\typedecl}
+\newcommand{\scopepgm}{\typepgm}
 
 \newcommand{\mt}{\varepsilon}
 
@@ -32,14 +61,21 @@
 \newkeyword{\Case}{case}
 \newkeyword{\Of}{of}
 \newkeyword{\As}{as}
-\newkeyword{\Ret}{ret}
 \newkeyword{\Rec}{rec}
+\newkeyword{\NonRec}{nonrec}
+\newkeyword{\Ret}{ret}
+\newkeyword{\Jump}{jump}
+\newkeyword{\Returns}{returns}
+\newkeyword{\Cont}{cont}
+\newkeyword{\Val}{val}
 
 \newcommand{\hash}{\#}
 
 \newcommand{\blank}{{\rule{1ex}{0.5pt}}}
 \newcommand{\ann}[2]{#1{:}{#2}}
 \newcommand{\vect}[2][]{{\vv{#2}}^{#1}}
+
+\newcommand{\subst}[2]{[#2/#1]}
 
 \newcommand{\hole}{\square}
 
@@ -52,6 +88,12 @@
 \newcommand{\packs}[3][]{\packrets[#1]{\pack{#2}{#3}}}
 \newcommand{\fnk}{\fn}
 
+\newcommand{\jump}[2]{\cut{\Jump #1}{#2}}
+\newcommand{\unitjmpty}{Unit\hash}
+\newcommand{\prodjmptyop}{\times_\hash}
+\newcommand{\prodjmpty}[2]{#1 \prodjmptyop #2}
+\newcommand{\existjmpty}[1]{\exists_\hash #1.}
+
 \newcommand{\eqty}[2]{#1 \sim #2}
 \newcommand{\gives}{\Rightarrow}
 
@@ -63,14 +105,20 @@
 \newcommand{\fn}[1]{\lambda{#1}.}
 \newcommand{\coerce}[2]{{#1}\triangleright{#2}}
 
+\newcommand{\ret}[1]{\Ret #1}
 \newcommand{\letin}{\compute}
 \newcommand{\app}[2]{{#1}\cdot{#2}}
 \newcommand{\koerce}[2]{{#1}\triangleleft{#2}}
+\newcommand{\tick}[2]{#1; #2}
 \newcommand{\caseas}[2]{\Case\As{#1}\Of{#2}}
 \newcommand{\tp}{exit}
 
 \newcommand{\bind}[2]{#1 = #2}
+\newcommand{\bindk}[2]{\Cont\bind{#1}{#2}}
+\newcommand{\bindv}[2]{\Val\bind{#1}{#2}}
 \newcommand{\rec}[1]{\Rec\left\{{#1}\right\}}
+% \newcommand{\nonrec}[1]{\NonRec{#1}}
+\newcommand{\nonrec}[1]{#1}
 \newcommand{\alt}[2]{#1 \to #2}
 
 \newcommand{\Alt}{\mid}
