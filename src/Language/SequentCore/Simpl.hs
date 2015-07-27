@@ -289,10 +289,36 @@ simplPKontBind env_j j j' env_pk pk _recFlag
                         return $ env_j `addFloats` env_with_floats
         completeBind env_j' j j' (Right (PKont xs' comm')) NotTopLevel
 
-bindAsCurrentKont :: SimplEnv -> InKontId -> StaticEnv -> InKont -> SimplM SimplEnv
-bindAsCurrentKont env_p p env_k k
-  = let (env_p', _) = enterScope env_p p
-    in return env_p' { se_retKont = Just (Susp env_k k) }
+-- | Bind a continuation as the current one (as bound by a Compute). Unlike with
+-- simplLazyBind and simplPKontBind, here we *have* to substitute (that is,
+-- either pre-inline or post-inline) since we can't give a continuation a
+-- let binding.
+simplKontBind :: SimplEnv -> InKontId -> StaticEnv -> InKont -> SimplM SimplEnv
+simplKontBind env_p p env_k k
+  | preInline
+  = do
+    tick $ PreInlineUnconditionally p
+    return env_p' { se_retKont = Just (Susp env_k k) }
+  | otherwise
+  = do
+    tick $ PostInlineUnconditionally p
+    (env_k', k') <- mkDupableKont (zapFloats (env_k `inDynamicScope` env_p'))
+                                  (kontTyArg (idType retId)) k
+    return (env_p' `addFloats` env_k') { se_retKont = Just (Done k') }
+  where
+    (env_p', _) = enterScope env_p p -- ignore cloned p because we're
+                                     -- substituting anyway
+    retId = se_retId env_p `orElse` panic "simplKontBind at top level"
+    
+    -- Pre-inline (i.e. substitute whole rather than making it dupable first)
+    -- whenever 
+    preInline
+      = case idOccInfo p of
+          OneOcc _ notInBranch _ -> notInBranch
+          other                  -> warnPprTrace True __FILE__ __LINE__
+                                    (text "weird OccInfo for cont var"
+                                      <+> ppr p <> colon <+> ppr other)
+                                    False
 
 wrapFloatsAroundTerm :: SimplEnv -> OutTerm -> SimplM OutTerm
 wrapFloatsAroundTerm env term
@@ -512,7 +538,7 @@ simplCut3 env_v term env_k (Case case_bndr [Alt _ bndrs rhs])
 
 simplCut3 env_v (Compute p c) env_k kont
   = do
-    env_v' <- bindAsCurrentKont env_v p env_k kont
+    env_v' <- simplKontBind env_v p env_k kont
     simplCommand env_v' c
 simplCut3 env_v term@(Lit {}) env_k kont
   = simplKontWith (env_v `setStaticPart` env_k) term kont
@@ -575,24 +601,11 @@ simplKont env kont
         go env kont (kc . Cast co')
     go env (Case x alts) kc
       = do
-        env' <- case alts of
-                  -- We're about to fork the context, thus duplicating the return
-                  -- continuation, so now's when we make sure it's okay to duplicate it.
-                  (_:_:_) -> ensureRetKontDupable env
-                  _       -> return env
-        let (env'', x') = enterScope env' x
+        let (env', x') = enterScope env x
         -- FIXME The Nothing there could be the scrutinee, but we don't ever
         -- have access to it here.
-        alts' <- forM alts (simplAlt env'' Nothing [] x)
-        -- FIXME We're forgetting that we made the ret cont dupable! Can this
-        -- be a problem? (Maybe not: How can there be another reference to it if
-        -- we just split its scope for the first time?)
-        
-        -- Long-term solution is to have a sequent-aware occurrence analyser so
-        -- we can know from the start whether we need to duplicate a
-        -- continuation (the binder would say whether it's used in multiple
-        -- branches).
-        return (env `addFloats` env', kc (Case x' alts'))
+        alts' <- forM alts (simplAlt env' Nothing [] x)
+        return (env, kc (Case x' alts'))
     go env (Tick ti kont) kc
       = go env kont (kc . Tick ti)
     go env (Return x) kc
@@ -858,30 +871,6 @@ inlineDFun _env bndrs con conArgs kont
     term          = mkLambdas bndrs bodyTerm
     bodyTerm      = mkAppTerm (Var (dataConWorkId con)) conArgs
 
-ensureRetKontDupable :: SimplEnv -> SimplM SimplEnv
-ensureRetKontDupable env
-  | se_retKontDupable env
-  = return env
-  | otherwise
-  -- Arguably, se_retKont and se_retKontDupable are redundant; as of this
-  -- writing, se_retKontDupable is False iff se_retKont is Just (Susp _ _). This
-  -- seems like a fragile circumstance, though.
-  = case se_retKont env of
-      Just (Done k)          -> warnPprTrace True __FILE__ __LINE__
-                                (text "OutKont not marked as dupable in env:" <+> ppr k)
-                                return env_markedDupable
-      Just (DoneId {})       -> return env_markedDupable
-      Nothing                -> return env_markedDupable
-      Just (Susp env_k kont) -> do
-                                (env', kont') <- mkDupableKont (env_k `inDynamicScope` env) ty kont
-                                return (env' `setStaticPart` staticPart env)
-                                         { se_retKont = Just (Done kont')
-                                         , se_retKontDupable = True }
-  where
-    env_markedDupable = env { se_retKontDupable = True }
-    retId = se_retId env `orElse` panic "ensureRetKontDupable at top level"
-    ty = kontTyArg (idType retId)
-
 -- | Make a continuation into something we're okay with duplicating into each
 -- branch of a case (and each branch of those branches, ...), possibly
 -- generating a number of bound terms and join points in the process.
@@ -912,10 +901,10 @@ mkDupableKont env ty kont
       = case substKv env kid of
           DoneId kid'               -> return (env, kk (Return kid'))
           Done   kont'              -> do
-                                       let env' = zapFloats (zapSubstEnvs env)
+                                       let env' = zapSubstEnvs env
                                        go env' kk ty kont'
           Susp stat kont'           -> do
-                                       let env' = zapFloats (stat `inDynamicScope` env)
+                                       let env' = stat `inDynamicScope` env
                                        go env' kk ty kont'
     
     go env kk _ty (Cast co kont)

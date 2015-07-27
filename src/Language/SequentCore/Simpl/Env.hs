@@ -63,8 +63,6 @@ data SimplEnv
                 , se_cvSubst :: CvSubstEnv     -- InCoVar   |--> OutCoercion
                 , se_retId   :: Maybe KontId
                 , se_retKont :: Maybe KontSubstAns
-                , se_retKontDupable
-                             :: Bool
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
                 , se_defs    :: IdDefEnv       -- OutId     |--> Definition (out)
                 , se_floats  :: Floats
@@ -175,8 +173,6 @@ initialEnv dflags
              , se_cvSubst = emptyVarEnv
              , se_retId   = Nothing
              , se_retKont = Nothing
-             , se_retKontDupable
-                          = False
              , se_inScope = emptyInScopeSet
              , se_defs    = emptyVarEnv
              , se_floats  = emptyFloats
@@ -197,7 +193,7 @@ enterScope env x
     env'  | isTyVar x   = env { se_tvSubst = tvs', se_inScope = ins', se_defs = defs' }
           | isCoVar x   = env { se_cvSubst = cvs', se_inScope = ins', se_defs = defs' }
           | isPKontId x = env { se_pvSubst = pvs', se_inScope = ins', se_defs = defs' }
-          | isKontId x  = env { se_pvSubst = emptyVarEnv, se_retId = Just x, se_retKontDupable = False
+          | isKontId x  = env { se_pvSubst = emptyVarEnv, se_retId = Just x
                               , se_retKont = rk',  se_inScope = ins', se_defs = defs' }
           | otherwise   = env { se_idSubst = ids', se_inScope = ins', se_defs = defs' }
     ids'  | x' /= x     = extendVarEnv ids x (DoneId x')
@@ -237,8 +233,7 @@ mkFreshKontId env name inTy
     let env' = env { se_inScope = extendInScopeSet (se_inScope env) p
                    , se_pvSubst = emptyVarEnv
                    , se_retId   = Just p
-                   , se_retKont = Nothing
-                   , se_retKontDupable = False }
+                   , se_retKont = Nothing }
     return (env', p)
 
 substId :: SimplEnv -> InId -> TermSubstAns
@@ -319,8 +314,7 @@ zapSubstEnvs env
         , se_pvSubst = emptyVarEnv
         , se_tvSubst = emptyVarEnv
         , se_cvSubst = emptyVarEnv
-        , se_retKont = Nothing
-        , se_retKontDupable = False }
+        , se_retKont = Nothing }
 
 retType :: SimplEnv -> Type
 retType env
@@ -341,9 +335,7 @@ setStaticPart dest (StaticEnv src)
          , se_tvSubst = se_tvSubst src
          , se_cvSubst = se_cvSubst src
          , se_retId   = se_retId   src
-         , se_retKont = se_retKont src
-         , se_retKontDupable
-                      = se_retKontDupable src }
+         , se_retKont = se_retKont src }
 
 inDynamicScope :: StaticEnv -> SimplEnv -> SimplEnv
 inDynamicScope = flip setStaticPart
@@ -590,8 +582,6 @@ instance Outputable SimplEnv where
     $$ text " TvSubst   =" <+> ppr (se_tvSubst env)
     $$ text " CvSubst   =" <+> ppr (se_cvSubst env)
     $$ text " RetId     =" <+> ppr (se_retId env)
-                           <+> (if se_retKontDupable env then text "(dupable)"
-                                                         else empty)
     $$ text " RetKont   =" <+> ppr (se_retKont env)
     $$ text " Floats    =" <+> ppr floatBndrs
      <> char '>'
@@ -605,8 +595,6 @@ instance Outputable StaticEnv where
     $$ text " TvSubst   =" <+> ppr (se_tvSubst env)
     $$ text " CvSubst   =" <+> ppr (se_cvSubst env)
     $$ text " RetId     =" <+> ppr (se_retId env)
-                           <+> (if se_retKontDupable env then text "(dupable)"
-                                                         else empty)
     $$ text " RetKont   =" <+> ppr (se_retKont env)
      <> char '>'
 
