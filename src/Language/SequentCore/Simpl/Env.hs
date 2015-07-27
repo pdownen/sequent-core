@@ -16,7 +16,8 @@ module Language.SequentCore.Simpl.Env (
   inDynamicScope, zapSubstEnvsStatic, retType,
   
   Floats, emptyFloats, addNonRecFloat, addRecFloats, zapFloats, zapKontFloats,
-  mapFloats, extendFloats, addFloats, wrapFloats, wrapKontFloats, isEmptyFloats,
+  mapFloats, extendFloats, addFloats, wrapFloats, wrapKontFloats,
+  isEmptyFloats, hasNoKontFloats,
   doFloatFromRhs, getFloatBinds, getFloats,
   
   termIsHNF, commandIsHNF
@@ -494,6 +495,11 @@ getFloats = se_floats
 
 isEmptyFloats :: SimplEnv -> Bool
 isEmptyFloats = isNilOL . floatBinds . se_floats
+
+-- XXX Should we cache this?
+hasNoKontFloats :: SimplEnv -> Bool
+hasNoKontFloats = foldrOL (&&) True . mapOL (all bindsTerm . flattenBind)
+                                    . floatBinds . se_floats
 
 findDef :: SimplEnv -> OutId -> Maybe Definition
 findDef env var

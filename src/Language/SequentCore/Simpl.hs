@@ -162,6 +162,11 @@ simplCommand env (Jump args j)
   = simplJump env args j
 
 simplTermNoFloats :: SimplEnv -> InTerm -> SimplM OutTerm
+simplTermNoFloats env (Compute p comm)
+  = do
+    let (env', p') = enterScope env p
+    comm' <- simplCommandNoFloats env' comm
+    return $ mkCompute p' comm'
 simplTermNoFloats env term
   = do
     (env', term') <- simplTerm (zapFloats env) term
@@ -320,11 +325,41 @@ simplKontBind env_p p env_k k
                                       <+> ppr p <> colon <+> ppr other)
                                     False
 
+{-
+Note [Wrap around compute]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Suppose we have floats F and we wrap around a term (compute p. c), that is, we
+calculate
+
+F[compute p. c].
+
+Remembering that terms are continuation-closed, we know two things:
+
+1. Any continuations let-bound in F will be dead bindings, and
+2. Any terms bound in F can float into c.
+
+We are safe, then, in saying
+
+F[compute p. c] = compute p. F'[c],
+
+where F' contains only the term bindings from F. Of course, if a binding *is*
+trying to float up past a compute, something has gone very wrong, so we check
+for this condition and warn.
+-}
+
 wrapFloatsAroundTerm :: SimplEnv -> OutTerm -> SimplM OutTerm
 wrapFloatsAroundTerm env term
   | isEmptyFloats env
   = return term
-  | otherwise
+wrapFloatsAroundTerm env (Compute p comm)
+  -- See Note [Wrap around compute]
+  = warnPprTrace (not $ hasNoKontFloats env) __FILE__ __LINE__
+      (text "cont floats escaping body of command:" <+> ppr comm $$
+       text "floats:" <+> brackets (pprWithCommas (ppr . bindersOf)
+                                                  (getFloatBinds (getFloats env)))) $
+    return $ Compute p (wrapFloats (zapKontFloats env) comm)
+wrapFloatsAroundTerm env term
   = do
     let ty = termType term
     (env', k) <- mkFreshKontId env (fsLit "*wrap") ty
@@ -457,11 +492,12 @@ simplCut3 env_v (Lam x body) env_k (App arg kont)
     tick (BetaReduction x)
     env_v' <- simplNonRec env_v x env_k arg NotTopLevel
     simplCut env_v' body env_k kont
-simplCut3 env_v (Lam x body) env_k kont
+simplCut3 env_v term@(Lam {}) env_k kont
   = do
-    let (env_v', x') = enterScope env_v x
+    let (xs, body) = lambdas term
+        (env_v', xs') = enterScopes env_v xs
     body' <- simplTermNoFloats env_v' body
-    simplKontWith (env_v' `setStaticPart` env_k) (Lam x' body') kont
+    simplKontWith (env_v' `setStaticPart` env_k) (mkLambdas xs' body') kont
 simplCut3 env_v term env_k kont
   | Just (value, Case x alts) <- splitValue term kont
   , Just (pairs, body) <- matchCase env_v value alts
