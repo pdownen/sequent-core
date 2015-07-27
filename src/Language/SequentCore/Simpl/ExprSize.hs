@@ -1,5 +1,5 @@
 module Language.SequentCore.Simpl.ExprSize (
-  ExprSize(..), termSize, kontSize, commandSize
+  ExprSize(..), termSize, kontSize, pKontSize, commandSize
 ) where
 
 import Language.SequentCore.Syntax
@@ -76,6 +76,7 @@ mkBodySize cap b as r
 
 termSize    :: DynFlags -> Int -> SeqCoreTerm    -> Maybe ExprSize
 kontSize    :: DynFlags -> Int -> SeqCoreKont    -> Maybe ExprSize
+pKontSize   :: DynFlags -> Int -> SeqCorePKont   -> Maybe ExprSize
 commandSize :: DynFlags -> Int -> SeqCoreCommand -> Maybe ExprSize
 
 -- We have three mutually recursive functions, but only one argument changes
@@ -96,12 +97,16 @@ commandSize dflags cap comm
 
 kontSize dflags cap kont = body2ExprSize [] $ bodySize dflags cap [] (K kont)
 
+pKontSize dflags cap (PKont xs comm)
+  = let valBinders = filter isId xs
+    in body2ExprSize valBinders $ bodySize dflags cap valBinders (C comm)
+
 bodySize dflags cap topArgs expr
   = cap `seq` size expr -- use seq to unbox cap now; we will use it often
   where
     size (T (Type _))       = sizeZero
     size (T (Coercion _))   = sizeZero
-    size (T (Var _))        = sizeZero -- invariant: not a nullary constructor
+    size (T (Var x))        = sizeCall x [] 0
     size (T (Compute _ comm)) = size (C comm)
     size (T (Lit lit))      = sizeN (litSize lit)
     size (T term@(Lam {}))  | erased    = size (T body)
@@ -109,18 +114,16 @@ bodySize dflags cap topArgs expr
       where 
         (xs, body)          = lambdas term
         erased              = all (\x -> not (isId x) || isRealWorldId x) xs
-    size (T (KArgs _ args)) = foldr (addSizeNSD . size . T) sizeZero args
     
     size (K (Return _))     = sizeZero
     size (K (Cast _ kont))  = size (K kont)
     size (K (Tick _ kont))  = size (K kont)
     size (K (App arg kont)) = sizeArg arg `addSizeNSD` size (K kont)
     size (K (Case _ alts))  = sizeAlts alts
-    size (K (KLam _ comm))  = -- Unclear that the scrutinee discount makes sense
-                              size (C comm)
 
-    size (C comm)           = sizeLets (cmdLet comm) `addSizeNSD`
-                              sizeCut (cmdTerm comm) (cmdKont comm)
+    size (C (Let b c))      = addSizeNSD (sizeBind b) (size (C c))
+    size (C (Eval v k))       = sizeCut v k
+    size (C (Jump args j))  = sizeJump args j
     
     sizeCut :: SeqCoreTerm -> SeqCoreKont -> BodySize
     -- Compare this clause to size_up_app in CoreUnfold; already having the
@@ -180,19 +183,23 @@ bodySize dflags cap topArgs expr
           -- An unlifted type has no heap allocation
           | isUnLiftedType (idType x) =  0
           | otherwise                 = 10
-    sizeBind (NonRec (BindKont _p kont))
-      = size (K kont)
+    sizeBind (NonRec (BindPKont _p (PKont _xs comm)))
+      = size (C comm)
 
     sizeBind (Rec pairs)
       = foldr (addSizeNSD . pairSize) (sizeN allocSize) pairs
       where
         allocSize                     = 10 * length (filter bindsTerm pairs)
         pairSize (BindTerm _x rhs)    = size (T rhs)
-        pairSize (BindKont _p kont)   = size (K kont)
+        pairSize (BindPKont _p (PKont _xs comm))
+                                      = size (C comm)
 
-    sizeLets :: [SeqCoreBind] -> BodySize
-    sizeLets binds = foldr (addSizeNSD . sizeBind) sizeZero binds
-
+    sizeJump :: [SeqCoreArg] -> PKontId -> BodySize
+    sizeJump args j
+      = let realArgs      = filter (not . isErasedTerm) args
+            voids         = count isRealWorldTerm realArgs
+        in sizeArgs realArgs `addSizeNSD` sizeCall j realArgs voids
+    
     addSizeN :: BodySize -> Int -> BodySize
     addSizeN TooBig            _ = TooBig
     addSizeN (BodySize b as r) d = mkBodySize cap (b + d) as r

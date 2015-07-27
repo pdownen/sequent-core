@@ -5,7 +5,7 @@ module Language.SequentCore.WiredIn (
   isKontKind, isKontKind_maybe, isKontArgsKind,
   isKontTy, isKontTy_maybe, isKontArgsTy, isKontArgsTy_maybe,
   isUbxExistsTy, isUbxExistsTy_maybe,
-  applyUbxExists_maybe, applysUbxExists_maybe,
+  applyUbxExists, applyUbxExists_maybe, applysUbxExists_maybe,
   
   sequentCoreTag, sequentCoreWiredInTag,
   
@@ -15,7 +15,9 @@ module Language.SequentCore.WiredIn (
 import FastString
 import Id
 import Kind
+import Maybes
 import Name
+import Outputable
 import PrelNames
 import TyCon
 import Type
@@ -23,7 +25,6 @@ import TysPrim
 import Unique
 
 import Control.Monad
-import Data.Maybe
 
 sequentCoreTag, sequentCoreWiredInTag :: Char
 -- Must be different from any other unique tag!! See the Unique module
@@ -122,6 +123,10 @@ isKontArgsTy_maybe ty = do [arg] <- matchTyConApp ty kontArgsTyCon
 isUbxExistsTy_maybe :: Type -> Maybe (TyVar, Type)
 isUbxExistsTy_maybe ty = do [arg] <- matchTyConApp ty ubxExistsTyCon
                             splitForAllTy_maybe arg
+
+applyUbxExists :: Type -> Type -> Type
+applyUbxExists ty tyArg
+  = applyUbxExists_maybe ty tyArg `orElse` pprPanic "applyUbxExists" (ppr ty <+> ppr tyArg)
 
 applyUbxExists_maybe :: Type -> Type -> Maybe Type
 applyUbxExists_maybe ty tyArg

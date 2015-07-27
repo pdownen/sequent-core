@@ -205,10 +205,6 @@ specInTerm env (Compute kb c)
   = do
     (usage, c') <- specInCommand env c
     return (usage, Compute kb c')
-specInTerm env (KArgs ty args)
-  = do
-    (usage, args') <- mapAndUnzipM (specInTerm env) args
-    return (mconcat usage, KArgs ty args')
 specInTerm _ v
   = return (emptyScUsage, v)
 
@@ -222,14 +218,6 @@ specInKont env (Case x as)
   = do
     (usages, as') <- mapAndUnzipM (specInAlt env) as
     return (mconcat usages, Case x as')
-specInKont env (KLam xs c)
-  = do
-    (usage, c') <- specInCommand env' c
-    return (usage, KLam xs c')
-  where
-    env' = env { sc_how_bound = extendVarEnvList hb [(x, SpecArg) | x <- xs] }
-    hb   = sc_how_bound env
-    
 specInKont env (Cast co k)
   = do
     (usage, k') <- specInKont env k
@@ -241,11 +229,13 @@ specInKont env (Tick ti k)
 specInKont _ k
   = return (emptyScUsage, k)
 
-specInRhs :: ScEnv -> Either SeqCoreTerm SeqCoreKont -> CoreM (ScUsage, Either SeqCoreTerm SeqCoreKont)
+specInRhs :: ScEnv -> SeqCoreRhs -> CoreM (ScUsage, SeqCoreRhs)
 specInRhs env (Left term)
   = second Left <$> specInTerm env term
-specInRhs env (Right kont)
-  = second Right <$> specInKont env kont
+specInRhs env (Right (PKont xs comm))
+  = do
+    (usage, comm') <- specInCommand env comm
+    return (usage, Right (PKont xs comm'))
 
 specInAlt :: ScEnv -> SeqCoreAlt -> CoreM (ScUsage, SeqCoreAlt)
 specInAlt env (Alt ac xs c)
@@ -260,20 +250,20 @@ specInBind env b
     return (u, b')
 
 specInCommand :: ScEnv -> SeqCoreCommand -> CoreM (ScUsage, SeqCoreCommand)
-specInCommand env (Command { cmdLet = bs, cmdTerm = v, cmdKont = fs })
-  = specBinds env bs [] []
-  where
-    specBinds :: ScEnv -> [SeqCoreBind] -> [SeqCoreBind] -> [ScUsage]
-                       -> CoreM (ScUsage, SeqCoreCommand)
-    specBinds env [] bs' usages
-      = do
-        (usage', v', fs') <- specInCut env v fs
-        return (mconcat (usage' : usages), Command 
-          { cmdLet = reverse bs', cmdTerm = v', cmdKont = fs' })
-    specBinds env (b : bs) bs' usages
-      = do
-        (usage', env', b') <- specBind env b
-        specBinds env' bs (b' : bs') (usage' : usages)
+specInCommand env (Let bind comm)
+  = do
+    (usage1, env', bind') <- specBind env bind
+    (usage2, comm') <- specInCommand env' comm
+    return (usage1 <> usage2, Let bind' comm')
+specInCommand env (Eval term kont)
+  = do
+    (usage, term', kont') <- specInCut env term kont
+    return (usage, Eval term' kont')
+specInCommand env (Jump args j)
+  = do
+    -- TODO Maybe specialize join points, too?
+    (usages, args') <- mapAndUnzipM (specInTerm env) args
+    return (mconcat usages, Jump args' j)
     
 specInCut :: ScEnv -> SeqCoreTerm -> SeqCoreKont
         -> CoreM (ScUsage, SeqCoreTerm, SeqCoreKont)
@@ -316,7 +306,7 @@ specBind env (Rec bs)
       case rhs of
         Left  term -> map (uncurry BindTerm) <$>
                         specialize env' totalUsages (bndr, term)
-        Right kont -> return [BindKont bndr kont]
+        Right pk   -> return [BindPKont bndr pk]
     return (totalUsages, env', Rec (concat bindss))
   where 
     env'  = env { sc_how_bound = hb' }
