@@ -318,7 +318,8 @@ simplKontBind env_p p env_k k
   = do
     tick $ PostInlineUnconditionally p
     (env_k', k') <- mkDupableKont (zapFloats (env_k `inDynamicScope` env_p'))
-                                  (kontTyArg (idType p)) k
+                                  (kontTyArg (substTy env_p (idType p)))
+                                  k
     return (env_p' `addFloats` env_k') { se_retKont = Just (Done k') }
   where
     (env_p', _) = enterScope env_p p -- ignore cloned p because we're
@@ -649,7 +650,7 @@ simplKont env kont
         let (env', x') = enterScope env x
         -- FIXME The Nothing there could be the scrutinee, but we don't ever
         -- have access to it here.
-        alts' <- forM alts (simplAlt env' Nothing [] x)
+        alts' <- forM alts (simplAlt env' Nothing [] x')
         return (env, kc (Case x' alts'))
     go env (Tick ti kont) kc
       = go env kont (kc . Tick ti)
