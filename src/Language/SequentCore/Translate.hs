@@ -277,7 +277,13 @@ escAnalExpr expr@(Core.Lam {})
     let (tyBndrs, valBndrs, body) = Core.collectTyAndValBinders expr
     -- Remove value binders from the environment in case of shadowing - we
     -- won't report them as free vars
-    body' <- withoutBindingList valBndrs $ escAnalExpr body
+    body' <- withoutBindingList valBndrs $
+             -- We have to make everything escape a lambda, no matter what, for
+             -- contification to work; if contification weren't the concern,
+             -- we might say that variables on the left side of a beta-redex,
+             -- for instance, don't escape
+             filterAnalysis allFreeVarsEscape $
+             escAnalExpr body
     let bndrs' = [ Marked bndr MakeFunc | bndr <- tyBndrs ++ valBndrs ]
     return $ Core.mkLams bndrs' body'
 escAnalExpr (Core.Let bind body)
