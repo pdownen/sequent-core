@@ -295,7 +295,17 @@ escAnalExpr (Core.Case scrut bndr ty alts)
       return (con, map (`Marked` MakeFunc) bndrs, rhs')
     return $ Core.Case scrut' (Marked bndr MakeFunc) ty alts'
 escAnalExpr (Core.Cast expr co)
-  = (`Core.Cast` co) <$> escAnalExpr expr
+  -- FIXME What we really want here isn't actually an escape analysis per se,
+  -- it's something a little pickier: We want to be sure that a function is used
+  -- *only by tail-calling it.* Usually, the only non-escaping uses of a
+  -- functions are tail calls, so this is the same thing, *but* a call under a
+  -- cast is not a tail call and yet, if the *cast* is in tail position, it
+  -- still doesn't escape. Since the cast changes the type of the context (and
+  -- hence that of the continuation), we can't contify something if its return
+  -- value is cast.
+  --
+  -- Short story is that we lie here and say that everything escapes.
+  = (`Core.Cast` co) <$> filterAnalysis allFreeVarsEscape (escAnalExpr expr)
 escAnalExpr (Core.Tick ti expr)
   = Core.Tick ti <$> escAnalExpr expr
 escAnalExpr (Core.Type ty)
