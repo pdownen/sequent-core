@@ -988,8 +988,8 @@ mkDupableKont env ty kont
         -- case. May be worth checking that we get the same result.
         
         let (altEnv, caseBndr') = enterScope env caseBndr
-        alts' <- mapM (simplAlt altEnv Nothing [] caseBndr) alts
-        (env', alts'') <- mkDupableAlts env caseBndr alts'
+        alts' <- mapM (simplAlt altEnv Nothing [] caseBndr') alts
+        (env', alts'') <- mkDupableAlts env caseBndr' alts'
         
         return (env', kk (Case caseBndr' alts''))
         
