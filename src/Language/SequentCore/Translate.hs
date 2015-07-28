@@ -222,6 +222,7 @@ escAnalBind lvl (Core.Rec pairs) escs_body
 shouldKontify :: TopLevelFlag -> EscapeAnalysis -> IdSet -> Bool
 shouldKontify lvl escs bndrs
   = isNotTopLevel lvl &&
+    not (isEmptyVarSet (bndrs `intersectVarSet` ea_freeVars escs)) &&
     isEmptyVarSet (bndrs `intersectVarSet` ea_escVars escs)
 
 addBinders :: [(Var, Core.CoreExpr)] -> EscM (BindingEnv, [Candidacy])
