@@ -281,17 +281,24 @@ simplPKontBind env_j j j' env_pk pk _recFlag
             env' = extendPvSubst env_j j rhs
         return env'
       else do
-        -- TODO Handle floating type lambdas
-        let PKont xs comm = pk
-            env_pk' = zapFloats (env_pk `inDynamicScope` env_j)
-            (env_pk'', xs') = enterScopes env_pk' xs
-        (env_with_floats, comm') <- simplCommand env_pk'' comm
-        -- TODO Something like Simplify.prepareRhs
-        env_j'
-          <- if isEmptyFloats env_with_floats
-                then return env_j
-                else do tick LetFloatFromLet -- Can always float through a cont binding
-                        return $ env_j `addFloats` env_with_floats
+        (env_j', xs', comm') <-
+          case pk of
+            PKont [] comm -> do
+              -- No parameters, so we can float things out
+              let env_pk' = zapFloats (env_pk `inDynamicScope` env_j)
+              (env_with_floats, comm') <- simplCommand env_pk' comm
+              -- TODO Something like Simplify.prepareRhs
+              env_j'
+                <- if isEmptyFloats env_with_floats
+                      then return env_j
+                      else do tick LetFloatFromLet -- Can always float through a cont binding
+                              return $ env_j `addFloats` env_with_floats
+              return (env_j', [], comm')
+            PKont xs comm -> do
+              -- There are parameters, so no floating
+              let (env_pk', xs') = enterScopes (env_pk `inDynamicScope` env_j) xs
+              comm' <- simplCommandNoFloats env_pk' comm
+              return (env_j, xs', comm')
         completeBind env_j' j j' (Right (PKont xs' comm')) NotTopLevel
 
 -- | Bind a continuation as the current one (as bound by a Compute). Unlike with
