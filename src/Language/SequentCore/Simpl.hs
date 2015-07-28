@@ -307,6 +307,9 @@ simplPKontBind env_j j j' env_pk pk _recFlag
 -- let binding.
 simplKontBind :: SimplEnv -> InKontId -> StaticEnv -> InKont -> SimplM SimplEnv
 simplKontBind env_p p env_k k
+  | tracing
+  , pprTraceShort "simplKontBind" (pprBndr LetBind p $$ ppr k) False
+  = undefined
   | preInline
   = do
     tick $ PreInlineUnconditionally p
@@ -797,7 +800,8 @@ callSiteInline env_v x kont
     ans <- go <$> getMode <*> getDynFlags
     when tracing $ liftCoreM $ putMsg $ ans `seq`
       hang (text "callSiteInline") 6 (pprBndr LetBind x <> colon
-        <+> (if isJust ans then text "YES" else text "NO") $$ ppr def)
+        <+> (if isJust ans then text "YES" else text "NO")
+        $$ ppWhen (isJust ans) (ppr def))
     return ans
   where
     go _mode _dflags
@@ -930,7 +934,7 @@ inlineDFun _env bndrs con conArgs kont
 mkDupableKont :: SimplEnv -> Type -> InKont -> SimplM (SimplEnv, OutKont)
 mkDupableKont env ty kont
   = do
-    when tracing $ liftCoreM $ putMsg $ hang (text "mkDupableKont") 4 (ppr env $$ ppr kont)
+    when tracing $ liftCoreM $ putMsg $ hang (text "mkDupableKont") 4 (ppr env $$ ppr ty $$ ppr kont)
     (env', ans) <- go env (\kont' -> kont') ty kont
     when tracing $ liftCoreM $ putMsg $ hang (text "mkDupableKont DONE") 4 $
       ppr ans $$ vcat (map ppr (getFloatBinds (getFloats env')))
