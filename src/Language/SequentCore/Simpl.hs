@@ -42,7 +42,7 @@ import MonadUtils
 import Outputable
 import Pair
 import qualified PprCore as Core
-import Type        ( Type, funResultTy, isUnLiftedType, mkTyVarTy )
+import Type        ( Type, applyTy, funResultTy, isUnLiftedType, mkTyVarTy )
 import TysWiredIn  ( mkTupleTy )
 import Var
 import VarEnv
@@ -315,12 +315,11 @@ simplKontBind env_p p env_k k
   = do
     tick $ PostInlineUnconditionally p
     (env_k', k') <- mkDupableKont (zapFloats (env_k `inDynamicScope` env_p'))
-                                  (kontTyArg (idType retId)) k
+                                  (kontTyArg (idType p)) k
     return (env_p' `addFloats` env_k') { se_retKont = Just (Done k') }
   where
     (env_p', _) = enterScope env_p p -- ignore cloned p because we're
                                      -- substituting anyway
-    retId = se_retId env_p `orElse` panic "simplKontBind at top level"
     
     -- Pre-inline (i.e. substitute whole rather than making it dupable first)
     -- whenever 
@@ -956,7 +955,12 @@ mkDupableKont env ty kont
         go env (kk . Cast co') (pSnd (coercionKind co')) kont
     
     go env kk ty kont@(Tick {})
-      = split env kk ty kont
+      = split env kk ty kont (fsLit "*tickj")
+    
+    go env kk ty (App (Type tyArg) kont)
+      = let tyArg' = substTy env tyArg
+            ty' = applyTy ty tyArg'
+        in go env (kk . App (Type tyArg')) ty' kont
     
     go env kk ty (App arg kont)
       = do
@@ -967,7 +971,7 @@ mkDupableKont env ty kont
     go env kk ty kont@(Case caseBndr [Alt _altCon bndrs _rhs])
       | all isDeadBinder bndrs
       , not (isUnLiftedType (idType caseBndr))
-      = split env kk ty kont
+      = split env kk ty kont (fsLit "*seqj")
 
     go env kk _ty (Case caseBndr alts)
       -- This is dual to the App case: We have several branches and we want to
@@ -985,9 +989,9 @@ mkDupableKont env ty kont
         
         return (env', kk (Case caseBndr' alts''))
         
-    split :: SimplEnv -> (OutKont -> OutKont) -> Type -> InKont
+    split :: SimplEnv -> (OutKont -> OutKont) -> Type -> InKont -> FastString
           -> SimplM (SimplEnv, OutKont)
-    split env kk ty kont
+    split env kk ty kont name
         -- XXX This is a bit ugly, but it is currently the only way to split a
         -- non-parameterized continuation in two:
         --   Edup[Knodup] ==> let cont j x = < x | Knodup >
@@ -998,11 +1002,11 @@ mkDupableKont env ty kont
         -- revisit this.
       = do
         let kontTy = mkKontTy (mkKontArgsTy (mkTupleTy UnboxedTuple [ty]))
-        (env', j) <- mkFreshVar env (fsLit "*tickj") kontTy
+        (env', j) <- mkFreshVar env name kontTy
         let (env'', x) = enterScope env' (mkKontArgId ty)
             join_rhs  = PKont [x] (Eval (Var x) kont)
             join_kont = Case x [Alt DEFAULT [] (Jump [Var x] j)]
-        env_final <- simplNonRecPKont env'' j (staticPart env'') join_rhs
+        env_final <- simplPKontBind env'' j j (staticPart env'') join_rhs NonRecursive
         
         return (env_final, kk join_kont)
     
