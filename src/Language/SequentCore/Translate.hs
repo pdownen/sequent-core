@@ -339,7 +339,22 @@ escAnalApp fid args
 
 -- Analyse unfolding and rules
 escAnalId :: Id -> EscM ()
-escAnalId _id = return () -- TODO
+escAnalId x
+  | isId x
+  = do
+    mapM_ escAnalRule (idCoreRules x)
+    escAnalUnfolding (idUnfolding x)
+  | otherwise
+  = return ()
+
+escAnalRule :: Core.CoreRule -> EscM ()
+escAnalRule rule
+  = void $ withoutBindingList (Core.ru_bndrs rule) $ escAnalExpr (Core.ru_rhs rule)
+
+escAnalUnfolding :: Core.Unfolding -> EscM ()
+escAnalUnfolding (Core.CoreUnfolding { Core.uf_tmpl = rhs  }) = void $ escAnalExpr rhs
+escAnalUnfolding (Core.DFunUnfolding { Core.df_args = args }) = mapM_ escAnalExpr args
+escAnalUnfolding _                                            = return ()
 
 ----------------------------------------
 -- Phase 2: Translate to Sequent Core --

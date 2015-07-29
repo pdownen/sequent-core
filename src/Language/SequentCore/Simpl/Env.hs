@@ -10,9 +10,9 @@ module Language.SequentCore.Simpl.Env (
   OutId, OutKontId, OutPKontId, OutVar, OutTyVar, OutCoVar,
   
   mkBoundTo, mkBoundToPKont, findDef, setDef,
-  initialEnv, mkSuspension, enterScope, enterScopes, mkFreshVar, mkFreshKontId,
+  initialEnv, getMode, activeRule, enterScope, enterScopes, mkFreshVar, mkFreshKontId,
   substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar,
-  extendIdSubst, extendPvSubst, zapSubstEnvs, staticPart, setStaticPart,
+  extendIdSubst, extendPvSubst, zapSubstEnvs, staticPart, setStaticPart, mkSuspension,
   inDynamicScope, zapSubstEnvsStatic, retType,
   
   Floats, emptyFloats, addNonRecFloat, addRecFloats, zapFloats, zapKontFloats,
@@ -29,10 +29,11 @@ import Language.SequentCore.Syntax
 import Language.SequentCore.Translate
 import Language.SequentCore.WiredIn
 
-import BasicTypes ( TopLevelFlag(..), RecFlag(..)
-                  , isTopLevel, isNotTopLevel, isNonRec )
+import BasicTypes ( Activation, TopLevelFlag(..), RecFlag(..)
+                  , isActive, isTopLevel, isNotTopLevel, isNonRec )
 import Coercion   ( Coercion, CvSubstEnv, CvSubst(..), isCoVar )
 import qualified Coercion
+import CoreMonad  ( SimplifierMode(..) )
 import CoreSyn    ( Unfolding(..), UnfoldingGuidance(..), UnfoldingSource(..)
                   , mkOtherCon )
 import CoreUnfold ( mkCoreUnfolding, mkDFunUnfolding  )
@@ -64,12 +65,14 @@ data SimplEnv
                 , se_cvSubst :: CvSubstEnv     -- InCoVar   |--> OutCoercion
                 , se_retId   :: Maybe KontId
                 , se_retKont :: Maybe KontSubstAns
+                --  ^^^ static part ^^^  --
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
                 , se_defs    :: IdDefEnv       -- OutId     |--> Definition (out)
                 , se_floats  :: Floats
-                , se_dflags  :: DynFlags }
+                , se_dflags  :: DynFlags
+                , se_mode    :: SimplifierMode }
 
-newtype StaticEnv = StaticEnv SimplEnv -- Ignore se_inScope, se_*floats, se_defs
+newtype StaticEnv = StaticEnv SimplEnv -- Ignore se_inScope, etc.
 
 type SimplSubst a = IdEnv (SubstAns a) -- InId |--> SubstAns a
 data SubstAns a
@@ -166,8 +169,8 @@ type OutVar     = Var
 type OutTyVar   = TyVar
 type OutCoVar   = CoVar
 
-initialEnv :: DynFlags -> SimplEnv
-initialEnv dflags
+initialEnv :: DynFlags -> SimplifierMode -> SimplEnv
+initialEnv dflags mode
   = SimplEnv { se_idSubst = emptyVarEnv
              , se_pvSubst = emptyVarEnv
              , se_tvSubst = emptyVarEnv
@@ -177,7 +180,19 @@ initialEnv dflags
              , se_inScope = emptyInScopeSet
              , se_defs    = emptyVarEnv
              , se_floats  = emptyFloats
-             , se_dflags  = dflags }
+             , se_dflags  = dflags
+             , se_mode    = mode }
+
+getMode :: SimplEnv -> SimplifierMode
+getMode = se_mode
+
+activeRule :: SimplEnv -> Activation -> Bool
+-- Nothing => No rules at all
+activeRule env
+  | not (sm_rules mode) = \_ -> False     -- Rewriting is off
+  | otherwise           = isActive (sm_phase mode)
+  where
+    mode = getMode env
 
 mkSuspension :: StaticEnv -> In a -> SubstAns a
 mkSuspension = Susp

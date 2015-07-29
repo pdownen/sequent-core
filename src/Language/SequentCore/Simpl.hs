@@ -29,13 +29,13 @@ import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      CoreM, defaultPlugin, reinitializeGlobals,
                      isZeroSimplCount, pprSimplCount, putMsg, errorMsg
                    )
-import CoreSyn     ( isRuntimeVar, isCheapUnfolding )
+import CoreSyn     ( CoreVect(..), isRuntimeVar, isCheapUnfolding )
 import CoreUnfold  ( smallEnoughToInline )
 import DataCon
 import DynFlags    ( DynFlags, gopt, GeneralFlag(..), ufKeenessFactor, ufUseThreshold )
 import FastString
 import Id
-import HscTypes    ( ModGuts(..) )
+import HscTypes    ( ModGuts(..), VectInfo(..) )
 import Literal     ( litIsDupable )
 import Maybes      ( whenIsJust )
 import MonadUtils
@@ -51,7 +51,7 @@ import VarSet
 import Control.Exception   ( assert )
 import Control.Monad       ( foldM, forM, when )
 
-import Data.Maybe          ( isJust )
+import Data.Maybe          ( catMaybes, isJust )
 
 tracing, dumping, linting :: Bool
 tracing = False
@@ -84,6 +84,10 @@ runSimplifier iters mode guts
   = do
     let coreBinds = mg_binds guts
         binds = fromCoreModule coreBinds
+    when (dumping && not (null rules)) $
+      putMsg  $ text "CORE RULES"
+             $$ text "----------"
+             $$ ppr rules
     when linting $ whenIsJust (lintCoreBindings binds) $ \err ->
       pprPgmError "Sequent Core Lint error (pre-simpl)"
         (withPprStyle defaultUserStyle $ err
@@ -91,8 +95,14 @@ runSimplifier iters mode guts
                                       $$ text "--- Original Core: ---"
                                       $$ Core.pprCoreBindings coreBinds)
     binds' <- go 1 binds
-    return $ guts { mg_binds = bindsToCore binds' }
+    let coreBinds' = bindsToCore binds'
+    when dumping $ putMsg  $ text "FINAL CORE"
+                          $$ text "----------"
+                          $$ Core.pprCoreBindings coreBinds'
+    return $ guts { mg_binds = coreBinds' }
   where
+    rules = mg_rules guts
+
     go n binds
       | n > iters
       = do
@@ -102,12 +112,26 @@ runSimplifier iters mode guts
         return binds
       | otherwise
       = do
-        let globalEnv = SimplGlobalEnv { sg_mode = mode }
-            mod       = mg_module guts
-            occBinds  = runOccurAnal mod binds
+        dflags <- getDynFlags
+        let mod       = mg_module guts
+            vectVars  = mkVarSet $
+                          catMaybes [ fmap snd $ lookupVarEnv (vectInfoVar (mg_vect_info guts)) bndr
+                                    | Vect bndr _ <- mg_vect_decls guts]
+                          ++
+                          catMaybes [ fmap snd $ lookupVarEnv (vectInfoVar (mg_vect_info guts)) bndr
+                                    | bndr <- bindersOfBinds binds]
+                                    -- FIXME: This second comprehensions is only needed as long as we
+                                    --        have vectorised bindings where we get "Could NOT call
+                                    --        vectorised from original version".
+            (maybeVects, maybeVectVars)
+                      = case sm_phase mode of
+                          InitialPhase -> (mg_vect_decls guts, vectVars)
+                          _            -> ([], vectVars)
+            env = initialEnv dflags mode
+            occBinds = runOccurAnal env mod maybeVects maybeVectVars binds
         when dumping $ putMsg  $ text "BEFORE" <+> int n
                               $$ text "--------" $$ pprTopLevelBinds occBinds
-        (binds', count) <- runSimplM globalEnv $ simplModule occBinds
+        (binds', count) <- runSimplM $ simplModule env occBinds
         when linting $ case lintCoreBindings binds' of
           Just err -> pprPanic "Sequent Core Lint error"
             (withPprStyle defaultUserStyle $ err $$ pprTopLevelBinds binds')
@@ -124,18 +148,14 @@ runSimplifier iters mode guts
                                   <+> int n <+> text "iterations"
             return binds'
           else go (n+1) binds'
-    runOccurAnal mod binds
-      = let isRuleActive = const False
-            rules        = []
-            vects        = []
-            vectVars     = emptyVarSet
+    runOccurAnal env mod vects vectVars binds
+      = let isRuleActive = activeRule env
         in occurAnalysePgm mod isRuleActive rules vects vectVars binds
 
-simplModule :: [InBind] -> SimplM [OutBind]
-simplModule binds
+simplModule :: SimplEnv -> [InBind] -> SimplM [OutBind]
+simplModule env binds
   = do
-    dflags <- getDynFlags
-    finalEnv <- simplBinds (initialEnv dflags) binds TopLevel
+    finalEnv <- simplBinds env binds TopLevel
     freeTick SimplifierDone
     return $ getFloatBinds (getFloats finalEnv)
 
@@ -724,9 +744,9 @@ simplJump env args j
 -- Based on preInlineUnconditionally in SimplUtils; see comments there
 preInlineUnconditionally :: SimplEnv -> StaticEnv -> InBindPair
                          -> TopLevelFlag -> SimplM Bool
-preInlineUnconditionally _env_x _env_rhs pair level
+preInlineUnconditionally env_x _env_rhs pair level
   = do
-    ans <- go <$> getMode <*> getDynFlags
+    ans <- go (getMode env_x) <$> getDynFlags
     --liftCoreM $ putMsg $ "preInline" <+> ppr x <> colon <+> text (show ans))
     return ans
   where
@@ -766,9 +786,9 @@ preInlineUnconditionally _env_x _env_rhs pair level
 -- Based on postInlineUnconditionally in SimplUtils; see comments there
 postInlineUnconditionally :: SimplEnv -> OutBindPair -> TopLevelFlag
                           -> SimplM Bool
-postInlineUnconditionally _env pair level
+postInlineUnconditionally env pair level
   = do
-    ans <- go <$> getMode <*> getDynFlags
+    ans <- go (getMode env) <$> getDynFlags
     -- liftCoreM $ putMsg $ "postInline" <+> ppr x <> colon <+> text (show ans)
     return ans
   where
@@ -798,7 +818,7 @@ callSiteInline :: SimplEnv -> InVar -> InKont
                -> SimplM (Maybe OutTerm)
 callSiteInline env_v x kont
   = do
-    ans <- go <$> getMode <*> getDynFlags
+    ans <- go (getMode env_v) <$> getDynFlags
     when tracing $ liftCoreM $ putMsg $ ans `seq`
       hang (text "callSiteInline") 6 (pprBndr LetBind x <> colon
         <+> (if isJust ans then text "YES" else text "NO")

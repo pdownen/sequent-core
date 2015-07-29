@@ -1,6 +1,6 @@
 module Language.SequentCore.Simpl.Monad (
-  SimplM, SimplGlobalEnv(..), runSimplM, liftCoreM,
-  getDynFlags, getMode, tick, freeTick
+  SimplM, runSimplM, liftCoreM,
+  getDynFlags, tick, freeTick
 ) where
 
 import CoreMonad
@@ -15,28 +15,25 @@ import Control.Monad.IO.Class
 traceTicks :: Bool
 traceTicks = False
 
-newtype SimplM a = SimplM { unSimplM :: SimplGlobalEnv -> CoreM (a, SimplCount) }
+newtype SimplM a = SimplM { unSimplM :: CoreM (a, SimplCount) }
 
-data SimplGlobalEnv
-  = SimplGlobalEnv { sg_mode :: SimplifierMode }
-
-runSimplM :: SimplGlobalEnv -> SimplM a -> CoreM (a, SimplCount)
-runSimplM genv m
+runSimplM :: SimplM a -> CoreM (a, SimplCount)
+runSimplM m
   = do
-    ans <- unSimplM m genv
+    ans <- unSimplM m
     addSimplCount (snd ans)
     return ans
 
 instance Monad SimplM where
   {-# INLINE return #-}
   return x = SimplM $
-    \_ -> getDynFlags >>= \dflags -> return (x, zeroSimplCount dflags)
+    getDynFlags >>= \dflags -> return (x, zeroSimplCount dflags)
 
   {-# INLINE (>>=) #-}
   m >>= k
-    = SimplM $ \mode -> do
-        (x, count1) <- unSimplM m mode
-        (y, count2) <- unSimplM (k x) mode
+    = SimplM $ do
+        (x, count1) <- unSimplM m
+        (y, count2) <- unSimplM (k x)
         let count = count1 `plusSimplCount` count2
         return $ count `seq` (y, count)
 
@@ -54,7 +51,7 @@ instance Applicative SimplM where
 {-# INLINE liftCoreM #-}
 liftCoreM :: CoreM a -> SimplM a
 liftCoreM m
-  = SimplM $ \_ -> withZeroCount m
+  = SimplM $ withZeroCount m
 
 instance HasDynFlags SimplM where
   getDynFlags = liftCoreM getDynFlags
@@ -67,19 +64,16 @@ instance MonadUnique SimplM where
   getUniqueM = liftCoreM getUniqueM
   getUniquesM = liftCoreM getUniquesM
 
-getMode :: SimplM SimplifierMode
-getMode = SimplM $ \genv -> withZeroCount $ return (sg_mode genv)
-
 tick, freeTick :: Tick -> SimplM ()
 tick t
-  = SimplM $ \_ -> do
+  = SimplM $ do
       when traceTicks $ putMsg (text "TICK:" <+> ppr t)
       dflags <- getDynFlags
       let count = doSimplTick dflags t (zeroSimplCount dflags)
       return ((), count)
 
 freeTick t
-  = SimplM $ \_ -> do
+  = SimplM $ do
       dflags <- getDynFlags
       let count = doFreeSimplTick t (zeroSimplCount dflags)
       return ((), count)
