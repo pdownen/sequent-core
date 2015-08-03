@@ -769,6 +769,581 @@ tuples in the sequent calculus.  Thus, solving the problem with forall gives us
 a solution for exists by duality in the sequent calculus.  Symmetry saves the
 day!
 
+\section{Semantics}
+\label{sec:semantics}
+
+Here we illustrate the semantics of Sequent Core programs in two forms:
+\begin{itemize}
+\item An equational theory of program transformations that a compiler might
+  perform, in any order, to simplify a Sequent Core program.
+\item A small-step, operational semantics that suggests how an interpreter might
+  evaluate a Sequent Core program.
+\end{itemize}
+For simplicity, the presented semantics Sequent Core only accounts for
+call-by-name evaluation and non-recursive bindings.  A more thorough semantics
+would combine both call-by-name evaluation (for lifted types) and call-by-value
+evaluation (which is necessary for unlifted types), along with recursive
+$\Let$-bindings.
+
+\subsection{Equational Theory}
+
+First, we have the sequent equivalent of the usual $\beta$ and $\eta$ axioms for
+functions:
+\begin{align*}
+  \cut{\fn{\ann{x}{\ty}} \tm}{\app{\tm'}{\ko}}
+  &=
+  \Let \nonrec{\bindv{\ann{x}{\ty}}{\tm'}} \In \cut{\tm}{\ko}
+  &
+  \Where
+  x &\notin FV(\ko)
+  \\
+  \fn{\ann{x}{\ty}}\comp{\ann{r}{\ty'}} \cut{\tm}{\app{x}{\ret r}}
+  &=
+  \tm
+  &
+  \Where
+  x &\notin FV(\tm)
+  \\
+  &&
+  \tm &\neq \bot : \ty \to \ty'
+\end{align*}
+For the $\beta$ axiom, we simplify a $\lambda$-abstraction that is evaluated
+with respect to a calling continuation by $\Let$-binding the argument and
+evaluating the body in the return return continuation.  For the $\eta$ axiom, we
+recognize that the functional abstraction
+$\fn{x}\comp{r}\cut{f}{\app{x}{\ret r}}$ immediately delegates to $f$, so the
+two are equivalent.  Note that, due to the presence of unconstrained,
+polymorphic strictness (for example,\texttt{seq}), the $\eta$ axiom can only be
+applied to terms of a function type that do not evaluate to bottom.  In other
+words, the $\eta$ axiom only applies to terms that are already equal to a
+$\lambda$-abstraction without the use of $\eta$.
+
+Computation abstractions (that is, $\mu$-abstractions), also follow a form of
+$\beta$ and $\eta$ axioms:
+\begin{align*}
+  \cut{\comp{r}\cmd}{\ko}
+  &=
+  \cmd\subst{r}{\ko}
+  \\
+  \comp{r}\cut{\tm}{\ret r}
+  &=
+  \tm
+  &
+  \Where
+  r \notin FV(\tm)
+\end{align*}
+The $\beta$ axiom for a $\mu$-abstraction substitutes its entire continuation
+for the bound continuation variable.  To avoid unnecessary code duplication, we
+may only want to apply the $\beta$ axiom for $\mu$ when $k$ is small (and we can
+force $k$ to be small by introducing auxiliary bindings naming arguments and
+join points).  The $\eta$ axiom for a $\mu$-abstraction is more well-behaved
+than the one for functions: it applies to \emph{any} term that does not
+reference the bound continuation variable.
+
+Case continuations have their own form of $\beta$ and $\eta$ axioms.  The
+$\beta$ axiom for a case continuation selects the appropriate branch based on
+the structure of input, in the case that it is given a literal or a constructed
+data structure.
+\begin{align*}
+  \cut{\lit}{\caseas{\ann{x}{\ty}}{\dots;\alt{\lit}{\cmd};\dots}}
+  &=
+  \cmd\subst{x}{\lit}
+\end{align*}
+\begin{align*}
+  &
+  \cut
+  {K}
+  {\app
+    {\vect[n]{\tm_n}}
+    {\caseas{\ann{x}{\ty}}{
+      \dots;\alt{K ~ \vect[n]{\ann{y_n}{\sty_n}}}{\cmd};\dots}}}
+  \\
+  &=
+  \vect[n]{
+  \Let
+    \nonrec{\bindv{\ann{y_n}{\sty_n}}{\tm_n}}
+  \In
+  }
+  \Let \nonrec{
+    \bindv
+    {\ann{x}{\ty}}
+    {\comp{\ann{r}{\ty}}\cut{K}{\app{\vect[n]{y_n}}{\ret r}}}
+  } \In
+    \cmd
+\end{align*}
+The default alternative for a case continuation is selected when no other
+alternative matches, and only applies when the continuation is given a weak-head
+normal form (WHNF) as input.
+\begin{align*}
+  \cut{\tm'}{\app{\vect[n]{\tm_n}}{\caseas{\ann{x}{\ty}}{\dots;\alt{\blank}{\cmd}}}}
+  &=
+  \Let
+    \nonrec{\bindv{\ann{x}{\ty}}{\tm''}}
+  \In
+    \cmd
+  \\
+  \Where
+  \tm''
+  &=
+  \comp{\ann{r}{\ty}}\cut{\tm'}{\app{\vect[n]{\tm_n}}{\ret r}}
+  \in
+  WHNF
+\end{align*}
+Note that the list of arguments, $\vect[n]{\tm_n}$, can only be non-empty when
+the head term $\tm$ is a constructor:
+$\comp{\ann{r}{\ty}}\cut{K}{\app{\vect[n]{\tm_n}}{\ret r}}$ is a WHNF.  The
+other possibility is that $\vect[n]{\tm_n}$ is empty and $\tm'$ is a literal or
+a $\lambda$-abstraction.  We also have some extensional properties about case
+continuations.  First, we may replace the name for the input with the pattern in
+any alternative, or vice versa:
+\begin{align*}
+  \caseas{\ann{x}{\ty}}{\dots;\alt{\lit}{\cmd};\dots}
+  &=
+  \caseas{\ann{x}{\ty}}{\dots;\alt{\lit}{\cmd\subst{x}{\lit}};\dots}
+\end{align*}
+\begin{align*}
+  &
+  \caseas{\ann{x}{\ty}}{\dots;\alt{K ~ \vect[n]{\ann{y_n}{\sty_n}}}{\cmd};\dots}
+  \\
+  &=
+  \caseas{\ann{x}{\ty}}{
+    \dots;
+    \alt
+    {K ~ \vect[n]{\ann{y_n}{\sty_n}}}
+    {\cmd\subst{x}{\comp{\ann{r}{\ty}}\cut{K}{\app{\vect[n]{y_n}}{r}}}};
+    \dots
+    }
+\end{align*}
+Second, we have a form of $\eta$ axiom for case continuations which eliminates
+a redundant case analysis wrapped around another continuation.
+\begin{align*}
+  \caseas{\ann{x}{\ty}}{\vect[n]{\alt{\pat_n}{\cut{x}{\ko}}}}
+  &=
+  \ko
+  &
+  \Where{}
+  \{x\} \cup BV(\vect[n]{\pat_n}) &\notin FV(\ko)
+  ,
+  \ko : \ty
+\end{align*}
+These extensionality laws are dual to the $\eta$ laws for $\lambda$- and
+$\mu$-abstractions.  For instance, for pairs, we have the dual equality to
+functional $\eta$:
+\begin{align*}
+  \Case\Of \alt{(\ann{x}{\ty_1},\ann{y}{\ty_2})}{\cut{(x,y)}{\ko}}
+  &=
+  \ko
+  &
+  \Where
+  x,y &\notin FV(\ko)
+  ,
+  \ko : (\ty_1, \ty_2)
+\end{align*}
+Furthermore, for a case continuation with only a default alternative, we have
+the dual equality to $\mu$ $\eta$:
+\begin{align*}
+  \Case\Of \alt{x}{\cut{x}{\ko}}
+  &=
+  \ko
+  &
+  \Where
+  x &\notin FV(\ko)
+\end{align*}
+
+The $\Let$ form of commands substitute their bindings into the underlying
+command.  First, we interpret each type of binding pair as a substitution:
+\begin{align*}
+  \subp{\bindv{x}{\tm}} &= \subst{x}{\tm}
+  \\
+  \subp{\bindk{j}{\fnk{\vect[n]{x_n}}\cmd}}
+  &=
+  \subst{\vect[n]{\Let \nonrec{\bindv{x_n}{\tm_n}} \In} \cmd}{\jump{\vect[n]{\tm_n}}{j}}
+\end{align*}
+The substitution of a value binding is the normal capture-avoiding substitution
+of terms.  The substitution of a continuation binding  Then a $\Let$-binding command substitutes its binding pair:
+\begin{align*}
+  \Let \nonrec{\bp} \In \cmd
+  &=
+  \cmd\subp{\bp}
+\end{align*}
+
+We now consider axioms for pushing casts around the program.  First, we
+introduce syntactic sugar for casting the output of a term via the dual form of
+casting the input of its continuation:
+\begin{align*}
+  \coerce{\tm}{\cn} &= \comp{r}\cut{\tm}{\koerce{\cn}{\ret r}}
+\end{align*}
+A sequence of casts can be combined into a single cast of the composed coercion:
+\begin{align*}
+  \koerce{\cn}{(\koerce{\cn'}{\ko})}
+  &=
+  \koerce{(\compcn{\cn}{\cn'})}{\ko}
+\end{align*}
+Casting a coercion itself can be reduced to a modified coercion that pipes the
+type conversions together:
+\begin{align*}
+  \cut{\cn}{\koerce{\cn'}{\ko}}
+  &=
+  \cut{\compcn{\cn'_0}{\compcn{\cn}{\cn'_1}}}{\ko}
+  &
+  \Where
+  \cn &: \eqty{\ty_0}{\ty_1}
+  \\ &&
+  \cn' &: \eqty{(\eqty{\ty_0}{\ty_1})}{(\eqty{\ty'_0}{\ty'_1})}
+  \\ &&
+  \cn'_0 &: \eqty{\ty'_0}{\ty_0} = \sym(\nth_0 \cn')
+  \\ &&
+  \cn'_1 &: \eqty{\ty_1}{\ty'_1} = \nth_1 \cn'
+\end{align*}
+In general, we will always push casts down structures.  For coercions between
+function type, this means pushing the cast down a call-stack:
+\begin{align*}
+  \koerce{\cn}{(\app{\tm}{\ko})}
+  &=
+  \app{(\coerce{\tm}{\cn_0})}{(\koerce{\cn_1}{\ko})}
+  \\
+  \Where
+  \cn &: \eqty{(\ty_0 \to \ty_1)}{(\ty_0' \to \ty_1')}
+  \\
+  % \tm &\notin Type \cup Coercion
+  \tm &\notin Type
+  \\
+  \cn_0 &: \eqty{\ty'_0}{\ty_0} = \sym (\nth_0 \cn)
+  \\
+  \cn_1 &: \eqty{\ty_1}{\ty'_1} = \nth_1 \cn
+\end{align*}
+Similarly, casts down polymorphic call-stacks for coercions between universally
+quantified types:
+\begin{align*}
+  \koerce{\cn}{(\app{\ty}{\ko})}
+  &=
+  \app{\ty}{(\koerce{\cn'}{\ko})}
+  \\
+  \Where
+  \cn &: \eqty{\forall a:\ki. \ty'_1}{\forall a:\ki. \ty'_2}
+  \\
+  \cn' &: \eqty{\ty'_1\subst{a}{\ty}}{\ty'_2\subst{a}{\ty}} = \instancn{\cn}{\ty}
+\end{align*}
+Casting a literal is a no-op, so long as the coercion represents the reflexive
+equality of the literal type with itself:
+\begin{align*}
+  \cut{\lit}{\koerce{\cn}{\ko}}
+  &=
+  \cut{\lit}{\ko}
+  &
+  \Where
+  \cn &: \eqty{\ty}{\ty}
+  ,
+  \lit : \ty
+\end{align*}
+The most complicated push axiom is for data types.  Here, we push a cast on a
+constructed data structure into its sub-terms:
+\begin{align*}
+  \cut
+  {K}
+ {\app
+   {\vect[m]{\ty_{m}}}
+   {\app
+     {\vect[m']{\sty_{m'}}}
+     {\app
+       {\vect[n]{\tm_n}}
+       {\koerce{\cn}{\ko}}}}}
+  &=
+  \cut
+  {K}
+  {\app
+    {\vect[m]{\ty'_{m}}}
+    {\app
+      {\vect[m']{\sty_{m'}}}
+      {\app
+        {\vect[n]{(\coerce{\tm_n}{\cn'_n})}}
+        {\ko}}}}
+  \\
+  \Where
+  \cn &: \eqty{T ~ \vect[m]{\ty_m}}{T ~ \vect[m]{\ty'_m}}
+  \\
+  K
+  &:
+  \ty_K
+  =
+  \vect[m]{\forall a_{m}:\ki_{m}.}
+  \vect[m']{\forall b_{m'}:\ki'_{'m}.}
+  \vect[n]{\sty'_n \to} T ~ \vect[m]{a_{m}}
+  \\
+  \cn'_i
+  &:
+  \eqty
+  {(\sty'_i\vect[m]{\subst{a_{m}}{\ty_m}}\vect[m']{\subst{b_{m'}}{\sty_{m'}}})}
+  {(\sty'_i\vect[m]{\subst{a_{m}}{\ty'_m}}\vect[m']{\subst{b_{m'}}{\sty_{m'}}})}
+  \\
+  \cn'_i &= \ntharg_i(\idcn{\ty_K} ~ \vect[m]{\nth_{m} \cn} ~ \vect[m']{\idcn{\sty_{m'}}})
+\end{align*}
+Part of the complication is the different behavior of universally and
+existentially quantified types in the structure.  The universally quantified
+types, $\vect[m]{\ty_{m}}$, are replaced the type of the coercion, representing
+a change in the externally visible type of the structure itself.  The
+existentially quantified types, $\vect[m']{\sty_{m'}}$, don't change at all, as
+they are a hidden internal part of the structure.  The value sub-components of
+the structure, $\vect[n]{\tm_n}$, are get cast by the new coercions
+$\vect[n]{\cn'_n}$.  These new coercions are formed by selecting the matching
+argument type from the type of the constructor, and replacing the original
+universally quantified types with the coerced ones.
+
+\subsection{Operational Semantics}
+
+Since we do not consider recursive bindings, the reduction steps in operational
+semantics of Sequent Core always apply the to the top of a command.  The
+reductions of non-recursive $\Let$-bindings, $\mu$-abstractions, and
+$\lambda$-abstractions are:
+\begin{align*}
+  \Let \nonrec{\bp} \In \cmd
+  &\sred
+  \cmd\subp{\bp}
+\end{align*}
+\begin{align*}
+  \cut{\comp{r}\cmd}{\ko}
+  &\sred
+  \cmd\subst{r}{\ko}
+\end{align*}
+\begin{align*}
+  \cut{\fn x \tm}{\app{\tm'}{\ko}}
+  &\sred
+  \cut{\tm\subst{x}{\tm'}}{\ko}
+\end{align*}
+
+For the purpose of the simplicity of the operational semantics, we assume fully
+saturated constructors, so an unapplied constructor
+$K : \vect[m]{\forall\ann{a_{m}}{\ki_{m}}}\vect[n]{\ty_{n}\to}\ty'$ is
+represented as
+$
+\vect[m]{\fn{a_{m}}}\vect[n]{\fn{x_{n}}}\comp{r}
+  \cut{K ~ \vect[m]{a_{m}} ~ \vect[n]{x_{n}}}{\ret r}
+$.
+The constructed form of term greatly simplifies the presentation of the
+operational semantics for case continuations.  The rules for reducing case
+continuations are:
+\begin{align*}
+  \cut{\lit}{\caseas{x}{\dots;\alt{\lit}{\cmd};\dots}}
+  &\sred
+  \cmd\subst{x}{\lit}
+  \\
+  \cut
+  {K ~ \vect[m]{\ty_{m}} ~ \vect[n]{\tm_{n}}}
+  {\caseas{x}{\dots;\alt{K ~ \vect[n]{y_n}}{\cmd};\dots}}
+  &\sred
+  \cmd
+  \subst{x}{(K ~ \vect[m]{\ty_{m}} ~ \vect[n]{\tm_{n}})}
+  \vect[n]{\subst{y_n}{\tm_n}}
+  \\
+  \cut
+  {\whnf}
+  {\caseas{x}{\dots;\alt{\blank}{\cmd}}}
+  &\sred
+  \cmd\subst{x}{\whnf}
+\end{align*}
+Note that the $\whnf$ in the last rule stands for a WHNF, which is either a
+literal, a $\lambda$-abstraction, or a constructed term $K ~ \vect[n]{\tm_n}$.
+
+Finally, we have the reductions which push casts out of the way of $\beta$
+reductions at the last moment.  For function and type abstractions, we have:
+\begin{align*}
+  \cut{\fn x \tm}{\koerce{\cn}{(\app{\tm'}{\ko})}}
+  &\sred
+  \cut
+  {\fn x \tm}
+  {\app{(\coerce{\tm'}{\sym(\nth_0 \cn)})}{(\koerce{\nth_1 \cn}{\ko})}}
+  &
+  \Where
+  \tm' &\notin Type
+  \\
+  \cut{\fn a \tm}{\koerce{\cn}{(\app{\ty}{\ko})}}
+  &\sred
+  \cut
+  {\fn a \tm}
+  {\app{\ty}{(\koerce{\instancn{\cn}{\ty}}{\ko})}}
+\end{align*}
+For a matching literal case, we have:
+\begin{align*}
+  \cut{\lit}{\koerce{\cn}{\caseas{x}{\dots;\alt{\lit}{\cmd};\dots}}}
+  &\sred  
+  \cut{\lit}{\caseas{x}{\dots;\alt{\lit}{\cmd};\dots}}
+\end{align*}
+For a matching constructed term, we have:
+\begin{align*}
+  &
+  \cut
+  {K ~ \vect[m]{\ty_{m}} ~ \vect[m']{\sty_{m'}} ~ \vect[n]{\tm_{n}}}
+  {\koerce{\cn}{\caseas{x}{\dots;\alt{K ~ \vect[m']{b_{m'}} \vect[n]{y_{n}}}{\cmd};\dots}}}
+  \\
+  &\sred
+  \cut
+  {K ~ \vect[m]{\ty'_{m}} ~ \vect[m']{\sty_{m'}} ~ \vect[n]{(\coerce{\tm_{n}}{\cn'_n})}}
+  {\caseas{x}{\dots;\alt{K ~ \vect[m']{b_{m'}} \vect[n]{y_{n}}}{\cmd};\dots}}
+  \\
+  &\qquad
+  \Where
+  \cn : \eqty{T ~ \vect[m]{\ty_{m}}}{T ~ \vect[m]{\ty'_{m}}}
+  \\
+  &\qquad\phantom{\Where}
+  K 
+  :
+  \vect[m]{\forall\ann{a_{m}}{\ki_{m}}.}
+  \vect[m']{\forall\ann{b_{m'}}{\ki'_{m'}}.}
+  \vect[n]{\sty'_{n} \to} T ~ \vect[m]{a_{m}}
+  \\
+  &\qquad\phantom{\Where}
+  \cn'_i = \sty'_i\vect[m]{\subst{a_{m}}{\nth_m \cn}}\vect[m']{\subst{b_{m'}}{\idcn{\sty_{m'}}}}
+\end{align*}
+The default alternative of a case continuation doesn't have anything to do with
+a particular type, so we can't really push the cast anywhere.  Instead, we
+include it with the substitution in another form of the default case reduction:
+\begin{align*}
+  \cut{\whnf}{\koerce{\cn}{\caseas{x}{\dots;\alt{\blank}{\cmd}}}}
+  &\sred
+  \cmd\subst{x}{\coerce{\whnf}{\cn}}
+\end{align*}
+% \begin{align*}
+%   &
+%   \begin{aligned}[b]
+%     &
+%     \Let \rec{\vect[n]{\bp_n}} \In
+%     \\ &
+%     \cut
+%     {K}
+%     {\app
+%       {\vect[m]{\ty_{m}}}
+%       {\app
+%         {\vect[m']{\sty_{m'}}}
+%         {\app
+%           {\vect[n']{\tm_{n'}}}
+%           {\koerce
+%             {\cn}
+%             {\caseas{x}{\dots;\alt{K ~ \vect[n']{y_{n'}}}{\cmd};\dots}}}}}}
+%   \end{aligned}
+%   \\
+%   &\sred
+%   \begin{aligned}[b]
+%     &
+%     \Let \rec{\vect[n]{\bp_n}} \In
+%     \\ &
+%     \cut
+%     {K}
+%     {\app
+%       {\vect[m]{\ty'_{m}}}
+%       {\app
+%         {\vect[m']{\sty_{m'}}}
+%         {\app
+%           {\vect[n']{(\coerce{\tm_{n'}}{\cn'_{n'}})}}
+%           {\caseas{x}{\dots;\alt{K ~ \vect[n']{y_{n'}}}{\cmd};\dots}}}}}
+%   \end{aligned}
+%   \\
+%   &
+%   \Where
+%   \cn : \eqty{T ~ \vect[m]{\ty_{m}}}{T ~ \vect[m]{\ty'_{m}}}
+%   \\
+%   &\phantom{\Where}
+%   K : \ty_K
+%   \\
+%   &\phantom{\Where}
+%   \cn_i = \arg_i(\idcn{\ty_K} ~ \vect[m]{\nth_{m} \cn} ~ \vect[m']{\idcn{\sty_{m'}}})
+% \end{align*}
+% \begin{align*}
+%   \begin{aligned}[b]
+%     &
+%     \Let \rec{\vect[n]{\bp_n}} \In
+%     \\ &
+%     \cut
+%     {\tm'}
+%     {\app{\vect[m]{\tm_{m}}}{\koerce{\cn}{\caseas{x}{\dots;\alt{\blank}{\cmd}}}}}
+%   \end{aligned}
+%   &\sred
+%   \begin{aligned}[b]
+%     &
+%     \Let \rec{\vect[n]{\bp_n}} \In
+%     \\ &
+%     \cmd\subst{x}{\tm''}
+%   \end{aligned}
+%   \\
+%   \Where
+%   \tm''
+%   &=
+%   \comp{r}\cut{\tm'}{\app{\vect[m]{\tm_{m}}}{\koerce{\cn}{\ret r}}}
+%   \text{ is a WHNF}
+% \end{align*}
+
+And finally, when we have two casts in a row, we merge them into a single cast
+of the composed coercion:
+\begin{align*}
+  \cut{\V}{\koerce{\cn}{\koerce{\cn'}{\ko}}}
+  &\sred
+  \cut{\V}{\koerce{\compcn{\cn}{\cn'}}{\ko}}
+\end{align*}
+
+% \begin{align*}
+%   \begin{aligned}[b]
+%     &
+%     \Let \rec{\vect[n]{\bp_n}} \In
+%     \\ &
+%     \cut{K}{\app{\vect[m]{\tm_m}}{\koerce{\cn}{(\app{\tm'}{\ko})}}}
+%   \end{aligned}
+%   &\sred  
+%   \begin{aligned}[b]
+%     &
+%     \Let \rec{\vect[n]{\bp_n}} \In
+%     \\ &
+%     \cut
+%     {K}
+%     {\app
+%       {\vect[m]{\tm_m}}
+%       {\app
+%         {(\coerce{\tm'}{\sym(\nth_0 \cn)})}
+%         {(\koerce{\nth_1 \cn}{\ko})}}}
+%   \end{aligned}
+%   \\
+%   \Where
+%   m &< arity(K)
+%   \\
+%   \tm' &\notin Type
+%   \\
+%   \begin{aligned}[b]
+%     &
+%     \Let \rec{\vect[n]{\bp_n}} \In
+%     \\ &
+%     \cut{K}{\app{\vect[m]{\tm_m}}{\koerce{\cn}{(\app{\ty}{\ko})}}}
+%   \end{aligned}
+%   &\sred  
+%   \begin{aligned}[b]
+%     &
+%     \Let \rec{\vect[n]{\bp_n}} \In
+%     \\ &
+%     \cut
+%     {K}
+%     {\app
+%       {\vect[m]{\tm_m}}
+%       {\app{\ty}{(\koerce{\cn ~ \ty}{\ko})}}}
+%   \end{aligned}
+%   \\
+%   \Where
+%   m &< arity(K)
+%   \\
+%   \begin{aligned}[b]
+%     &
+%     \Let \rec{\vect[n]{\bp_n}} \In
+%     \\ &
+%     \cut{K}{\app{\vect[m]{\tm_m}}{\koerce{\cn}{\koerce{\cn'}{\ko}}}}
+%   \end{aligned}
+%   &\sred
+%   \begin{aligned}[b]
+%     &
+%     \Let \rec{\vect[n]{\bp_n}} \In
+%     \\ &
+%     \cut{K}{\app{\vect[m]{\tm_m}}{\koerce{\compcn{\cn}{\cn'}}{\ko}}}
+%   \end{aligned}
+%   \\
+%   \Where
+%   m &< arity(K)
+% \end{align*}
+
 \section{Translation}
 \label{sec:translation}
 
@@ -975,7 +1550,7 @@ the outer-most continuation and bindings of the computation:
   \Where
     \expr \text{ is an apparent value }
 \end{align*}
-Some care must still be taken when transating $\Case$ expressions, since we want
+Some care must still be taken when translating $\Case$ expressions, since we want
 to avoid unnecessary duplication of large continuations inside the branches of
 alternatives.  For now, we just check if the continuation to a $\Case$ is small
 enough to duplicate, and if not, bind it with a computation abstraction.  When

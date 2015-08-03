@@ -2,9 +2,17 @@
 
 \usepackage{esvect}
 
+\newcommand{\qqquad}{\qquad\quad}
+\newcommand{\qqqquad}{\qquad\qquad}
+
+\newcommand{\co}{\mbox{co-}}
+\newcommand{\Co}{\mbox{Co-}}
+
 \newcommand{\expr}{e}
 \newcommand{\cmd}{c}
 \newcommand{\tm}{v}
+\newcommand{\V}{V}
+\newcommand{\whnf}{W}
 \newcommand{\ko}{k}
 \newcommand{\ty}{\tau}
 \newcommand{\sty}{\sigma}
@@ -22,6 +30,7 @@
 \newcommand{\rhs}{rhs}
 \newcommand{\bp}{bp}
 \newcommand{\atick}{tick}
+\newcommand{\pat}{pat}
 
 \newcommand{\typecmd}[3]{#1; #2 \vdash_{cmd} #3 \Ok}
 \newcommand{\typetm}[3]{#1 \vdash_{tm} #2 : #3}
@@ -76,8 +85,13 @@
 \newcommand{\vect}[2][]{{\vv{#2}}^{#1}}
 
 \newcommand{\subst}[2]{[#2/#1]}
+\newcommand{\subp}[1]{[#1]}
 
 \newcommand{\hole}{\square}
+
+\newcommand{\red}{\to}
+\newcommand{\sred}{\mapsto}
+\newcommand{\ared}{\rightsquigarrow}
 
 \newcommand{\trans}[1]{\left\llbracket{#1}\right\rrbracket}
 
@@ -121,15 +135,15 @@
 \newcommand{\nonrec}[1]{#1}
 \newcommand{\alt}[2]{#1 \to #2}
 
+\newcommand{\idcn}[1]{\left\langle#1\right\rangle}
+\newcommand{\sym}{\operatorname{sym}}
+\newcommand{\nth}{\operatorname{nth}}
+\newcommand{\compcn}[2]{#1; #2}
+\newcommand{\instancn}[2]{#1 @ #2}
+\newcommand{\ntharg}{\operatorname{arg}}
+
 \newcommand{\Alt}{\mid}
 
 \newcommand{\axiom}[2][]{\infer[#1]{#2}{}}
 
 \newcommand{\Ok}{\operatorname{ok}}
-
-\newcommand{\qqquad}{\qquad\quad}
-\newcommand{\qqqquad}{\qquad\qquad}
-
-\newcommand{\co}{\mbox{co-}}
-\newcommand{\Co}{\mbox{Co-}}
-
