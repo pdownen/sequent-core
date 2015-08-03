@@ -9,7 +9,8 @@ module Language.SequentCore.WiredIn (
   
   sequentCoreTag, sequentCoreWiredInTag,
   
-  mkLamKontId, mkLetKontId, mkArgKontId, mkCaseKontId, mkKontArgId
+  mkLamKontId, mkLetKontId, mkArgKontId, mkCaseKontId, mkCastKontId,
+  mkTermKontId, mkKontArgId
 ) where
 
 import FastString
@@ -32,16 +33,18 @@ sequentCoreTag        = 'Q'
 sequentCoreWiredInTag = 'q'
 
 kontKindKey, kontArgsKindKey, kontTypeKey, kontArgsTypeKey, ubxExistsTypeKey,
-  lamKontKey, argKontKey, letKontKey, kontArgKey, caseKontKey :: Unique
+  lamKontKey, argKontKey, letKontKey, caseKontKey, castKontKey, termKontKey,
+  kontArgKey :: Unique
 kontKindKey: kontArgsKindKey: kontTypeKey: kontArgsTypeKey: ubxExistsTypeKey:
-  lamKontKey: argKontKey: letKontKey: kontArgKey: caseKontKey: _
+  lamKontKey: argKontKey: letKontKey: caseKontKey: castKontKey: termKontKey:
+  kontArgKey: _
   = map (mkUnique sequentCoreWiredInTag) [1..]
 
-lamKontName, argKontName, letKontName, caseKontName, kontArgName :: Name
-[lamKontName, argKontName, letKontName, caseKontName, kontArgName] =
+lamKontName, argKontName, letKontName, caseKontName, castKontName, termKontName, kontArgName :: Name
+[lamKontName, argKontName, letKontName, caseKontName, castKontName, termKontName, kontArgName] =
   zipWith mkSystemVarName
-    [lamKontKey,    argKontKey,    letKontKey,    caseKontKey,    kontArgKey]
-    [fsLit "*lamk", fsLit "*argk", fsLit "*letk", fsLit "*casek", fsLit "karg"]
+    [lamKontKey,    argKontKey,    letKontKey,    caseKontKey,    castKontKey,    termKontKey,    kontArgKey]
+    [fsLit "*lamk", fsLit "*argk", fsLit "*letk", fsLit "*casek", fsLit "*castk", fsLit "*termk", fsLit "karg"]
 
 kontKindTyConName, kontArgsKindTyConName, kontTyConName, kontArgsTyConName, ubxExistsTyConName :: Name
 kontKindTyConName     = mkPrimTyConName (fsLit "ContKind")     kontKindKey      kontKindTyCon
@@ -50,10 +53,10 @@ kontTyConName         = mkPrimTyConName (fsLit "Cont#")        kontTypeKey      
 kontArgsTyConName     = mkPrimTyConName (fsLit "ContArgs#")    kontArgsTypeKey  kontArgsTyCon
 ubxExistsTyConName    = mkPrimTyConName (fsLit "Exists#")      ubxExistsTypeKey ubxExistsTyCon
 
-mkLamKontId, mkArgKontId, mkLetKontId, mkCaseKontId :: Type -> Var
-[mkLamKontId, mkArgKontId, mkLetKontId, mkCaseKontId]
+mkLamKontId, mkArgKontId, mkLetKontId, mkCaseKontId, mkCastKontId, mkTermKontId :: Type -> Var
+[mkLamKontId, mkArgKontId, mkLetKontId, mkCaseKontId, mkCastKontId, mkTermKontId]
   = map (\name ty -> mkLocalId name (mkKontTy ty))
-      [lamKontName, argKontName, letKontName, caseKontName]
+      [lamKontName, argKontName, letKontName, caseKontName, castKontName, termKontName]
 
 mkKontArgId :: Type -> Id
 mkKontArgId ty = mkLocalId kontArgName ty

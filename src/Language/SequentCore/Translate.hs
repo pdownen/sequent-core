@@ -28,10 +28,10 @@ import qualified CoreFVs as Core
 import Id
 import Maybes
 import qualified MkCore as Core
-import Module     ( mkModule, mkModuleName, stringToPackageId )
-import OccurAnal  ( occurAnalysePgm, occurAnalyseExpr )
+import MkId
 import Outputable  hiding ( (<>) )
 import Type        hiding ( substTy )
+import TysPrim
 import TysWiredIn
 import VarEnv
 import VarSet
@@ -58,23 +58,14 @@ import Data.Monoid
 
 -- | Translates a list of Core bindings into Sequent Core.
 fromCoreModule :: [Core.CoreBind] -> [SeqCoreBind]
-fromCoreModule = fromCoreBinds . escAnalProgram . runOccurAnal
-  where
-    runOccurAnal = occurAnalysePgm fakeModule isActive rules vects vectVars
-      where
-        fakeModule = mkModule (stringToPackageId "fake-0.0") (mkModuleName "FakeModule")
-        isActive _ = False
-        rules      = []
-        vects      = []
-        vectVars   = emptyVarSet
+fromCoreModule = fromCoreBinds . escAnalProgram
 
 -- | Translates a single Core expression as a Sequent Core term.
 termFromCoreExpr :: Core.CoreExpr -> SeqCoreTerm
 termFromCoreExpr expr
   = fromCoreExprAsTerm env markedExpr mkLetKontId
   where
-    occExpr = occurAnalyseExpr expr
-    markedExpr = runEscM (escAnalExpr occExpr)
+    markedExpr = runEscM (escAnalExpr expr)
     env = initFromCoreEnv { fce_subst = freeVarSet }
     freeVarSet = mkSubst (mkInScopeSet (Core.exprFreeVars expr))
                    emptyVarEnv emptyVarEnv emptyVarEnv
@@ -234,8 +225,8 @@ addBinders pairs
     doOne env (bndr, rhs)
       = (extendVarEnv env bndr cand, cand)
       where
-        (_tyBndrs, valBndrs, _body) = Core.collectTyAndValBinders rhs
-        cand = Candidate (length valBndrs)
+        (bndrs, _body) = Core.collectBinders rhs
+        cand = Candidate (length bndrs)
 
 allFreeVarsEscape :: EscapeAnalysis -> EscapeAnalysis
 allFreeVarsEscape escs@(EA { ea_freeVars = fvs, ea_escVars = evs })
@@ -250,24 +241,17 @@ escAnalExpr expr@(Core.App {})
   = do
     env <- getBindings
     let (func, args) = Core.collectArgs expr
-        valArgs = filter (not . Core.isTypeArg) args
-    
     func' <- case func of
       Core.Var fid -> do 
                       case lookupVarEnv env fid of
                         Just (Candidate arity) ->
                           -- Exactly saturated calls don't cause escapes; others do
-                          if arity == length valArgs
+                          if arity == length args
                             then reportFreeVar fid
                             else reportEscVar fid
                         _ -> return ()
                       return (Core.Var fid)
-      -- The effect of making all free vars escape here is that we're saying
-      -- the free variables in the lambda of a beta-redex escape. This is not
-      -- necessary, but our type system won't let a lambda see any continuations
-      -- from an outer scope, so we can't contify in this case; however, this is
-      -- not a serious problem since a beta-redex won't last long once the
-      -- simplifier has its paws on it.
+      -- The filter is probably redundant, but can't hurt
       _ -> filterAnalysis allFreeVarsEscape $ escAnalExpr func
     args' <- forM args $ \arg ->
                filterAnalysis allFreeVarsEscape $ escAnalExpr arg
@@ -279,10 +263,7 @@ escAnalExpr expr@(Core.Lam {})
     -- Remove value binders from the environment in case of shadowing - we
     -- won't report them as free vars
     body' <- withoutBindingList valBndrs $
-             -- We have to make everything escape a lambda, no matter what, for
-             -- contification to work; if contification weren't the concern,
-             -- we might say that variables on the left side of a beta-redex,
-             -- for instance, don't escape
+             -- Lambdas ruin contification, so pretend the free vars escape
              filterAnalysis allFreeVarsEscape $
              escAnalExpr body
     let bndrs' = [ Marked bndr MakeFunc | bndr <- tyBndrs ++ valBndrs ]
@@ -302,16 +283,7 @@ escAnalExpr (Core.Case scrut bndr ty alts)
       return (con, map (`Marked` MakeFunc) bndrs, rhs')
     return $ Core.Case scrut' (Marked bndr MakeFunc) ty alts'
 escAnalExpr (Core.Cast expr co)
-  -- FIXME What we really want here isn't actually an escape analysis per se,
-  -- it's something a little pickier: We want to be sure that a function is used
-  -- *only by tail-calling it.* Usually, the only non-escaping uses of a
-  -- functions are tail calls, so this is the same thing, *but* a call under a
-  -- cast is not a tail call and yet, if the *cast* is in tail position, it
-  -- still doesn't escape. Since the cast changes the type of the context (and
-  -- hence that of the continuation), we can't contify something if its return
-  -- value is cast.
-  --
-  -- Short story is that we lie here and say that everything escapes.
+  -- A call under a cast isn't a tail call, so pretend the free vars escape
   = (`Core.Cast` co) <$> filterAnalysis allFreeVarsEscape (escAnalExpr expr)
 escAnalExpr (Core.Tick ti expr)
   = Core.Tick ti <$> escAnalExpr expr
@@ -366,7 +338,8 @@ data FromCoreEnv
         , fce_boundKonts :: IdEnv KontCallConv
         }
 
-newtype KontCallConv = ByJump TotalArity
+data KontCallConv = ByJump TotalArity VoidArgFlag
+data VoidArgFlag = HasVoidArg | NoVoidArg
 
 initFromCoreEnv :: FromCoreEnv
 initFromCoreEnv = FCE { fce_subst = emptySubst
@@ -424,17 +397,24 @@ fromCoreExpr env expr kont = go [] env expr kont
       where
         done term = mkCommand (reverse binds) term kont
         
-        goApp x args = case kontCallConv env x' of
-          Just (ByJump arity) -> assert (length args == arity) $
-                                   foldr Let (Jump args' p) (reverse binds)
-          Nothing             -> doneWith (Var x') (foldr App kont args')
+        goApp x args = case conv_maybe of
+          Just (ByJump arity HasVoidArg) -> assert (length args == arity + 1) $
+                                            doneJump (dropLast args') p
+          Just (ByJump arity NoVoidArg)  -> assert (length args == arity) $
+                                            doneJump args' p
+          Nothing             -> doneEval (Var x') (foldr App kont args')
           where
             x' = substIdOcc subst x
             args' = map (\e -> fromCoreExprAsTerm env e mkArgKontId) args
             conv_maybe = kontCallConv env x'
-            Just conv = conv_maybe
-            p = idToKontId x' conv
-            doneWith v k = mkCommand (reverse binds) v k
+            p = let Just conv = conv_maybe in idToKontId x' conv
+            doneEval v k = mkCommand (reverse binds) v k
+            doneJump vs j = foldr Let (Jump vs j) (reverse binds)
+
+dropLast :: [a] -> [a]
+dropLast [] = panic "dropLast"
+dropLast [_] = []
+dropLast (x:xs) = x:dropLast xs
 
 fromCoreLams :: FromCoreEnv -> MarkedVar -> Core.Expr MarkedVar
                             -> SeqCoreTerm
@@ -479,24 +459,32 @@ fromCoreExprAsTerm env expr mkId
     ty = substTy subst (Core.exprType (unmarkExpr expr))
     env' = env `bindCurrentKont` k
 
-fromCoreExprAsPKont :: FromCoreEnv -> SeqCoreKont -> Arity -> Core.Expr MarkedVar
-                   -> ([SeqCoreBndr], SeqCoreCommand)
+fromCoreExprAsPKont :: FromCoreEnv -> SeqCoreKont -> TotalArity
+                    -> Core.Expr MarkedVar
+                    -> (KontCallConv, [SeqCoreBndr], SeqCoreCommand)
 fromCoreExprAsPKont env kont arity expr
-  = (bndrs', comm)
+  = (conv, bndrs_final, comm)
   where
     (bndrs, body) = collectNBinders arity expr
     subst = fce_subst env
-    (subst', bndrs') = substBndrs subst (map unmark bndrs)
+    (subst', bndrs_final) = substBndrs subst bndrs'
+    bndrs_unmarked = map unmark bndrs
+    (hasVoid, bndrs')
+      = case span isTyVar bndrs_unmarked of
+          (tyVars, [x]) | isDeadBinder x
+                        , idType x `eqType` voidPrimTy
+             -> (True, tyVars)
+          _  -> (False, bndrs_unmarked)
+    conv | hasVoid   = ByJump (arity - 1) HasVoidArg
+         | otherwise = ByJump arity NoVoidArg
     env' = env { fce_subst = subst' }
     comm = fromCoreExpr env' body kont
 
-collectNBinders :: Int -> Core.Expr MarkedVar -> ([MarkedVar], Core.Expr MarkedVar)
+collectNBinders :: TotalArity -> Core.Expr MarkedVar -> ([MarkedVar], Core.Expr MarkedVar)
 collectNBinders 0 expr = ([], expr)
 collectNBinders n (Core.Lam x body) | n > 0 = (x:xs, body')
   where
-    (xs, body') = collectNBinders n' body
-    n' | isTyVar (unmark x) = n
-       | otherwise          = n - 1
+    (xs, body') = collectNBinders (n - 1) body
 collectNBinders n body = pprPanic "collectNBinders" (int n <+> ppr body)
 
 -- | Translates a Core case alternative into Sequent Core.
@@ -526,23 +514,24 @@ fromCoreBind (env@FCE { fce_subst = subst }) kont_maybe bind =
         env' = env { fce_subst = subst' }
         pairs_substed = [ (Marked x' mark, rhs) | (Marked _ mark, rhs) <- pairs 
                                                 | x' <- xs' ]
-        env_final = bindAsPKonts env' [ (p, ByJump arity)
-                                      | (Marked p (MakeKont arity), _) <- pairs_substed ]
-        pairs_final = [ snd $ fromCoreBindPair env_final kont_maybe x' mark rhs
-                      | (Marked x' mark, rhs) <- pairs_substed ]
+        pairs' = [ fromCoreBindPair env_final kont_maybe x' mark rhs
+                 | (Marked x' mark, rhs) <- pairs_substed ]
+        env_final = bindAsPKonts env' [ (binderOfPair pair, conv)
+                                      | (Just conv, pair) <- pairs' ]
+        pairs_final = map snd pairs'
 
 fromCoreBindPair :: FromCoreEnv -> Maybe SeqCoreKont -> Var -> KontOrFunc
                  -> Core.Expr MarkedVar -> (Maybe KontCallConv, SeqCoreBindPair)
 fromCoreBindPair env kont_maybe x mark rhs
   = case mark of
       MakeKont arity -> let Just kont = kont_maybe
-                            (bndrs, comm) = fromCoreExprAsPKont env kont arity rhs
-                        in (Just (ByJump arity),
-                            BindPKont (idToKontId x (ByJump arity)) (PKont bndrs comm))
+                            (conv, bndrs, comm) = fromCoreExprAsPKont env kont arity rhs
+                        in (Just conv,
+                            BindPKont (idToKontId x conv) (PKont bndrs comm))
       MakeFunc       -> (Nothing, BindTerm x $ fromCoreExprAsTerm env rhs mkLetKontId)
 
 idToKontId :: Id -> KontCallConv -> KontId
-idToKontId p (ByJump arity)
+idToKontId p (ByJump arity _hasVoidArg)
   = p `setIdType` mkKontTy (mkKontArgsTy (foldr mkUbxExistsTy (mkTupleTy UnboxedTuple kArgTys) tyVars))
     where
       (tyVars, monoTy) = splitForAllTys (idType p)
@@ -562,9 +551,12 @@ commandToCoreExpr retId comm
   = case comm of
       Let bind comm' -> Core.mkCoreLet (bindToCore (Just retId) bind)
                                        (commandToCoreExpr retId comm')
-      Eval term kont   -> kontToCoreExpr retId kont (termToCoreExpr term)
+      Eval term kont -> kontToCoreExpr retId kont (termToCoreExpr term)
       Jump args j    -> Core.mkCoreApps (Core.Var (kontIdToCore retId j))
-                                        (map termToCoreExpr args)
+                                        (map termToCoreExpr args ++ extraArgs)
+        where
+          extraArgs | all isTypeTerm args = [ Core.Var voidPrimId ]
+                    | otherwise           = []
 
 -- | Translates a term into Core.
 termToCoreExpr :: SeqCoreTerm -> Core.CoreExpr
@@ -612,9 +604,26 @@ kontArgsTyToCoreTy ty retTy
   = mkForAllTy a (kontArgsTyToCoreTy body retTy)
   | isUnboxedTupleType ty
   = let (_, args) = splitTyConApp ty
-    in mkFunTys args retTy
+        args' | null args = [ voidPrimTy ]
+              | otherwise = args
+    in mkFunTys args' retTy
   | otherwise
   = pprPanic "kontArgsTyToCoreTy" (ppr ty)
+
+needsVoidArg :: Type -> Bool
+needsVoidArg ty
+  | Just ty' <- isKontArgsTy_maybe ty
+  = go ty'
+  | otherwise
+  = False
+  where
+    go ty' | Just (_, bodyTy) <- isUbxExistsTy_maybe ty'
+           = go bodyTy
+           | isUnboxedTupleType ty'
+           = let (_, args) = splitTyConApp ty
+             in null args
+           | otherwise
+           = pprPanic "needsVoidArg" (ppr ty)
 
 -- | Translates a binding into Core.
 bindToCore :: Maybe KontId -> SeqCoreBind -> Core.CoreBind
@@ -629,10 +638,12 @@ bindPairToCore :: Maybe KontId -> RecFlag -> SeqCoreBindPair
 bindPairToCore retId_maybe recFlag pair =
   case pair of
     BindTerm b v -> (b, termToCoreExpr v)
-    BindPKont b (PKont xs c) -> (b', Core.mkCoreLams (maybeOneShots xs)
+    BindPKont b (PKont xs c) -> (b', Core.mkCoreLams (maybeOneShots xs')
                                                      (commandToCoreExpr retId c))
       where
         b'    = kontIdToCore retId b
+        xs'   | null xs   = [ voidArgId ]
+              | otherwise = xs
         maybeOneShots xs | isNonRec recFlag = map setOneShotLambdaIfId xs
                          | otherwise        = xs
         setOneShotLambdaIfId x | isId x = setOneShotLambda x

@@ -20,22 +20,28 @@ module Language.SequentCore.Simpl.Env (
   isEmptyFloats, hasNoKontFloats,
   doFloatFromRhs, getFloatBinds, getFloats,
   
+  activeUnfolding,
+  
   termIsHNF, commandIsHNF
 ) where
 
-import Language.SequentCore.Pretty ()
+import Language.SequentCore.Arity
+import Language.SequentCore.OccurAnal
 import Language.SequentCore.Simpl.ExprSize
 import Language.SequentCore.Syntax
 import Language.SequentCore.Translate
 import Language.SequentCore.WiredIn
 
-import BasicTypes ( Activation, TopLevelFlag(..), RecFlag(..)
-                  , isActive, isTopLevel, isNotTopLevel, isNonRec )
+import BasicTypes ( Activation, Arity, CompilerPhase(..), PhaseNum
+                  , TopLevelFlag(..), RecFlag(..)
+                  , isActive, isActiveIn, isEarlyActive
+                  , isInlinePragma, inlinePragmaActivation
+                  , isTopLevel, isNotTopLevel, isNonRec )
 import Coercion   ( Coercion, CvSubstEnv, CvSubst(..), isCoVar )
 import qualified Coercion
 import CoreMonad  ( SimplifierMode(..) )
 import CoreSyn    ( Unfolding(..), UnfoldingGuidance(..), UnfoldingSource(..)
-                  , mkOtherCon )
+                  , isCompulsoryUnfolding, mkOtherCon )
 import CoreUnfold ( mkCoreUnfolding, mkDFunUnfolding  )
 import DataCon    ( DataCon )
 import DynFlags   ( DynFlags, ufCreationThreshold )
@@ -54,7 +60,7 @@ import VarSet
 
 import Control.Applicative ( (<$>), (<|>) )
 import Control.Exception   ( assert )
-import Control.Monad       ( guard, liftM )
+import Control.Monad       ( guard )
 
 infixl 1 `setStaticPart`
 
@@ -94,6 +100,11 @@ data Definition
   = BoundTo { defTerm :: OutTerm
             , defLevel :: TopLevelFlag
             , defGuidance :: Guidance
+            , defArity :: Arity
+            , defIsValue :: Bool
+            , defIsConLike :: Bool
+            , defIsWorkFree :: Bool
+            , defIsExpandable :: Bool
             }
   | BoundToPKont { defPKont :: OutPKont
                  , defGuidance :: Guidance }
@@ -110,9 +121,21 @@ data Guidance
   | Sometimes { guSize :: Int
               , guArgDiscounts :: [Int]
               , guResultDiscount :: Int }
+              
+always :: Guidance
+always = Usually { guEvenIfUnsat = True, guEvenIfBoring = True }
 
-mkBoundTo :: DynFlags -> OutTerm -> TopLevelFlag -> Definition
-mkBoundTo dflags term level = BoundTo term level (mkGuidance dflags term)
+mkBoundTo :: SimplEnv -> DynFlags -> OutTerm -> Arity -> TopLevelFlag -> Definition
+mkBoundTo env dflags term arity level
+  = BoundTo { defTerm         = occurAnalyseTerm term
+            , defLevel        = level
+            , defGuidance     = mkGuidance dflags term
+            , defArity        = arity
+            , defIsExpandable = termIsExpandable term
+            , defIsValue      = termIsHNF env term
+            , defIsWorkFree   = termIsCheap term
+            , defIsConLike    = False -- TODO
+            }
 
 mkBoundToPKont :: DynFlags -> OutPKont -> Definition
 mkBoundToPKont dflags pkont = BoundToPKont pkont (mkPKontGuidance dflags pkont)
@@ -122,8 +145,20 @@ mkGuidance dflags term
   = let cap = ufCreationThreshold dflags
     in case termSize dflags cap term of
        Nothing -> Never
-       Just (ExprSize base args res) ->
-         Sometimes base args res
+       Just (ExprSize base args res)
+         | uncondInline term nValBinds base -> always
+         | otherwise                        -> Sometimes base args res
+  where
+    (bndrs, _) = lambdas term
+    nValBinds = length (filter isId bndrs)
+    
+uncondInline :: OutTerm -> Arity -> Int -> Bool
+-- Inline unconditionally if there no size increase
+-- Size of call is arity (+1 for the function)
+-- See GHC CoreUnfold: Note [INLINE for small functions]
+uncondInline rhs arity size 
+  | arity > 0 = size <= 10 * (arity + 1)
+  | otherwise = isTrivialTerm rhs
 
 mkPKontGuidance :: DynFlags -> OutPKont -> Guidance
 mkPKontGuidance dflags pkont
@@ -245,12 +280,17 @@ mkFreshVar env name ty
 mkFreshKontId :: MonadUnique m => SimplEnv -> FastString -> Type -> m (SimplEnv, KontId)
 mkFreshKontId env name inTy
   = do
-    p <- (uniqAway (se_inScope env) . asKontId) `liftM` mkSysLocalM name inTy
-    let env' = env { se_inScope = extendInScopeSet (se_inScope env) p
-                   , se_pvSubst = emptyVarEnv
-                   , se_retId   = Just p
-                   , se_retKont = Nothing }
-    return (env', p)
+    p <- mkSysLocalM name inTy
+    let occInfo = -- Assumes we're wrapping a term in a Compute or some such,
+                  -- so there's no branching
+                  OneOcc notInsideLam oneBranch False
+        p'      = asKontId p `setIdOccInfo` occInfo
+        p_final = uniqAway (se_inScope env) p'
+        env'    = env { se_inScope = extendInScopeSet (se_inScope env) p_final
+                      , se_pvSubst = emptyVarEnv
+                      , se_retId   = Just p_final
+                      , se_retKont = Nothing }
+    return (env', p_final)
 
 substId :: SimplEnv -> InId -> TermSubstAns
 substId (SimplEnv { se_idSubst = ids, se_inScope = ins }) x
@@ -442,7 +482,7 @@ extendFloats env bind
     bndrs = bindersOf bind
     defs = map asDef (flattenBind bind)
     -- FIXME The NotTopLevel flag might wind up being wrong!
-    asDef (BindTerm x term) = (x, mkBoundTo (se_dflags env) term NotTopLevel)
+    asDef (BindTerm x term) = (x, mkBoundTo env (se_dflags env) term (termArity term) NotTopLevel)
     asDef (BindPKont p pk)  = (p, mkBoundToPKont (se_dflags env) pk)
 
 addFloats :: SimplEnv -> SimplEnv -> SimplEnv
@@ -518,19 +558,28 @@ hasNoKontFloats = foldrOL (&&) True . mapOL (all bindsTerm . flattenBind)
 
 findDef :: SimplEnv -> OutId -> Maybe Definition
 findDef env var
-  = lookupVarEnv (se_defs env) var <|> unfoldingToDef (unfoldingInfo (idInfo var))
+  | isStrongLoopBreaker (idOccInfo var)
+  = Nothing
+  | otherwise
+  = lookupVarEnv (se_defs env) var <|> unfoldingToDef (idUnfolding var)
 
 unfoldingToDef :: Unfolding -> Maybe Definition
 unfoldingToDef NoUnfolding     = Nothing
 unfoldingToDef (OtherCon cons) = Just (NotAmong cons)
 unfoldingToDef unf@(CoreUnfolding {})
-  = Just $ BoundTo { defTerm     = termFromCoreExpr (uf_tmpl unf)
-                   , defLevel    = if uf_is_top unf then TopLevel else NotTopLevel
-                   , defGuidance = unfGuidanceToGuidance (uf_guidance unf) }
+  = Just $ BoundTo { defTerm         = occurAnalyseTerm (termFromCoreExpr (uf_tmpl unf))
+                   , defLevel        = if uf_is_top unf then TopLevel else NotTopLevel
+                   , defGuidance     = unfGuidanceToGuidance (uf_guidance unf)
+                   , defArity        = uf_arity unf
+                   , defIsValue      = uf_is_value unf
+                   , defIsConLike    = uf_is_conlike unf
+                   , defIsWorkFree   = uf_is_work_free unf
+                   , defIsExpandable = uf_expandable unf }
 unfoldingToDef unf@(DFunUnfolding {})
   = Just $ BoundToDFun { dfunBndrs    = df_bndrs unf
                        , dfunDataCon  = df_con unf
-                       , dfunArgs     = map termFromCoreExpr (df_args unf) }
+                       , dfunArgs     = map (occurAnalyseTerm . termFromCoreExpr)
+                                            (df_args unf) }
 
 unfGuidanceToGuidance :: UnfoldingGuidance -> Guidance
 unfGuidanceToGuidance UnfNever = Never
@@ -574,9 +623,9 @@ termIsHNF :: SimplEnv -> SeqCoreTerm -> Bool
 termIsHNF _   (Lit {})  = True
 termIsHNF env (Var id)
   = case lookupVarEnv (se_defs env) id of
-      Just (NotAmong {})      -> True
-      Just (BoundTo term _ _) -> termIsHNF env term
-      _                       -> False
+      Just (NotAmong {})              -> True
+      Just (BoundTo {defTerm = term}) -> termIsHNF env term
+      _                               -> False
 termIsHNF env (Compute _ comm) = commandIsHNF env comm
 termIsHNF _   _        = False
 
@@ -593,6 +642,41 @@ commandIsHNF env (Eval term (Return _))
   = termIsHNF env term
 commandIsHNF _ _
   = False
+  
+activeUnfolding :: SimplEnv -> Id -> Bool
+activeUnfolding env
+  | not (sm_inline mode) = active_unfolding_minimal
+  | otherwise            = case sm_phase mode of
+                             InitialPhase -> active_unfolding_gentle
+                             Phase n      -> active_unfolding n
+  where
+    mode = getMode env
+
+active_unfolding_minimal :: Id -> Bool
+-- Compuslory unfoldings only
+-- Ignore SimplGently, because we want to inline regardless;
+-- the Id has no top-level binding at all
+--
+-- NB: we used to have a second exception, for data con wrappers.
+-- On the grounds that we use gentle mode for rule LHSs, and
+-- they match better when data con wrappers are inlined.
+-- But that only really applies to the trivial wrappers (like (:)),
+-- and they are now constructed as Compulsory unfoldings (in MkId)
+-- so they'll happen anyway.
+active_unfolding_minimal id = isCompulsoryUnfolding (realIdUnfolding id)
+
+active_unfolding :: PhaseNum -> Id -> Bool
+active_unfolding n id = isActiveIn n (idInlineActivation id)
+
+active_unfolding_gentle :: Id -> Bool
+-- Anything that is early-active
+-- See Note [Gentle mode]
+active_unfolding_gentle id
+  =  isInlinePragma prag
+  && isEarlyActive (inlinePragmaActivation prag)
+       -- NB: wrappers are not early-active
+  where
+    prag = idInlinePragma id
 
 instance Outputable SimplEnv where
   ppr env
@@ -627,8 +711,8 @@ instance Outputable a => Outputable (SubstAns a) where
 --    = brackets $ hang (text "Suspended:") 2 (ppr v)
 
 instance Outputable Definition where
-  ppr (BoundTo c level guid)
-    = sep [brackets (ppr level <+> ppr guid), ppr c]
+  ppr (BoundTo { defTerm = term, defLevel = level, defGuidance = guid})
+    = sep [brackets (ppr level <+> ppr guid), ppr term]
   ppr (BoundToPKont pk guid)
     = sep [brackets (ppr guid), ppr pk]
   ppr (BoundToDFun bndrs con args)

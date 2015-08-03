@@ -28,6 +28,7 @@ flag examples
 library
   hs-source-dirs:      src
   exposed-modules:     Language.SequentCore
+                       Language.SequentCore.Arity
                        Language.SequentCore.Dump
                        Language.SequentCore.Inspect
                        Language.SequentCore.Lint

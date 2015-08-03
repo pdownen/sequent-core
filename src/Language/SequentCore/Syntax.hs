@@ -14,8 +14,9 @@ module Language.SequentCore.Syntax (
     SeqCoreBind, SeqCoreBindPair, SeqCoreRhs, SeqCoreBndr, SeqCoreAlt,
     SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
-  mkCommand, mkLambdas, mkCompute, mkAppTerm, mkApp, mkConstruction, addLets,
-  addLetsToTerm, addNonRec,
+  mkCommand, mkVarTerm, mkLambdas, mkCompute, mkAppTerm, mkApp, mkCast,
+  mkConstruction,
+  addLets, addLetsToTerm, addNonRec,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
   partitionTypes,
@@ -27,13 +28,15 @@ module Language.SequentCore.Syntax (
   binderOfPair, setPairBinder, rhsOfPair, mkBindPair, destBindPair,
   bindsTerm, bindsKont, flattenBind, flattenBinds, bindersOf, bindersOfBinds,
   -- * Calculations
-  termArity, termType,
-  termIsBottom, commandIsBottom,
+  termType, termIsBottom, commandIsBottom,
   needsCaseBinding,
   termOkForSpeculation, commandOkForSpeculation, kontOkForSpeculation,
   termOkForSideEffects, commandOkForSideEffects, kontOkForSideEffects,
-  termIsCheap, kontIsCheap, commandIsCheap,
-  termIsExpandable, kontIsExpandable, commandIsExpandable,
+  termIsCheap, kontIsCheap, commandIsCheap, rhsIsCheap,
+  termIsExpandable, kontIsExpandable, commandIsExpandable, rhsIsExpandable,
+  CheapAppMeasure, isCheapApp, isExpandableApp,
+  termIsCheapBy, kontIsCheapBy, commandIsCheapBy, rhsIsCheapBy,
+  applyTypeToArg,
   -- * Continuation ids
   isKontId, isPKontId, asKontId, Language.SequentCore.WiredIn.mkKontTy, kontTyArg,
   -- * Values
@@ -45,7 +48,7 @@ module Language.SequentCore.Syntax (
 import {-# SOURCE #-} Language.SequentCore.Pretty ()
 import Language.SequentCore.WiredIn
 
-import Coercion  ( Coercion, coercionType )
+import Coercion  ( Coercion, coercionKind, coercionType, isCoVar, mkCoVarCo )
 import CoreSyn   ( AltCon(..), Tickish, tickishCounts, isRuntimeVar
                  , isEvaldUnfolding )
 import DataCon   ( DataCon, dataConTyCon, dataConRepArity
@@ -57,6 +60,7 @@ import IdInfo    ( IdDetails(..) )
 import Literal   ( Literal, isZeroLit, litIsTrivial, literalType )
 import Maybes    ( orElse )
 import Outputable
+import Pair      ( pSnd )
 import PrimOp    ( PrimOp(..), primOpOkForSpeculation, primOpOkForSideEffects
                  , primOpIsCheap )
 import TyCon
@@ -196,6 +200,11 @@ mkCommand binds (Compute kbndr comm) kont
 mkCommand binds term kont
   = foldr Let (Eval term kont) binds
 
+mkVarTerm :: Var -> SeqCoreTerm
+mkVarTerm x | Type.isTyVar x = Type (Type.mkTyVarTy x)
+            | Coercion.isCoVar x = Coercion (mkCoVarCo x)
+            | otherwise = Var x
+
 mkLambdas :: [b] -> Term b -> Term b
 mkLambdas = flip (foldr Lam)
 
@@ -220,6 +229,10 @@ mkAppTerm fun args = mkCompute k (mkApp fun args (Return k))
 
 mkApp :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreKont -> SeqCoreCommand
 mkApp fun args kont = mkCommand [] fun (foldr App kont args)
+
+mkCast :: SeqCoreTerm -> Coercion -> SeqCoreTerm
+mkCast term co = Compute p $ Eval term (Cast co (Return p))
+  where p = mkCastKontId (pSnd (coercionKind co))
 
 mkConstruction :: DataCon -> [Type] -> [SeqCoreTerm] -> SeqCoreTerm
 mkConstruction dc tyArgs valArgs
@@ -620,9 +633,13 @@ commandIsCheap, commandIsExpandable :: HasId b => Command b -> Bool
 commandIsCheap      = commCheap isCheapApp
 commandIsExpandable = commCheap isExpandableApp
 
-type CheapMeasure = Id -> Int -> Bool
+rhsIsCheap, rhsIsExpandable :: HasId b => Rhs b -> Bool
+rhsIsCheap      = rhsCheap isCheapApp
+rhsIsExpandable = rhsCheap isExpandableApp
 
-termCheap :: HasId b => CheapMeasure -> Term b -> Bool
+type CheapAppMeasure = Id -> Int -> Bool
+
+termCheap :: HasId b => CheapAppMeasure -> Term b -> Bool
 termCheap _        (Lit _)      = True
 termCheap _        (Var _)      = True
 termCheap _        (Type _)     = True
@@ -631,7 +648,7 @@ termCheap appCheap (Lam x t)    = isRuntimeVar (identifier x)
                                || termCheap appCheap t
 termCheap appCheap (Compute _ c)= commCheap appCheap c
 
-kontCheap :: HasId b => CheapMeasure -> Kont b -> Bool
+kontCheap :: HasId b => CheapAppMeasure -> Kont b -> Bool
 kontCheap _        (Return _)      = True
 kontCheap appCheap (Case _ alts) = all (\(Alt _ _ rhs) -> commCheap appCheap rhs)
                                          alts
@@ -641,7 +658,7 @@ kontCheap appCheap (Tick ti kont)  = not (tickishCounts ti)
 kontCheap appCheap (App arg kont)  = isErasedTerm arg
                                    && kontCheap appCheap kont
 
-commCheap :: HasId b => CheapMeasure -> Command b -> Bool
+commCheap :: HasId b => CheapAppMeasure -> Command b -> Bool
 commCheap appCheap (Let bind comm)
   = all (bindPairCheap appCheap) (flattenBind bind) && commCheap appCheap comm
 commCheap appCheap (Eval term kont)
@@ -649,13 +666,16 @@ commCheap appCheap (Eval term kont)
 commCheap appCheap (Jump args j)
   = appCheap j (length (filter isValueArg args))
   
-bindPairCheap :: HasId b => CheapMeasure -> BindPair b -> Bool
-bindPairCheap appCheap (BindTerm _ term)  = termCheap appCheap term
-bindPairCheap appCheap (BindPKont _ (PKont _ comm)) = commCheap appCheap comm
+rhsCheap :: HasId b => CheapAppMeasure -> Rhs b -> Bool
+rhsCheap appCheap (Left term) = termCheap appCheap term
+rhsCheap appCheap (Right (PKont _ comm)) = commCheap appCheap comm
+
+bindPairCheap :: HasId b => CheapAppMeasure -> BindPair b -> Bool
+bindPairCheap appCheap = rhsCheap appCheap . rhsOfPair
 
 -- See the last clause in CoreUtils.exprIsCheap' for explanations
 
-cutCheap :: HasId b => CheapMeasure -> Term b -> Kont b -> Bool
+cutCheap :: HasId b => CheapAppMeasure -> Term b -> Kont b -> Bool
 cutCheap appCheap term (Cast _ kont) = cutCheap appCheap term kont
 cutCheap appCheap (Var fid) kont@(App {})
   = case collectTypeAndOtherArgs kont of
@@ -677,7 +697,7 @@ cutCheap appCheap (Var fid) kont@(App {})
     primOpCheap op args = primOpIsCheap op && all (termCheap appCheap) args
 cutCheap _ _ _ = False
     
-isCheapApp, isExpandableApp :: CheapMeasure
+isCheapApp, isExpandableApp :: CheapAppMeasure
 isCheapApp fid valArgCount = isDataConWorkId fid
                            || valArgCount == 0
                            || valArgCount < idArity fid
@@ -691,6 +711,20 @@ isExpandableApp fid valArgCount = isConLikeId fid
       | Just (argTy, ty') <- Type.splitFunTy_maybe ty
       , Type.isPredTy argTy = allPreds (n-1) ty'
       | otherwise = False
+
+termIsCheapBy    :: HasId b => CheapAppMeasure -> Term b    -> Bool
+kontIsCheapBy    :: HasId b => CheapAppMeasure -> Kont b    -> Bool
+commandIsCheapBy :: HasId b => CheapAppMeasure -> Command b -> Bool
+rhsIsCheapBy     :: HasId b => CheapAppMeasure -> Rhs b     -> Bool
+
+termIsCheapBy    = termCheap
+kontIsCheapBy    = kontCheap
+commandIsCheapBy = commCheap
+rhsIsCheapBy     = rhsCheap
+
+applyTypeToArg :: Type -> Arg b -> Type
+applyTypeToArg ty (Type tyArg) = Type.applyTy ty tyArg
+applyTypeToArg ty _            = Type.funResultTy ty
 
 --------------------------------------------------------------------------------
 -- Continuation ids

@@ -1234,17 +1234,19 @@ occAnalTerm env (Compute bndr comm)
     (final_usage, Compute tagged_bndr comm') }
 
 occAnalKont :: OccEnv
+            -> UsageDetails         -- ^ Usage details for the term
             -> SeqCoreKont
-            -> (UsageDetails,       -- Gives info only about the "interesting" Ids
+            -> (UsageDetails,       -- ^ Usage details for the term *and* continuation
                 SeqCoreKont)
-occAnalKont env kont@(App {})
-  = case occAnalArgs env args [] of { ( args_uds, args' ) ->
-    case occAnalKont env kont' of { ( kont_uds, kont'' ) ->
-    (args_uds +++ kont_uds, foldr App kont'' args') }}
+occAnalKont env uds kont@(App {})
+  = case occAnalArgs env args []                  of { ( args_uds, args' ) ->
+    case occAnalKont env (uds +++ args_uds) kont' of { ( final_uds, kont'' ) ->
+    (final_uds, foldr App kont'' args') }}
   where (args, kont') = collectArgs kont
 
-occAnalKont env (Case bndr alts)
-  = occAnalCase env Nothing bndr alts
+occAnalKont env uds (Case bndr alts)
+  = case occAnalCase env Nothing bndr alts of { ( case_uds, kont' ) ->
+    (uds +++ case_uds, kont') }
 
 {-
 Note [Gather occurrences of coercion veriables]
@@ -1252,7 +1254,7 @@ Note [Gather occurrences of coercion veriables]
 We need to gather info about what coercion variables appear, so that
 we can sort them into the right place when doing dependency analysis.
 -}
-occAnalKont env (Tick tickish body)
+occAnalKont env uds (Tick tickish body)
   | Core.Breakpoint _ ids <- tickish
   = (mapVarEnv markInsideSCC usage
          +++ mkVarEnv (zip ids (repeat NoOccInfo)), Tick tickish body')
@@ -1262,21 +1264,21 @@ occAnalKont env (Tick tickish body)
   | otherwise
   = (usage, Tick tickish body')
   where
-    !(usage,body') = occAnalKont env body
+    !(usage,body') = occAnalKont env uds body
 
-occAnalKont env (Cast co kont)
-  = case occAnalKont env kont of { (usage, kont') ->
-    let usage1 = markManyIf (isRhsEnv env) usage
-        usage2 = addIdOccs usage1 (coVarsOfCo co)
-          -- See Note [Gather occurrences of coercion veriables]
-    in (usage2, Cast co kont')
+occAnalKont env usage (Cast co kont)
+  = let usage1 = markManyIf (isRhsEnv env) usage
         -- If we see let x = y `cast` co
         -- then mark y as 'Many' so that we don't
         -- immediately inline y again.
+        usage2 = addIdOccs usage1 (coVarsOfCo co)
+          -- See Note [Gather occurrences of coercion veriables]
+    in case occAnalKont env usage2 kont of { (usage3, kont') ->
+      (usage3, Cast co kont')
     }
     
-occAnalKont env (Return p)
-  = (mkOneOcc env p False, Return p)
+occAnalKont env uds (Return p)
+  = (mkOneOcc env p False +++ uds, Return p)
 
 occAnalPKont :: OccEnv
              -> SeqCorePKont
@@ -1345,8 +1347,8 @@ occAnalCut env fun kont@(App {})
     
 occAnalCut env term kont
   = case occAnalTerm (vanillaCtxt env) term of { ( term_usage, term' ) ->
-    case occAnalKont env kont               of { ( kont_usage, kont' ) ->
-    ( term_usage +++ kont_usage, Eval term' kont' ) }}
+    case occAnalKont env term_usage kont    of { ( final_usage, kont' ) ->
+    ( final_usage, Eval term' kont' ) }}
 
 occAnalJump :: OccEnv
             -> [SeqCoreArg]
@@ -1392,8 +1394,8 @@ occAnalApp env (Var fun) args kont
           -- This is the *whole point* of the isRhsEnv predicate
           -- See Note [Arguments of let-bound constructors]
     in
-    case occAnalKont env kont of { (kont_uds, kont') ->
-    (fun_uds +++ final_args_uds +++ kont_uds, mkApp (Var fun) args' kont') }}
+    case occAnalKont env (fun_uds +++ final_args_uds) kont of { (total_uds, kont') ->
+    (total_uds, mkApp (Var fun) args' kont') }}
   where
     n_val_args = length (filter isValueArg args)
     fun_uds    = mkOneOcc env fun (n_val_args > 0)
@@ -1422,9 +1424,9 @@ occAnalApp env fun args kont
         -- thing much like a let.  We do this by pushing some True items
         -- onto the context stack.
 
-    case occAnalArgs env args [] of        { (args_uds, args') ->
-    case occAnalKont env kont of           { (kont_uds, kont') ->
-    (fun_uds +++ args_uds +++ kont_uds, mkApp fun' args' kont') }}}
+    case occAnalArgs env args []                     of { (args_uds, args') ->
+    case occAnalKont env (fun_uds +++ args_uds) kont of { (total_uds, kont') ->
+    (total_uds, mkApp fun' args' kont') }}}
   
 occAnalArgs :: OccEnv -> [SeqCoreTerm] -> [OneShots] -> (UsageDetails, [SeqCoreTerm])
 occAnalArgs _ [] _ 
