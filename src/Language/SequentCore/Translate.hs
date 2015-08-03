@@ -74,40 +74,116 @@ termFromCoreExpr expr
 -- Phase 1: Escape-analyse Core code --
 ---------------------------------------
 
+{-
+Note [Escape analysis]
+~~~~~~~~~~~~~~~~~~~~~~
+
+The purpose of the escape analysis is to work out which let-bound functions we
+can translate as parameterized continuations rather than as functions. To do
+this, we gather information on all the identifier's occurrences, namely:
+
+  Does every occurrence of f appear in a non-escaping context?
+
+To be in a non-escaping context, the occurrence of f must be a tail call in the
+context that declared it - that is, not inside a lambda, an argument, a cast
+(see Note [Calls inside casts]), etc.
+
+We perform the escape analysis by passing a Var -> Bool mapping bottom-up. Any
+candidate for contification (that is, any let-bound variable) that appears in an
+expression will appear in the returned mapping. If f appears only in
+non-escaping contexts (that is, does not escape), it maps to True; if it appears
+at least once in an escaping context, it maps to False. When combining mappings,
+say when analysing the branches of a case, we union them together, performing an
+AND on any two variables that appear in both mappings. Then, whenever the
+traversal returns from an escaping context, such as a lambda or an argument
+position, we take the whole mapping and set every value to False, since every
+variable that appears in such a context escapes.
+
+(In practice, we save some time by keeping two sets rather than one mapping--one
+records all variables seen, and the other records the subset of those that
+escape. Rather than set every value to False, then, we just set the escapee set
+equal to the occurrence set.)
+
+The result of the escape analysis is an annotated version of the code where each
+binder is marked according to whether it should be contified and, if so, what
+its total arity is (that is, arity counting both type and value binders).
+
+Note [Calls inside casts]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If we try to contify a function that's invoked inside a cast, the resulting
+program will be ill-typed. From the perspective of (Dual) System FC's
+operational semantics, this is unsurprising because a cast is an operation and
+a tail call is definitionally the final operation a function performs. However,
+the cast is a fiction; all casts (and types) are erased on translation to STG.
+Hence CoreToStg's escape analysis is able to contify (or let-no-escape) more
+functions than ours. It's unclear what the workaround might be, though it's also
+unclear how often this is a problem in practice.
+-}
+
+-- Bottom-up data --
+
 data EscapeAnalysis
-  = EA { ea_freeVars :: FreeSet
-       , ea_escVars  :: EscSet }
+  = EA { ea_freeVars :: FreeSet  -- ^ Which variables, among the candidates,
+                                 --   appear free in the expression (escaping or
+                                 --   otherwise).
+       , ea_escVars  :: EscSet } -- ^ Of the variables in ea_freeVars, which
+                                 --   ones appear in escaping contexts.
        
 type FreeSet = IdSet
 type EscSet  = IdSet
 
 emptyEscapeAnalysis :: EscapeAnalysis
-emptyEscapeAnalysis = EA { ea_freeVars = emptyVarEnv
+emptyEscapeAnalysis = EA { ea_freeVars = emptyVarSet
                          , ea_escVars  = emptyVarSet }
 
-unitFreeVar :: Id -> EscapeAnalysis
-unitFreeVar x = emptyEscapeAnalysis { ea_freeVars = unitVarSet x }
+unitNonEscVar :: Id -> EscapeAnalysis
+unitNonEscVar x = emptyEscapeAnalysis { ea_freeVars = unitVarSet x }
 
 unitEscVar :: Id -> EscapeAnalysis
 unitEscVar x = emptyEscapeAnalysis { ea_freeVars = unitVarSet x
                                    , ea_escVars = unitVarSet x }
 
+markAllAsEscaping :: EscapeAnalysis -> EscapeAnalysis
+markAllAsEscaping escs@(EA { ea_freeVars = fvs, ea_escVars = evs })
+  = assert (evs `subVarSet` fvs) $ escs { ea_escVars = fvs }
+
+combineEscapeAnalyses :: EscapeAnalysis -> EscapeAnalysis -> EscapeAnalysis
+combineEscapeAnalyses (EA fvs1 evs1) (EA fvs2 evs2)
+  = EA (fvs1 `unionVarSet` fvs2) (evs1 `unionVarSet` evs2)
+
+forgetVars :: EscapeAnalysis -> [Id] -> EscapeAnalysis
+forgetVars (EA fvs evs) xs = EA (fvs `delVarSetList` xs) (evs `delVarSetList` xs)
+
+occursIn, escapesIn, occursWithoutEscapingIn :: Var -> EscapeAnalysis -> Bool
+x `occursIn` ea                = x `elemVarSet` ea_freeVars ea
+x `escapesIn` ea               = x `elemVarSet` ea_escVars ea
+x `occursWithoutEscapingIn` ea = x `occursIn` ea && not (x `escapesIn` ea)
+
+-- | True if both:
+--     1. At least one of the variables occurs
+--     2. None of the variables escapes
+listOccursWithoutEscapingIn :: [Var] -> EscapeAnalysis -> Bool
+xs `listOccursWithoutEscapingIn` ea
+  = any (`occursIn` ea) xs && not (any (`escapesIn` ea) xs)
+
 instance Monoid EscapeAnalysis where
   mempty = emptyEscapeAnalysis
-  mappend (EA fvs1 evs1) (EA fvs2 evs2)
-    = EA (fvs1 `unionVarSet` fvs2) (evs1 `unionVarSet` evs2)
+  mappend = combineEscapeAnalyses
 
-type BindingEnv = IdEnv BindingInfo
+-- Top-down data --
 
+type TotalArity = Arity -- Counts *all* arguments, including types
+newtype Candidacy = Candidate TotalArity
 type BindingInfo = Candidacy
+type BindingEnv = IdEnv BindingInfo
 
 emptyBindingEnv :: BindingEnv
 emptyBindingEnv = emptyVarEnv
 
-type TotalArity = Arity -- Counts *all* arguments, including types
+-- Monad --
 
-newtype Candidacy = Candidate TotalArity
-
+-- | The monad underlying the escape analysis.
 newtype EscM a = EscM { unEscM :: BindingEnv -> (EscapeAnalysis, a) }
 
 instance Monad EscM where
@@ -122,6 +198,11 @@ instance Applicative EscM where { pure = return; (<*>) = ap }
 instance MonadFix EscM where
   mfix f = EscM $ \env -> let pair@(_, ans) = unEscM (f ans) env
                           in pair
+
+runEscM :: EscM a -> a
+runEscM m = snd $ unEscM m emptyBindingEnv
+
+-- Monad operations --
 
 getBindings :: EscM BindingEnv
 getBindings = EscM $ \env -> (emptyEscapeAnalysis, env)
@@ -138,14 +219,11 @@ withoutBinding x m = alteringEnv (`delVarEnv` x) m
 withoutBindingList :: [Id] -> EscM a -> EscM a
 withoutBindingList xs m = alteringEnv (`delVarEnvList` xs) m
 
-reportFreeVar :: Id -> EscM ()
-reportFreeVar x = writeAnalysis (unitFreeVar x)
+reportNonEscVar :: Id -> EscM ()
+reportNonEscVar x = writeAnalysis (unitNonEscVar x)
 
 reportEscVar :: Id -> EscM ()
 reportEscVar x = writeAnalysis (unitEscVar x)
-
-runEscM :: EscM a -> a
-runEscM m = snd $ unEscM m emptyBindingEnv
 
 captureAnalysis, readAnalysis :: EscM a -> EscM (EscapeAnalysis, a)
 captureAnalysis m = EscM $ \env -> let (escs, ans) = unEscM m env
@@ -160,15 +238,15 @@ filterAnalysis :: (EscapeAnalysis -> EscapeAnalysis) -> EscM a -> EscM a
 filterAnalysis f m = EscM $ \env -> let (escs, ans) = unEscM m env
                                     in (f escs, ans)
 
-forgetVars :: EscapeAnalysis -> [Id] -> EscapeAnalysis
-forgetVars (EA fvs evs) xs = EA (fvs `delVarEnvList` xs) (evs `delVarSetList` xs)
+-- Result: Marked binders --
 
 data KontOrFunc = MakeKont TotalArity | MakeFunc
-
 data MarkedVar = Marked Var KontOrFunc
 
 unmark :: MarkedVar -> Var
 unmark (Marked var _) = var
+
+-- Escape analysis --
 
 escAnalProgram :: Core.CoreProgram -> [Core.Bind MarkedVar]
 escAnalProgram binds = runEscM (go binds)
@@ -188,9 +266,9 @@ escAnalBind lvl (Core.NonRec bndr rhs) escs_body
   = do
     (env', [Candidate arity]) <- addBinders [(bndr, rhs)]
     (escs_rhs, rhs') <- captureAnalysis $ escAnalExpr rhs
-    let kontify   = shouldKontify lvl escs_body (unitVarSet bndr)
+    let kontify = isNotTopLevel lvl && bndr `occursWithoutEscapingIn` escs_body
         (mark, escs_rhs') | kontify   = (MakeKont arity, escs_rhs)
-                          | otherwise = (MakeFunc, allFreeVarsEscape escs_rhs)
+                          | otherwise = (MakeFunc, markAllAsEscaping escs_rhs)
     writeAnalysis escs_rhs'
     return (env', Core.NonRec (Marked bndr mark) rhs')
 
@@ -200,21 +278,16 @@ escAnalBind lvl (Core.Rec pairs) escs_body
     let (bndrs, rhss) = unzip pairs
     (escs_rhss, rhss') <- captureAnalysis $ withBindings env' $ mapM escAnalExpr rhss
     let escs = escs_rhss <> escs_body
-        kontify = shouldKontify lvl escs (mkVarSet bndrs)
+        kontify = isNotTopLevel lvl &&
+                  bndrs `listOccursWithoutEscapingIn` escs
         mark arity | kontify   = MakeKont arity
                    | otherwise = MakeFunc
         pairs' = [ (Marked bndr (mark arity), rhs')
                  | bndr <- bndrs | rhs' <- rhss' | Candidate arity <- cands ]
-        escs_rhss' | not kontify = allFreeVarsEscape escs_rhss
+        escs_rhss' | not kontify = markAllAsEscaping escs_rhss
                    | otherwise   = escs_rhss
     writeAnalysis (escs_rhss' `forgetVars` bndrs)
     return (env', Core.Rec pairs')
-
-shouldKontify :: TopLevelFlag -> EscapeAnalysis -> IdSet -> Bool
-shouldKontify lvl escs bndrs
-  = isNotTopLevel lvl &&
-    not (isEmptyVarSet (bndrs `intersectVarSet` ea_freeVars escs)) &&
-    isEmptyVarSet (bndrs `intersectVarSet` ea_escVars escs)
 
 addBinders :: [(Var, Core.CoreExpr)] -> EscM (BindingEnv, [Candidacy])
 addBinders pairs
@@ -227,10 +300,6 @@ addBinders pairs
       where
         (bndrs, _body) = Core.collectBinders rhs
         cand = Candidate (length bndrs)
-
-allFreeVarsEscape :: EscapeAnalysis -> EscapeAnalysis
-allFreeVarsEscape escs@(EA { ea_freeVars = fvs, ea_escVars = evs })
-  = assert (evs `subVarSet` fvs) $ escs { ea_escVars = fvs } 
    
 escAnalExpr :: Core.CoreExpr -> EscM (Core.Expr MarkedVar)
 escAnalExpr (Core.Var x)
@@ -238,25 +307,13 @@ escAnalExpr (Core.Var x)
 escAnalExpr (Core.Lit lit)
   = return $ Core.Lit lit
 escAnalExpr expr@(Core.App {})
-  = do
-    env <- getBindings
-    let (func, args) = Core.collectArgs expr
-    func' <- case func of
-      Core.Var fid -> do 
-                      case lookupVarEnv env fid of
-                        Just (Candidate arity) ->
-                          -- Exactly saturated calls don't cause escapes; others do
-                          if arity == length args
-                            then reportFreeVar fid
-                            else reportEscVar fid
-                        _ -> return ()
-                      return (Core.Var fid)
-      -- The filter is probably redundant, but can't hurt
-      _ -> filterAnalysis allFreeVarsEscape $ escAnalExpr func
-    args' <- forM args $ \arg ->
-               filterAnalysis allFreeVarsEscape $ escAnalExpr arg
-               
-    return $ Core.mkApps func' args'
+  = let (func, args) = Core.collectArgs expr
+    in case func of
+      Core.Var fid -> escAnalApp fid args
+      _ -> filterAnalysis markAllAsEscaping $ do
+             func' <- escAnalExpr func
+             args' <- mapM escAnalExpr args
+             return $ Core.mkApps func' args'
 escAnalExpr expr@(Core.Lam {})
   = do
     let (tyBndrs, valBndrs, body) = Core.collectTyAndValBinders expr
@@ -264,7 +321,7 @@ escAnalExpr expr@(Core.Lam {})
     -- won't report them as free vars
     body' <- withoutBindingList valBndrs $
              -- Lambdas ruin contification, so pretend the free vars escape
-             filterAnalysis allFreeVarsEscape $
+             filterAnalysis markAllAsEscaping $
              escAnalExpr body
     let bndrs' = [ Marked bndr MakeFunc | bndr <- tyBndrs ++ valBndrs ]
     return $ Core.mkLams bndrs' body'
@@ -277,14 +334,14 @@ escAnalExpr (Core.Let bind body)
     return $ Core.Let bind' body'
 escAnalExpr (Core.Case scrut bndr ty alts)
   = do
-    scrut' <- filterAnalysis allFreeVarsEscape $ escAnalExpr scrut
+    scrut' <- filterAnalysis markAllAsEscaping $ escAnalExpr scrut
     alts' <- withoutBinding bndr $ forM alts $ \(con, bndrs, rhs) -> do
       rhs' <- withoutBindingList bndrs $ escAnalExpr rhs
       return (con, map (`Marked` MakeFunc) bndrs, rhs')
     return $ Core.Case scrut' (Marked bndr MakeFunc) ty alts'
 escAnalExpr (Core.Cast expr co)
   -- A call under a cast isn't a tail call, so pretend the free vars escape
-  = (`Core.Cast` co) <$> filterAnalysis allFreeVarsEscape (escAnalExpr expr)
+  = (`Core.Cast` co) <$> filterAnalysis markAllAsEscaping (escAnalExpr expr)
 escAnalExpr (Core.Tick ti expr)
   = Core.Tick ti <$> escAnalExpr expr
 escAnalExpr (Core.Type ty)
@@ -301,11 +358,11 @@ escAnalApp fid args
       Just (Candidate arity) ->
         -- Exactly saturated calls don't cause escapes; others do
         if arity == length valArgs
-          then reportFreeVar fid
+          then reportNonEscVar fid
           else reportEscVar fid
       _ -> return ()
     args' <- forM args $ \arg ->
-      filterAnalysis allFreeVarsEscape $ escAnalExpr arg
+      filterAnalysis markAllAsEscaping $ escAnalExpr arg
     escAnalId fid
     return $ Core.mkApps (Core.Var fid) args'
 
@@ -320,8 +377,10 @@ escAnalId x
   = return ()
 
 escAnalRule :: Core.CoreRule -> EscM ()
-escAnalRule rule
-  = void $ withoutBindingList (Core.ru_bndrs rule) $ escAnalExpr (Core.ru_rhs rule)
+escAnalRule (Core.Rule { Core.ru_bndrs = bndrs, Core.ru_rhs = rhs })
+  = void $ withoutBindingList bndrs $ escAnalExpr rhs
+escAnalRule _
+  = return ()
 
 escAnalUnfolding :: Core.Unfolding -> EscM ()
 escAnalUnfolding (Core.CoreUnfolding { Core.uf_tmpl = rhs  }) = void $ escAnalExpr rhs
@@ -461,9 +520,9 @@ fromCoreExprAsTerm env expr mkId
 
 fromCoreExprAsPKont :: FromCoreEnv -> SeqCoreKont -> TotalArity
                     -> Core.Expr MarkedVar
-                    -> (KontCallConv, [SeqCoreBndr], SeqCoreCommand)
+                    -> (KontCallConv, SeqCorePKont)
 fromCoreExprAsPKont env kont arity expr
-  = (conv, bndrs_final, comm)
+  = (conv, PKont bndrs_final comm)
   where
     (bndrs, body) = collectNBinders arity expr
     subst = fce_subst env
@@ -525,9 +584,9 @@ fromCoreBindPair :: FromCoreEnv -> Maybe SeqCoreKont -> Var -> KontOrFunc
 fromCoreBindPair env kont_maybe x mark rhs
   = case mark of
       MakeKont arity -> let Just kont = kont_maybe
-                            (conv, bndrs, comm) = fromCoreExprAsPKont env kont arity rhs
+                            (conv, pkont) = fromCoreExprAsPKont env kont arity rhs
                         in (Just conv,
-                            BindPKont (idToKontId x conv) (PKont bndrs comm))
+                            BindPKont (idToKontId x conv) pkont)
       MakeFunc       -> (Nothing, BindTerm x $ fromCoreExprAsTerm env rhs mkLetKontId)
 
 idToKontId :: Id -> KontCallConv -> KontId
