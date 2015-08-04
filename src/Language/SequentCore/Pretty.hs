@@ -62,10 +62,10 @@ ppr_comm add_par comm
     maybe_add_par = if null binds then noParens else add_par
     ppr_cut
       = case cut of
-          Left (term, kont) -> cat [text "<" <> pprCoreTerm term,
-                                    vcat $ ppr_block "|" ";" ">" $ ppr_kont_frames kont]
-          Right (args, j)   -> sep [text "<jump", parens (sep $ punctuate comma (map pprCoreTerm args)),
-                                    text "|", ppr j <> text ">"]
+          Left (term, kont) -> sep [text "<" <> pprCoreTerm term,
+                                    cat $ ppr_block "|" ";" ">" $ ppr_kont_frames kont]
+          Right (args, j)   -> sep [text "<jump" <+> parens (sep $ punctuate comma (map pprCoreTerm args)),
+                                    text "|" <+> ppr j <> text ">"]
 
 ppr_term :: OutputableBndr b => (SDoc -> SDoc) -> Term b -> SDoc
 ppr_term _ (Var name) = ppr name
