@@ -153,12 +153,20 @@ lintKontBndrTypes env bndr argBndrs
           bndr:bndrs' -> go (applyUbxExists ty (substTy env (mkTyVarTy bndr))) bndrs'
       | isUnboxedTupleType ty
       , Just (_, argTys) <- splitTyConApp_maybe ty
-      , and $ zipWith eqType argTys (map (substTy env . idType) bndrs)
-      = return ()
+      = goTup argTys bndrs
       | otherwise
+      = complain
+    
+    goTup []             []           = return ()
+    goTup [lastArgTy]    bndrs        | isUbxExistsTy lastArgTy
+                                      = go lastArgTy bndrs
+    goTup (argTy:argTys) (bndr:bndrs) | argTy `eqType` substTy env (idType bndr)
+                                      = goTup argTys bndrs
+    goTup _              _            = complain
+      
+    complain  
       = Left $ text "wrong binder types for continuation binder:" <+> pprBndr LetBind bndr
             $$ text "binders:" <+> sep (map (pprBndr LambdaBind) argBndrs)
-            $$ text "as of:" <+> ppr ty $$ text "and:" <+> ppr bndrs
 
 lintCoreTerm :: TermEnv -> SeqCoreTerm -> LintM Type
 lintCoreTerm env (Var x)
@@ -229,20 +237,35 @@ lintCoreJump env args j
                 Just argsTy -> return argsTy
                 Nothing     -> Left $ text "target of jump should have type Cont# (ContArgs# _):" <+>
                                       pprBndr LetBind j
-    go args argsTy args
+    go argsTy args
   where
-    go (Type argTy : args') ty topArgs
+    topArgs = args
+    
+    go ty (Type argTy : args)
       = case applyUbxExists_maybe ty (substTy (termEnv env) argTy) of
-          Just ty' -> go args' ty' topArgs
+          Just ty' -> go ty' args
           Nothing  -> mkError (text "type of polymorphic jump")
                               (text "existential type") (ppr ty)
-    go args' ty topArgs
+    go ty args
       | isUnboxedTupleType ty
       , Just (_, argTys) <- splitTyConApp_maybe ty
-      = forM_ (zip3 [1..] argTys args') $ \(n, argTy, arg) ->
-          checkingType (speakNth n <+> text "argument of jump") argTy $
-            lintCoreTerm (termEnv env) arg
-      | otherwise
+      = goTup 1 argTys args
+    go _ _
+      = complain
+      
+    goTup _ [] [] = return ()
+    goTup _ [ty] args@(Type _ : _)
+      | isUbxExistsTy ty
+      = go ty args
+    goTup n (argTy:argTys) (arg:args)
+      = do
+        void $ checkingType (speakNth n <+> text "argument of jump") argTy $
+          lintCoreTerm (termEnv env) arg
+        goTup (n+1) argTys args
+    goTup _ _ _
+      = complain
+    
+    complain
       = Left $ text "bad parameterized continuation type in binder:" <+> pprBndr LetBind j
             $$ text "for args:" <+> ppr topArgs
 
