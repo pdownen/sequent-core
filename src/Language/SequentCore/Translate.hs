@@ -349,7 +349,7 @@ escAnalBind :: TopLevelFlag -> Core.CoreBind -> EscapeAnalysis
             -> EscM (CandidateEnv, Core.Bind MarkedVar)
 escAnalBind lvl (Core.NonRec bndr rhs) escs_body
   = do
-    (escs_rhs, rhs') <- captureAnalysis $ escAnalExpr rhs
+    (escs_rhs, rhs') <- captureAnalysis $ escAnalRhs rhs
     let (marked, escs_rhs')
           | isNotTopLevel lvl
           , Just (NonEsc arity calls) <- occurrences escs_body bndr
@@ -369,7 +369,7 @@ escAnalBind lvl (Core.Rec pairs) escs_body
         env' = env `plusCandidates` bndrs
     (escs_rhss, rhss') <- captureAnalysis $ withEnv env' $ do
                             mapM_ escAnalId bndrs
-                            mapM escAnalRecRhs rhss
+                            mapM escAnalRhs rhss
     let escs = escs_rhss <> escs_body
         occsList_maybe = allOccurrences escs bndrs
         kontify = isNotTopLevel lvl && isJust occsList_maybe
@@ -387,8 +387,8 @@ escAnalBind lvl (Core.Rec pairs) escs_body
     return (env', Core.Rec pairs')
 
 -- | Analyse an expression, but ignore its top-level lambdas
-escAnalRecRhs :: Core.CoreExpr -> EscM (Core.Expr MarkedVar)
-escAnalRecRhs expr
+escAnalRhs :: Core.CoreExpr -> EscM (Core.Expr MarkedVar)
+escAnalRhs expr
   = do
     let (bndrs, body) = Core.collectBinders expr
     body' <- withoutCandidates bndrs $ escAnalExpr body
