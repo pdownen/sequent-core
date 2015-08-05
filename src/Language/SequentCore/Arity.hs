@@ -77,15 +77,17 @@ manifestArity v
   = goT v
   where
     goT (Lam v e) | isId v      = 1 + goT e
-                                    | otherwise         = goT e
+                  | otherwise   = goT e
     goT (Compute p (Eval v k))  = goK p v k
     goT _                       = 0
     
-    goK p v (Tick t k) | not (tickishIsCode t) = goK p v k
-    goK p v (Cast _ k)                         = goK p v k
-    goK p v (Return p')                        = assert (p == p') $
-                                                 goT v
-    goK _ _ _                                  = 0
+    goK p v (Kont fs (Return p')) | all skip fs = assert (p == p') $
+                                                  goT v
+    goK _ _ _                                   = 0
+    
+    skip (Tick ti) = not (tickishIsCode ti)
+    skip (Cast _)  = True
+    skip (App _)   = False
 
 ---------------
 termArity :: SeqCoreTerm -> Arity
@@ -98,15 +100,19 @@ termArity e = goT e
     goT (Compute p (Eval v k))     = goK p v k
     goT _                          = 0
     
-    goK p v (Tick t k) | not (tickishIsCode t) = goK p v k
-    goK p v (Cast co k)                        = trim_arity (goK p v k) (pSnd (coercionKind co))
+    goK p v (Kont fs e) = goF p v fs e
+    
+    goF p v (Tick t : fs)  e | not (tickishIsCode t)
+                             = goF p v fs e
+    goF p v (Cast co : fs) e = trim_arity (goF p v fs e) (pSnd (coercionKind co))
                                    -- Note [termArity invariant]
-    goK p v (App (Type _) k)            = goK p v k
-    goK p v (App a k) | isTrivialTerm a = (goK p v k - 1) `max` 0
+    goF p v (App a : fs) e   | Type {} <- a
+                             = goF p v fs e
+                             | isTrivialTerm a
+                             = (goF p v fs e - 1) `max` 0
         -- See Note [termArity for applications]
         -- NB: coercions count as a value argument
-
-    goK _ _ _                           = 0
+    goF _ _ _ _              = 0
 
     trim_arity :: Arity -> Type -> Arity
     trim_arity arity ty = arity `min` length (typeArity ty)
@@ -589,9 +595,13 @@ rhsEtaExpandArity dflags cheap_app e
                        = has_lam_K p v k
     has_lam _          = False
     
-    has_lam_K p v (Tick _ e)  = has_lam_K p v e
-    has_lam_K p v (Return p') = assert (p == p') $ has_lam v
-    has_lam_K _ _ _           = False
+    has_lam_K p v (Kont fs (Return p')) = assert (p == p') $
+                                          all skip fs && has_lam v
+    has_lam_K _ _ _                     = False
+    
+    skip (Tick _) = True
+    skip _        = False
+
 {-
 
 Note [Arity analysis]
@@ -799,22 +809,27 @@ arityType = goT
       where
         cheap_bind (NonRec pair) = cheapFlag $ is_cheap pair
         cheap_bind (Rec prs)     = cheapFlag $ all is_cheap prs
-        is_cheap (BindTerm b v)  = ae_cheap_fn env v (Just (idType b))
+        is_cheap (BindTerm x v)  = ae_cheap_fn env v (Just (idType x))
         is_cheap (BindPKont _ _) = True -- pkonts aren't shared anyway
     
     goC _ _ (Jump {}) = ATop -- TODO
 
-    goK env p (App (Type _) k) = goK env p k
-    goK env p (App arg k)      = CApp cheap (goK env p k)
+    goK env p (Kont fs e)      = goF env p fs e
+    
+    goF env p (App arg : fs) e | Type _ <- arg = goF env p fs e
+                               | otherwise     = CApp cheap (goF env p fs e)
       where cheap = cheapFlag $ ae_cheap_fn env arg Nothing
-    goK _   _ (Case _ [])      = CCase (ABot 0)
-    goK env p (Case _ alts)    = CCase $ foldr1 andArityType
-                                   [ goC env p rhs | Alt _ _ rhs <- alts ]
-    goK env p (Tick ti k)      | not (tickishIsCode ti) = goK env p k
-                               | otherwise = CTop
-    goK env p (Cast co k)      = CTrunc (length (typeArity toTy)) (goK env p k)
+    
+    goF env p (Tick ti : fs) e | not (tickishIsCode ti) = goF env p fs e
+                               | otherwise     = CTop
+    goF env p (Cast co : fs) e = CTrunc (length (typeArity toTy)) (goF env p fs e)
       where toTy = pSnd (coercionKind co)
-    goK _   p (Return p')      = assert (p == p') CTop
+    goF env p []             e = goE env p e
+    
+    goE _   _ (Case _ [])      = CCase (ABot 0)
+    goE env p (Case _ alts)    = CCase $ foldr1 andArityType
+                                   [ goC env p rhs | Alt _ _ rhs <- alts ]
+    goE _   p (Return p')      = assert (p == p') CTop
 
 {-
   
@@ -846,7 +861,7 @@ complexity here.
 --
 -- > ty = exprType e = exprType e'
 etaExpand :: Arity              -- ^ Result should have this number of value args
-          -> SeqCoreTerm            -- ^ Expression to expand
+          -> SeqCoreTerm        -- ^ Expression to expand
           -> SeqCoreTerm
 -- etaExpand deals with for-alls. For example:
 --              etaExpand 1 E
@@ -894,11 +909,10 @@ etaInfoApp :: SeqCoreTerm -> [EtaInfo] -> Type -> SeqCoreTerm
 --             ((substExpr s e) `appliedto` eis)
 
 etaInfoApp v eis ty
-  = mkCompute p (Eval v (go eis))
+  = mkCompute p (Eval v (Kont (map frame eis) (Return p)))
   where
-    go []                  = Return p
-    go (EtaVar v    : eis) = App (mkVarTerm v) (go eis)
-    go (EtaCo co    : eis) = Cast co (go eis)
+    frame (EtaVar v) = App (Var v)
+    frame (EtaCo co) = Cast co
     
     p = mkTermKontId ty
 

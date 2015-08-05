@@ -8,21 +8,23 @@
 
 module Language.SequentCore.Syntax (
   -- * AST Types
-  Term(..), Arg, Kont(..), PKont(..), Command(..), Bind(..), BindPair(..), Rhs,
+  Term(..), Arg, Kont(..), Frame(..), End(..), PKont(..), Command(..),
+  Bind(..), BindPair(..), Rhs,
   Alt(..), AltCon(..), Expr(..), Program, KontId, PKontId,
-  SeqCoreTerm, SeqCoreArg, SeqCoreKont, SeqCorePKont, SeqCoreCommand,
-    SeqCoreBind, SeqCoreBindPair, SeqCoreRhs, SeqCoreBndr, SeqCoreAlt,
-    SeqCoreExpr, SeqCoreProgram,
+  SeqCoreTerm, SeqCoreArg, SeqCoreKont, SeqCoreFrame, SeqCoreEnd, SeqCorePKont,
+    SeqCoreCommand, SeqCoreBind, SeqCoreBindPair, SeqCoreRhs, SeqCoreBndr,
+    SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
-  mkCommand, mkVarTerm, mkLambdas, mkCompute, mkAppTerm, mkApp, mkCast,
+  mkCommand, mkVarTerm, mkLambdas, mkCompute, mkAppTerm, mkCast,
   mkConstruction,
-  addLets, addLetsToTerm, addNonRec,
+  addLets, addLetsToTerm, addNonRec, consFrame, addFrames,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
   partitionTypes,
   flattenCommand,
   isValueArg, isTypeTerm, isCoTerm, isErasedTerm, isRuntimeTerm,
-  isTrivial, isTrivialTerm, isTrivialKont, isTrivialPKont, isReturnKont, isDefaultAlt,
+  isTrivial, isTrivialTerm, isTrivialKont, isTrivialPKont, isReturnKont, isReturn,
+  isDefaultAlt,
   termIsConstruction, termAsConstruction, splitConstruction,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
   binderOfPair, setPairBinder, rhsOfPair, mkBindPair, destBindPair,
@@ -99,16 +101,22 @@ type Arg b = Term b
 -- | A continuation, representing a strict context of a Haskell expression.
 -- Computation in the sequent calculus is expressed as the interaction of a
 -- value with a continuation.
-data Kont b     = Return KontId
-                  -- ^ Reference to a bound continuation.
-                | App  {- expr -} (Arg b) (Kont b)
+data Kont b     = Kont [Frame b] (End b)
+                  -- ^ A continuation is expressed as a series of frames
+                  -- (usually arguments to apply), followed by a terminal
+                  -- action (such as a case analysis).
+
+data Frame b    = App {- expr -} (Arg b)
                   -- ^ Apply the value to an argument.
+                | Cast {- expr -} Coercion
+                  -- ^ Cast the value using the given coercion.
+                | Tick (Tickish Id) {- expr -}
+                  -- ^ Annotate the enclosed frame. Used by the profiler.
+
+data End b      = Return KontId
+                  -- ^ Pass to a bound continuation.
                 | Case {- expr -} b [Alt b]
                   -- ^ Perform case analysis on the value.
-                | Cast {- expr -} Coercion (Kont b)
-                  -- ^ Cast the value using the given coercion.
-                | Tick (Tickish Id) {- expr -} (Kont b)
-                  -- ^ Annotate the enclosed frame. Used by the profiler.
 
 -- | A parameterized continuation, otherwise known as a join point. Where a
 -- regular continuation represents the context of a single expression, a
@@ -166,6 +174,10 @@ type SeqCoreTerm    = Term    Var
 type SeqCoreArg     = Arg     Var
 -- | Usual instance of 'Kont', with 'Var's for binders
 type SeqCoreKont    = Kont    Var
+-- | Usual instance of 'Kont', with 'Var's for binders
+type SeqCoreFrame   = Frame   Var
+-- | Usual instance of 'Kont', with 'Var's for binders
+type SeqCoreEnd     = End     Var
 -- | Usual instance of 'Command', with 'Var's for binders
 type SeqCoreCommand = Command Var
 -- | Usual instance of 'Bind', with 'Var's for binders
@@ -193,7 +205,7 @@ type SeqCoreProgram = Program Var
 -- command into the result.
 mkCommand :: HasId b => [Bind b] -> Term b -> Kont b -> Command b
 mkCommand binds (Compute kbndr comm) kont
-  | (binds', Left (term, Return q)) <- flattenCommand comm
+  | (binds', Left (term, Kont [] (Return q))) <- flattenCommand comm
   , identifier kbndr == q
   = mkCommand (binds ++ binds') term kont
 
@@ -221,17 +233,14 @@ mkCompute k comm
     kid = identifier k
   
 mkAppTerm :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreTerm
-mkAppTerm fun args = mkCompute k (mkApp fun args (Return k))
+mkAppTerm fun args = mkCompute k (Eval fun (Kont (map App args) (Return k)))
   where
     k = mkArgKontId retTy
     (tyArgs, _) = partitionTypes args
     (_, retTy) = Type.splitFunTys $ Type.applyTys (termType fun) tyArgs
 
-mkApp :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreKont -> SeqCoreCommand
-mkApp fun args kont = mkCommand [] fun (foldr App kont args)
-
 mkCast :: SeqCoreTerm -> Coercion -> SeqCoreTerm
-mkCast term co = Compute p $ Eval term (Cast co (Return p))
+mkCast term co = Compute p $ Eval term (Kont [Cast co] (Return p))
   where p = mkCastKontId (pSnd (coercionKind co))
 
 mkConstruction :: DataCon -> [Type] -> [SeqCoreTerm] -> SeqCoreTerm
@@ -247,14 +256,20 @@ addLets = flip (foldr Let)
 addNonRec :: HasId b => BindPair b -> Command b -> Command b
 addNonRec (BindTerm bndr rhs) comm
   | needsCaseBinding (idType (identifier bndr)) rhs
-  = mkCommand [] rhs (Case bndr [Alt DEFAULT [] comm])
+  = mkCommand [] rhs (Kont [] (Case bndr [Alt DEFAULT [] comm]))
 addNonRec pair comm
   = addLets [NonRec pair] comm
   
 addLetsToTerm :: [SeqCoreBind] -> SeqCoreTerm -> SeqCoreTerm
 addLetsToTerm [] term = term
-addLetsToTerm binds term = mkCompute k (mkCommand binds term (Return k))
+addLetsToTerm binds term = mkCompute k (mkCommand binds term (Kont [] (Return k)))
   where k = mkLetKontId (termType term)
+
+consFrame :: Frame b -> Kont b -> Kont b
+consFrame f (Kont fs end) = Kont (f : fs) end
+
+addFrames :: [Frame b] -> Kont b -> Kont b
+addFrames fs (Kont fs' end) = Kont (fs ++ fs') end
 
 --------------------------------------------------------------------------------
 -- Deconstructors
@@ -271,25 +286,28 @@ lambdas term         = ([], term)
 -- continuation. If @k@ is not an application continuation, then
 -- @collectArgs k == ([], k)@.
 collectArgs :: Kont b -> ([Term b], Kont b)
-collectArgs (App v k)
-  = (v : vs, k')
-  where (vs, k') = collectArgs k
-collectArgs k
-  = ([], k)
+collectArgs (Kont frames end)
+  = go frames
+  where
+    go (App arg : fs) = (arg : args, k') where (args, k') = go fs
+    go fs             = ([], Kont fs end)
 
 -- | Divide a continuation into a sequence of type arguments and an outer
 -- continuation. If @k@ is not an application continuation or only applies
 -- non-type arguments, then @collectTypeArgs k == ([], k)@.
 collectTypeArgs :: Kont b -> ([KindOrType], Kont b)
-collectTypeArgs (App (Type ty) k)
-  = (ty : tys, k')
-  where (tys, k') = collectTypeArgs k
-collectTypeArgs k
-  = ([], k)
+collectTypeArgs (Kont frames end)
+  = go frames
+  where
+    go (App (Type ty) : fs) = (ty : tys, k') where (tys, k') = go fs
+    go fs                   = ([], Kont fs end)
 
 -- | Divide a continuation into a sequence of type arguments, then a sequence
 -- of non-type arguments, then an outer continuation. If @k@ is not an
 -- application continuation, then @collectTypeAndOtherArgs k == ([], [], k)@.
+-- Note that, in general, type and value arguments can be arbitrarily
+-- intermingled, so the original continuation cannot necessarily be
+-- reconstructed from the returned tuple.
 collectTypeAndOtherArgs :: Kont b -> ([KindOrType], [Term b], Kont b)
 collectTypeAndOtherArgs k
   = let (tys, k') = collectTypeArgs k
@@ -300,13 +318,16 @@ collectTypeAndOtherArgs k
 -- continuation. If @k@ is not an application continuation, then
 -- @collectArgsUpTo n k == ([], k)@.
 collectArgsUpTo :: Int -> Kont b -> ([Term b], Kont b)
-collectArgsUpTo 0 k
-  = ([], k)
-collectArgsUpTo n (App v k)
-  = (v : vs, k')
-  where (vs, k') = collectArgsUpTo (n - 1) k
-collectArgsUpTo _ k
-  = ([], k)
+collectArgsUpTo n (Kont frames end)
+  = go n frames
+  where
+    go 0 fs
+      = ([], Kont fs end)
+    go n (App arg : fs)
+      = (arg : args, k')
+      where (args, k') = go (n - 1) fs
+    go _ fs
+      = ([], Kont fs end)
 
 -- | Divide a list of terms into an initial sublist of types and the remaining
 -- terms.
@@ -370,19 +391,27 @@ isTrivialTerm _           = True
 -- coercions). Ticks are not considered trivial, since this would cause them to
 -- be inlined.
 isTrivialKont :: HasId b => Kont b -> Bool
-isTrivialKont (Return _) = True
-isTrivialKont (Cast _ k) = isTrivialKont k
-isTrivialKont (App v k)  = isErasedTerm v && isTrivialKont k
-isTrivialKont _          = False
+isTrivialKont (Kont fs (Return _)) = all isTrivialFrame fs
+isTrivialKont _                    = False
+
+isTrivialFrame :: HasId b => Frame b -> Bool
+isTrivialFrame (App v)  = isErasedTerm v
+isTrivialFrame (Cast _) = True
+isTrivialFrame (Tick _) = False
 
 isTrivialPKont :: HasId b => PKont b -> Bool
 isTrivialPKont (PKont xs comm) = all (not . isRuntimeVar) (identifiers xs)
                               && isTrivial comm
 
--- | True if the given continuation is a return continuation, @Return _@.
+-- | True if the given continuation is a return continuation, @Kont [] (Return _)@.
 isReturnKont :: Kont b -> Bool
-isReturnKont (Return _) = True
-isReturnKont _          = False
+isReturnKont (Kont [] (Return _)) = True
+isReturnKont _                    = False
+
+-- | True if the given continuation end is a return, @Return _@.
+isReturn :: End b -> Bool
+isReturn (Return _) = True
+isReturn _          = False
 
 -- | True if the given alternative is a default alternative, @Alt DEFAULT _ _@.
 isDefaultAlt :: Alt b -> Bool
@@ -428,7 +457,7 @@ splitConstruction _ _
 commandAsConstruction :: KontId -> Command b
                       -> Maybe (DataCon, [Type], [Term b])
 commandAsConstruction retId (Eval term kont)
-  | Just (dc, tyArgs, valArgs, Return retId') <- splitConstruction term kont
+  | Just (dc, tyArgs, valArgs, Kont [] (Return retId')) <- splitConstruction term kont
   , retId == retId'
   = Just (dc, tyArgs, valArgs)
 commandAsConstruction _ _
@@ -450,7 +479,7 @@ asSaturatedCall term kont
 -- | If a command does nothing but provide a value to the given continuation id,
 -- returns that value.
 asValueCommand :: KontId -> Command b -> Maybe (Term b)
-asValueCommand k (Eval term (Return k'))
+asValueCommand k (Eval term (Kont [] (Return k')))
   | k == k'
   = Just term
 asValueCommand _ _
@@ -528,14 +557,14 @@ termIsBottom _             = False
 -- | Find whether a command definitely evaluates to bottom.
 commandIsBottom :: Command b -> Bool
 commandIsBottom (Let _ comm) = commandIsBottom comm
-commandIsBottom (Eval (Var x) kont)
-  = isBottomingId x && go 0 kont
+commandIsBottom (Eval (Var x) (Kont fs _))
+  = isBottomingId x && go (0 :: Int) fs
     where
-      go n (App arg kont') | isTypeTerm arg = go n kont'
-                           | otherwise      = (go $! (n+1)) kont'
-      go n (Tick _ kont')  = go n kont'
-      go n (Cast _ kont')  = go n kont'
-      go n _               = n >= idArity x
+      go n (App (Type _) : fs) = go n fs
+      go n (App  _ : fs)   = (go $! (n+1)) fs
+      go n (Tick _ : fs)   = go n fs
+      go n (Cast _ : fs)   = go n fs
+      go n []              = n >= idArity x
 commandIsBottom (Jump _ j) = isBottomingId j
 commandIsBottom _          = False
 
@@ -575,9 +604,17 @@ cutOk primOpOk term kont
   = termOk primOpOk term && kontOk primOpOk kont
 
 kontOk :: (PrimOp -> Bool) -> Kont b -> Bool
-kontOk _        (Return _)= False -- TODO Should look at unfolding??
-kontOk _        (App _ _) = False
-kontOk primOpOk (Case _bndr alts)
+kontOk primOpOk (Kont frames end) = all frameOk frames && endOk primOpOk end
+
+frameOk :: Frame b -> Bool
+frameOk (App (Type _)) = True
+frameOk (App _)   = False
+frameOk (Tick ti) = not (tickishCounts ti)
+frameOk (Cast _)  = True
+
+endOk :: (PrimOp -> Bool) -> End b -> Bool
+endOk _ (Return _) = False -- TODO Should look at unfolding??
+endOk primOpOk (Case _bndr alts)
   =  all (\(Alt _ _ rhs) -> commOk primOpOk rhs) alts
   && altsAreExhaustive
   where
@@ -586,13 +623,9 @@ kontOk primOpOk (Case _bndr alts)
       = case con1 of
           DEFAULT    -> True
           LitAlt {}  -> False
-          DataAlt dc -> 1 + length alts == tyConFamilySize (dataConTyCon dc)
+          DataAlt dc -> length alts == tyConFamilySize (dataConTyCon dc)
       | otherwise
       = False
-kontOk primOpOk (Tick ti kont)
-  = not (tickishCounts ti) && kontOk primOpOk kont
-kontOk primOpOk (Cast _ kont)
-  = kontOk primOpOk kont
 
 -- See comments in CoreUtils.app_ok
 appOk :: (PrimOp -> Bool) -> Id -> [Term b] -> Bool
@@ -649,14 +682,16 @@ termCheap appCheap (Lam x t)    = isRuntimeVar (identifier x)
 termCheap appCheap (Compute _ c)= commCheap appCheap c
 
 kontCheap :: HasId b => CheapAppMeasure -> Kont b -> Bool
-kontCheap _        (Return _)      = True
-kontCheap appCheap (Case _ alts) = all (\(Alt _ _ rhs) -> commCheap appCheap rhs)
-                                         alts
-kontCheap appCheap (Cast _ kont)   = kontCheap appCheap kont
-kontCheap appCheap (Tick ti kont)  = not (tickishCounts ti)
-                                   && kontCheap appCheap kont
-kontCheap appCheap (App arg kont)  = isErasedTerm arg
-                                   && kontCheap appCheap kont
+kontCheap appCheap (Kont frames end) = all frameCheap frames && endCheap appCheap end
+
+frameCheap :: HasId b => Frame b -> Bool
+frameCheap (App arg) = isErasedTerm arg
+frameCheap (Cast _)  = True
+frameCheap (Tick ti) = not (tickishCounts ti)
+
+endCheap :: HasId b => CheapAppMeasure -> End b -> Bool
+endCheap _        (Return _)    = True
+endCheap appCheap (Case _ alts) = and [commCheap appCheap rhs | Alt _ _ rhs <- alts]
 
 commCheap :: HasId b => CheapAppMeasure -> Command b -> Bool
 commCheap appCheap (Let bind comm)
@@ -676,8 +711,9 @@ bindPairCheap appCheap = rhsCheap appCheap . rhsOfPair
 -- See the last clause in CoreUtils.exprIsCheap' for explanations
 
 cutCheap :: HasId b => CheapAppMeasure -> Term b -> Kont b -> Bool
-cutCheap appCheap term (Cast _ kont) = cutCheap appCheap term kont
-cutCheap appCheap (Var fid) kont@(App {})
+cutCheap appCheap term (Kont (Cast _ : fs) end)
+  = cutCheap appCheap term (Kont fs end)
+cutCheap appCheap (Var fid) kont@(Kont (App {} : _) _)
   = case collectTypeAndOtherArgs kont of
       (_, [], kont')   -> kontCheap appCheap kont'
       (_, args, kont')
@@ -779,7 +815,8 @@ valueToCommandWith :: SeqCoreValue -> SeqCoreKont -> SeqCoreCommand
 valueToCommandWith (LitVal lit) kont        = mkCommand [] (Lit lit) kont
 valueToCommandWith (LamVal xs v) kont       = mkCommand [] (foldr Lam v xs) kont
 valueToCommandWith (ConsVal dc tys vs) kont = mkCommand [] (Var (dataConWorkId dc))
-                                                           (foldr App kont (map Type tys ++ vs))
+                                                           (addFrames (map App (map Type tys ++ vs))
+                                                            kont)
 
 --------------------------------------------------------------------------------
 -- Alpha-Equivalence
@@ -845,20 +882,28 @@ instance HasId b => AlphaEq (Term b) where
     = False
 
 instance HasId b => AlphaEq (Kont b) where
-  aeqIn env (App c1 k1) (App c2 k2)
-    = aeqIn env c1 c2 && aeqIn env k1 k2
-  aeqIn env (Case x1 as1) (Case x2 as2)
-    = aeqIn env' as1 as2
-      where env' = rnBndr2 env (identifier x1) (identifier x2)
-  aeqIn env (Cast co1 k1) (Cast co2 k2)
-    = aeqIn env co1 co2 && aeqIn env k1 k2
-  aeqIn env (Tick ti1 k1) (Tick ti2 k2)
-    = ti1 == ti2 && aeqIn env k1 k2
-  aeqIn env (Return x1) (Return x2)
-    = env `rnOccL` x1 == env `rnOccR` x2
+  aeqIn env (Kont fs1 end1) (Kont fs2 end2)
+    = aeqIn env fs1 fs2 && aeqIn env end1 end2
+
+instance HasId b => AlphaEq (Frame b) where
+  aeqIn env (App v1) (App v2)
+    = aeqIn env v1 v2
+  aeqIn env (Cast co1) (Cast co2)
+    = aeqIn env co1 co2
+  aeqIn _   (Tick ti1) (Tick ti2)
+    = ti1 == ti2
   aeqIn _ _ _
     = False
     
+instance HasId b => AlphaEq (End b) where
+  aeqIn env (Return x1) (Return x2)
+    = env `rnOccL` x1 == env `rnOccR` x2
+  aeqIn env (Case x1 as1) (Case x2 as2) 
+    = aeqIn env' as1 as2
+      where env' = rnBndr2 env (identifier x1) (identifier x2)
+  aeqIn _ _ _
+    = False
+
 instance HasId b => AlphaEq (PKont b) where
   aeqIn env (PKont xs1 c1) (PKont xs2 c2)
     = aeqIn env' c1 c2

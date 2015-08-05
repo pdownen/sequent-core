@@ -1,7 +1,7 @@
 {-# LANGUAGE KindSignatures #-}
 
 module Language.SequentCore.Syntax (
-  Term, Kont, Command, Bind, Alt,
+  Term, Kont, Frame, End, Command, Bind, Alt,
   SeqCoreTerm, SeqCoreKont, SeqCoreCommand, SeqCoreBind, SeqCoreAlt,
 
   mkCommand
@@ -11,6 +11,8 @@ import Var ( Var )
 
 data Term (b :: *)
 data Kont (b :: *)
+data Frame (b :: *)
+data End (b :: *)
 data Command (b :: *)
 data Bind (b :: *)
 data Alt (b :: *)

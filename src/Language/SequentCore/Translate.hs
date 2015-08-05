@@ -558,45 +558,47 @@ kontCallConv env var = lookupVarEnv (fce_boundKonts env) var
 
 fromCoreExpr :: FromCoreEnv -> Core.Expr MarkedVar -> SeqCoreKont
                             -> SeqCoreCommand
-fromCoreExpr env expr kont = go [] env expr kont
+fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
   where
     subst = fce_subst env
   
     go :: [SeqCoreBind] -> FromCoreEnv -> Core.Expr MarkedVar
-       -> SeqCoreKont -> SeqCoreCommand
-    go binds env expr kont = case expr of
+       -> [SeqCoreFrame] -> SeqCoreEnd -> SeqCoreCommand
+    go binds env expr fs end = case expr of
       Core.Var x         -> goApp x []
       Core.Lit l         -> done $ Lit l
       Core.App {}         | (Core.Var x, args) <- Core.collectArgs expr
                          -> goApp x args
       Core.App e1 e2     ->
         let e2' = fromCoreExprAsTerm env e2 mkArgKontId
-        in go binds env e1 (App e2' kont)
+        in go binds env e1 (App e2' : fs) end
       Core.Lam x e       -> done $ fromCoreLams env x e
       Core.Let bs e      ->
-        let (env', bs')   = fromCoreBind env (Just kont) bs
-        in go (bs' : binds) env' e kont
+        let (env', bs')   = fromCoreBind env (Just (Kont fs end)) bs
+        in go (bs' : binds) env' e fs end
       Core.Case e (Marked x _) ty as
         -- If the continuation is just a return, copy it into the branches
-        | Return {} <- kont ->
+        | null fs, Return {} <- end ->
         let (subst_rhs, x') = substBndr subst x
             env_rhs = env { fce_subst = subst_rhs }
-        in go binds env e (Case x' $ map (fromCoreAlt env_rhs kont) as)
+        in go binds env e [] (Case x' $ map (fromCoreAlt env_rhs (Kont fs end)) as)
         -- Otherwise be more careful. In the simplifier, we get clever and
         -- split the continuation into a duplicable part and a non-duplicable
         -- part (see splitDupableKont); for now just share the whole thing.
         | otherwise -> done $ fromCoreCaseAsTerm env e x ty as
       Core.Coercion co   -> done $ Coercion (substCo subst co)
-      Core.Cast e co     -> go binds env e (Cast (substCo subst co) kont)
-      Core.Tick ti e     -> go binds env e (Tick (substTickish subst ti) kont)
+      Core.Cast e co     -> go binds env e (Cast (substCo subst co) : fs) end
+      Core.Tick ti e     -> go binds env e (Tick (substTickish subst ti) : fs) end
       Core.Type t        -> done $ Type (substTy subst t)
       where
-        done term = mkCommand (reverse binds) term kont
+        done term = mkCommand (reverse binds) term (Kont fs end)
         
         goApp x args = case conv_maybe of
-          Just conv@(ByJump fixed) -> assert (length args == length fixed) $
-                                   doneJump (filterArgs args' conv) p
-          Nothing             -> doneEval (Var x') (foldr App kont args')
+          Just conv@(ByJump fixed)
+            -> assert (length args == length fixed) $
+               doneJump (filterArgs args' conv) p
+          Nothing
+            -> doneEval (Var x') (Kont (map App args' ++ fs) end)
           where
             x' = substIdOcc subst x
             args' = map (\e -> fromCoreExprAsTerm env e mkArgKontId) args
@@ -612,7 +614,7 @@ fromCoreLams env (Marked x _) expr
   = mkLambdas xs' body'
   where
     (xs, body) = Core.collectBinders expr
-    bodyComm = fromCoreExpr env' body (Return kid)
+    bodyComm = fromCoreExpr env' body (Kont [] (Return kid))
     body' = mkCompute kid bodyComm
     (subst', xs') = substBndrs (fce_subst env) (x : map unmark xs)
     env' = env { fce_subst = subst' } `bindCurrentKont` kid
@@ -635,15 +637,15 @@ fromCoreCaseAsTerm env scrut bndr ty alts
     env'    = env { fce_subst = subst' }
     (subst_rhs, bndr') = substBndr subst' bndr
     env_rhs = bindCurrentKont (env { fce_subst = subst_rhs }) p
-    alts'   = map (fromCoreAlt env_rhs (Return p)) alts
-    body    = fromCoreExpr env' scrut (Case bndr' alts')
+    alts'   = map (fromCoreAlt env_rhs (Kont [] (Return p))) alts
+    body    = fromCoreExpr env' scrut (Kont [] (Case bndr' alts'))
 
 fromCoreExprAsTerm :: FromCoreEnv -> Core.Expr MarkedVar -> (Type -> KontId)
                                   -> SeqCoreTerm
 fromCoreExprAsTerm env expr mkId
   = mkCompute k body
   where
-    body = fromCoreExpr env' expr (Return k)
+    body = fromCoreExpr env' expr (Kont [] (Return k))
     subst = fce_subst env
     k  = asKontId $ uniqAway (substInScope subst) (mkId ty)
     ty = substTy subst (Core.exprType (unmarkExpr expr))
@@ -759,21 +761,32 @@ termToCoreExpr val =
     Coercion co  -> Core.Coercion co
     Compute kb c -> commandToCoreExpr kb c
 
+type CoreContext = Core.CoreExpr -> Core.CoreExpr
+
 -- | Translates a continuation into a function that will wrap a Core expression
 -- with a fragment of context (an argument to apply to, a case expression to
 -- run, etc.).
-kontToCoreExpr :: KontId -> SeqCoreKont -> (Core.CoreExpr -> Core.CoreExpr)
-kontToCoreExpr retId k e =
+kontToCoreExpr :: KontId -> SeqCoreKont -> CoreContext
+kontToCoreExpr retId (Kont fs end) =
+  foldr (flip (.)) (endToCoreExpr retId end) (map frameToCoreExpr fs)
+
+frameToCoreExpr :: SeqCoreFrame -> CoreContext
+frameToCoreExpr k =
   case k of
-    App  {- expr -} v k'      -> kontToCoreExpr retId k' (Core.mkCoreApp e (termToCoreExpr v))
-    Case {- expr -} b as      -> Core.Case e b (kontTyArg (idType retId)) (map (altToCore retId) as)
-    Cast {- expr -} co k'     -> kontToCoreExpr retId k' (Core.Cast e co)
-    Tick ti {- expr -} k'     -> kontToCoreExpr retId k' (Core.Tick ti e)
+    App  {- expr -} v   -> \e -> Core.mkCoreApp e (termToCoreExpr v)
+    Cast {- expr -} co  -> \e -> Core.Cast e co
+    Tick ti {- expr -}  -> \e -> Core.Tick ti e
+
+endToCoreExpr :: KontId -> SeqCoreEnd -> CoreContext
+endToCoreExpr retId k =
+  case k of
+    Case {- expr -} b as -> \e -> Core.Case e b (kontTyArg (idType retId))
+                                                (map (altToCore retId) as)
     Return x
-      | x == retId            -> e
-      | otherwise             -> -- XXX Probably an error nowadays, as Return
-                                 -- only ever has one correct value
-                                 Core.App (Core.Var x) e
+      | x == retId       -> \e -> e
+      | otherwise        -> -- XXX Probably an error nowadays, as Return
+                            -- only ever has one correct value
+                            \e -> Core.App (Core.Var x) e
 
 kontIdToCore :: Id -> KontId -> Id
 kontIdToCore retId k = k `setIdType` kontTyToCoreTy argTy retTy

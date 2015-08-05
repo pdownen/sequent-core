@@ -1238,15 +1238,15 @@ occAnalKont :: OccEnv
             -> SeqCoreKont
             -> (UsageDetails,       -- ^ Usage details for the term *and* continuation
                 SeqCoreKont)
-occAnalKont env uds kont@(App {})
+occAnalKont env uds kont@(Kont (App {} : _) _)
   = case occAnalArgs env args []                  of { ( args_uds, args' ) ->
     case occAnalKont env (uds +++ args_uds) kont' of { ( final_uds, kont'' ) ->
-    (final_uds, foldr App kont'' args') }}
+    (final_uds, map App args' `addFrames` kont'') }}
   where (args, kont') = collectArgs kont
 
-occAnalKont env uds (Case bndr alts)
+occAnalKont env uds (Kont [] (Case bndr alts))
   = case occAnalCase env Nothing bndr alts of { ( case_uds, kont' ) ->
-    (uds +++ case_uds, kont') }
+    (uds +++ case_uds, Kont [] kont') }
 
 {-
 Note [Gather occurrences of coercion veriables]
@@ -1254,31 +1254,32 @@ Note [Gather occurrences of coercion veriables]
 We need to gather info about what coercion variables appear, so that
 we can sort them into the right place when doing dependency analysis.
 -}
-occAnalKont env uds (Tick tickish body)
+occAnalKont env uds (Kont (Tick tickish : frames) end)
   | Core.Breakpoint _ ids <- tickish
   = (mapVarEnv markInsideSCC usage
-         +++ mkVarEnv (zip ids (repeat NoOccInfo)), Tick tickish body')
+         +++ mkVarEnv (zip ids (repeat NoOccInfo)),
+     Tick tickish `consFrame` kont')
     -- never substitute for any of the Ids in a Breakpoint
   | Core.tickishScoped tickish
-  = (mapVarEnv markInsideSCC usage, Tick tickish body')
+  = (mapVarEnv markInsideSCC usage, Tick tickish `consFrame` kont')
   | otherwise
-  = (usage, Tick tickish body')
+  = (usage, Tick tickish `consFrame` kont')
   where
-    !(usage,body') = occAnalKont env uds body
+    !(usage,kont') = occAnalKont env uds (Kont frames end)
 
-occAnalKont env usage (Cast co kont)
+occAnalKont env usage (Kont (Cast co : frames) end)
   = let usage1 = markManyIf (isRhsEnv env) usage
         -- If we see let x = y `cast` co
         -- then mark y as 'Many' so that we don't
         -- immediately inline y again.
         usage2 = addIdOccs usage1 (coVarsOfCo co)
           -- See Note [Gather occurrences of coercion veriables]
-    in case occAnalKont env usage2 kont of { (usage3, kont') ->
-      (usage3, Cast co kont')
+    in case occAnalKont env usage2 (Kont frames end) of { (usage3, kont') ->
+      (usage3, Cast co `consFrame` kont')
     }
     
-occAnalKont env uds (Return p)
-  = (mkOneOcc env p False +++ uds, Return p)
+occAnalKont env uds kont@(Kont [] (Return p))
+  = (mkOneOcc env p False +++ uds, kont)
 
 occAnalPKont :: OccEnv
              -> SeqCorePKont
@@ -1319,12 +1320,12 @@ occAnalCut :: OccEnv
            -> SeqCoreKont
            -> (UsageDetails,
                SeqCoreCommand)
-occAnalCut env (Var x) (Case bndr alts@(alt1 : otherAlts))
+occAnalCut env (Var x) (Kont [] (Case bndr alts@(alt1 : otherAlts)))
   -- If a variable is scrutinised by a case with at least one non-default
   -- alternative, mark it as appearing in an interesting context
   | not (null otherAlts) || not (isDefaultAlt alt1)
-  = case occAnalCase env (Just (x, Nothing)) bndr alts of { ( kont_usage, kont') ->
-    (kont_usage +++ mkOneOcc env x True, Eval (Var x) kont') }
+  = case occAnalCase env (Just (x, Nothing)) bndr alts of { ( kont_usage, end') ->
+    (kont_usage +++ mkOneOcc env x True, Eval (Var x) (Kont [] end')) }
 
 -- FIXME This logic could probably be made cleaner.
 -- mkAltEnv (and hence occAnalCase) has two special cases it checks for: When
@@ -1334,14 +1335,14 @@ occAnalCut env (Var x) (Case bndr alts@(alt1 : otherAlts))
 -- have to look for those special cases here.
 occAnalCut env (Var x) kont
   | Just (co_maybe, bndr, alts) <- match kont
-  = case occAnalCase env (Just (x, co_maybe)) bndr alts of { ( kont_usage, kont') ->
-    (kont_usage +++ mkOneOcc env x False, Eval (Var x) kont') }
+  = case occAnalCase env (Just (x, co_maybe)) bndr alts of { ( kont_usage, end') ->
+    (kont_usage +++ mkOneOcc env x False, Eval (Var x) (Kont [] end')) }
   where
-    match (Cast co (Case bndr alts)) = Just (Just co, bndr, alts)
-    match (Case bndr alts)           = Just (Nothing, bndr, alts)
-    match _                          = Nothing
+    match (Kont [Cast co] (Case bndr alts)) = Just (Just co, bndr, alts)
+    match (Kont []        (Case bndr alts)) = Just (Nothing, bndr, alts)
+    match _                                 = Nothing
 
-occAnalCut env fun kont@(App {})
+occAnalCut env fun kont@(Kont (App {} : _) _)
   = let (args, kont') = collectArgs kont
     in occAnalApp env fun args kont'
     
@@ -1395,7 +1396,7 @@ occAnalApp env (Var fun) args kont
           -- See Note [Arguments of let-bound constructors]
     in
     case occAnalKont env (fun_uds +++ final_args_uds) kont of { (total_uds, kont') ->
-    (total_uds, mkApp (Var fun) args' kont') }}
+    (total_uds, Eval (Var fun) (map App args' `addFrames` kont')) }}
   where
     n_val_args = length (filter isValueArg args)
     fun_uds    = mkOneOcc env fun (n_val_args > 0)
@@ -1426,7 +1427,7 @@ occAnalApp env fun args kont
 
     case occAnalArgs env args []                     of { (args_uds, args') ->
     case occAnalKont env (fun_uds +++ args_uds) kont of { (total_uds, kont') ->
-    (total_uds, mkApp fun' args' kont') }}}
+    (total_uds, Eval fun' (map App args' `addFrames` kont')) }}}
   
 occAnalArgs :: OccEnv -> [SeqCoreTerm] -> [OneShots] -> (UsageDetails, [SeqCoreTerm])
 occAnalArgs _ [] _ 
@@ -1451,7 +1452,7 @@ markManyIf True  uds = mapVarEnv markMany uds
 markManyIf False uds = uds
 
 occAnalCase :: OccEnv -> Maybe (Id, Maybe Coercion) -> SeqCoreBndr
-            -> [SeqCoreAlt] -> (UsageDetails, SeqCoreKont)
+            -> [SeqCoreAlt] -> (UsageDetails, SeqCoreEnd)
 occAnalCase env scrut_maybe bndr alts
   = case mapAndUnzip occ_anal_alt alts of { (alts_usage_s, alts')   ->
     let
@@ -1848,7 +1849,7 @@ mkAltEnv :: OccEnv -> Maybe (Id, Maybe Coercion) -> Id -> (OccEnv, Maybe (Id, Se
 mkAltEnv env@(OccEnv { occ_gbl_scrut = pe }) scrut case_bndr
   = case scrut of
       Just (v, Nothing) -> add_scrut v case_bndr'
-      Just (v, Just co) -> add_scrut v (Compute p (Eval case_bndr' (Cast (mkSymCo co) (Return p))))
+      Just (v, Just co) -> add_scrut v (Compute p (Eval case_bndr' (Kont [Cast (mkSymCo co)] (Return p))))
                           -- See Note [Case of cast]
       _                 -> (env { occ_encl = OccVanilla }, Nothing)
 

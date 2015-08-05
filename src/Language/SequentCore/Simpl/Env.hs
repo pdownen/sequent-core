@@ -4,9 +4,11 @@ module Language.SequentCore.Simpl.Env (
   SimplEnv(..), StaticEnv, SimplIdSubst, SubstAns(..), IdDefEnv, Definition(..),
   Guidance(..),
 
-  InCommand, InTerm, InArg, InKont, InPKont, InAlt, InBind, InBindPair, InRhs, InValue,
+  InCommand, InTerm, InArg, InKont, InFrame, InEnd, InPKont,
+  InAlt, InBind, InBindPair, InRhs, InValue,
   InId, InKontId, InPKontId, InVar, InTyVar, InCoVar,
-  OutCommand, OutTerm, OutArg, OutKont, OutPKont, OutAlt, OutBind, OutBindPair, OutRhs, OutValue,
+  OutCommand, OutTerm, OutArg, OutKont, OutFrame, OutEnd, OutPKont,
+  OutAlt, OutBind, OutBindPair, OutRhs, OutValue,
   OutId, OutKontId, OutPKontId, OutVar, OutTyVar, OutCoVar,
   
   mkBoundTo, mkBoundToPKont, findDef, setDef,
@@ -173,6 +175,8 @@ type InCommand  = SeqCoreCommand
 type InTerm     = SeqCoreTerm
 type InArg      = SeqCoreArg
 type InKont     = SeqCoreKont
+type InFrame    = SeqCoreFrame
+type InEnd      = SeqCoreEnd
 type InPKont    = SeqCorePKont
 type InAlt      = SeqCoreAlt
 type InBind     = SeqCoreBind
@@ -191,6 +195,8 @@ type OutCommand = SeqCoreCommand
 type OutTerm    = SeqCoreTerm
 type OutArg     = SeqCoreArg
 type OutKont    = SeqCoreKont
+type OutFrame   = SeqCoreFrame
+type OutEnd     = SeqCoreEnd
 type OutPKont   = SeqCorePKont
 type OutAlt     = SeqCoreAlt
 type OutBind    = SeqCoreBind
@@ -316,7 +322,8 @@ substKv (SimplEnv { se_retId = q, se_retKont = rk, se_inScope = ins }) p
                                   text "Expected:" <+> ((pprBndr LetBind <$> q) `orElse` text "<nothing>"))
                                  DoneId (refine ins p)
       Just (DoneId p')        -> DoneId (refine ins p')
-      Just (Done (Return p')) -> DoneId (refine ins p')
+      Just (Done (Kont [] (Return p')))
+                              -> DoneId (refine ins p')
       Just ans                -> ans
 
 refine :: InScopeSet -> OutVar -> OutVar
@@ -638,7 +645,7 @@ commandIsHNF _env (Eval (Var fid) kont)
   = True
 commandIsHNF _env (Eval (Compute {}) _)
   = False
-commandIsHNF env (Eval term (Return _))
+commandIsHNF env (Eval term (Kont [] (Return _)))
   = termIsHNF env term
 commandIsHNF _ _
   = False
