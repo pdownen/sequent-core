@@ -77,14 +77,29 @@ case7_yes
         k x y f g = f x ++ g y
     in case (stringy, stringy) of (Stringy x f, Stringy y g) -> k x y f g
 
--- Produces a continuation that is NOT polymorphic because it would be
--- ill-typed; also, the Void# should be gone
-case8_yes :: [Int]
-case8_yes
+-- Produces a continuation that is NOT polymorphic because it would be ill-typed
+case8a_yes :: [Int]
+case8a_yes
+  = let {-# NOINLINE k #-}
+        k :: forall a. [a]
+        k = []
+    in k
+
+-- Same; also, the Void# should be gone
+case8b_yes :: [Int]
+case8b_yes
   = let {-# NOINLINE k #-}
         k :: forall a. Void# -> [a]
         k _ = []
     in k void#
+
+-- A tricky case of eta-expansion
+case8c_yes :: Int
+case8c_yes
+  = let {-# NOINLINE k #-}
+        k :: forall a. a -> a
+        k x = x
+    in k id 1
 
 main :: IO ()
 main = return ()

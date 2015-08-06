@@ -12,7 +12,7 @@ module Language.SequentCore.Translate (
   -- $txn
   fromCoreModule, termFromCoreExpr,
   bindsToCore,
-  commandToCoreExpr, termToCoreExpr, kontToCoreExpr,
+  commandToCoreExpr, termToCoreExpr, CoreContext, kontToCoreExpr,
   onCoreExpr, onSequentCoreTerm
 ) where
 
@@ -25,6 +25,7 @@ import CoreSubst
 import qualified CoreSyn as Core
 import qualified CoreUtils as Core
 import qualified CoreFVs as Core
+import FastString
 import Id
 import Maybes
 import qualified MkCore as Core
@@ -35,6 +36,7 @@ import Type        hiding ( substTy )
 import TysPrim
 import TysWiredIn
 import UniqFM     ( intersectUFM_C )
+import Unique
 import VarEnv
 import VarSet
 
@@ -126,20 +128,20 @@ unclear how often this is a problem in practice.
 -- Bottom-up data --
 
 data EscapeAnalysis
-  = EA { ea_nonEsc  :: IdEnv (TotalArity, [Call])
+  = EA { ea_nonEsc  :: IdEnv (TotalArity, Call)
        , ea_allVars :: IdSet }
 
 type TotalArity = Arity -- Counts *all* arguments, including types
 type Call = [Core.CoreExpr]
-data Occs = Esc | NonEsc TotalArity [Call] -- ^ Invariant: For NonEsc n cs,
-                                           --   all lists in cs have length n
+data Occs = Esc | NonEsc TotalArity Call -- ^ Invariant: The call has the given
+                                         -- length
 
 emptyEscapeAnalysis :: EscapeAnalysis
 emptyEscapeAnalysis = EA { ea_nonEsc  = emptyVarEnv
                          , ea_allVars = emptyVarSet }
 
 unitCall :: Id -> Call -> EscapeAnalysis
-unitCall x call = EA { ea_nonEsc  = unitVarEnv x (length call, [call])
+unitCall x call = EA { ea_nonEsc  = unitVarEnv x (length call, call)
                      , ea_allVars = unitVarSet x }
 
 markAllAsEscaping :: EscapeAnalysis -> EscapeAnalysis
@@ -170,8 +172,9 @@ combineEscapeAnalyses ea1 ea2
     onlyIn2 = ea_nonEsc ea2 `minusVarEnv` ea_allVars ea1
     nonEscBoth = intersectWithMaybeVarEnv combine (ea_nonEsc ea1) (ea_nonEsc ea2)
     
-    combine (n1, cs1) (n2, cs2) | n1 == n2  = Just (n1, cs1 ++ cs2)
-                                | otherwise = Nothing
+    -- Only need to keep one call made to each function
+    combine (n1, c1) (n2, _) | n1 == n2  = Just (n1, c1)
+                             | otherwise = Nothing
 
 forgetVars :: EscapeAnalysis -> [Id] -> EscapeAnalysis
 forgetVars (EA { ea_nonEsc = nonEsc, ea_allVars = allVars }) xs
@@ -186,14 +189,14 @@ occurrences ea x
 
 -- If none of the variables escape, return the list of variables that occur
 -- along with their apparent arities and call lists
-allOccurrences :: EscapeAnalysis -> [Id] -> Maybe [(Id, Maybe (Int, [Call]))]
+allOccurrences :: EscapeAnalysis -> [Id] -> Maybe [(Id, Maybe (Int, Call))]
 allOccurrences _  []       = Just []
 allOccurrences ea (x : xs) = case occurrences ea x of
-                               Just (NonEsc n calls) -> ((x, Just (n, calls)) :) <$>
-                                                        allOccurrences ea xs
-                               Just Esc              -> Nothing
-                               Nothing               -> ((x, Nothing) :) <$>
-                                                        allOccurrences ea xs
+                               Just (NonEsc n call) -> ((x, Just (n, call)) :) <$>
+                                                       allOccurrences ea xs
+                               Just Esc             -> Nothing
+                               Nothing              -> ((x, Nothing) :) <$>
+                                                       allOccurrences ea xs
 
 instance Monoid EscapeAnalysis where
   mempty = emptyEscapeAnalysis
@@ -272,63 +275,72 @@ filterAnalysis f m = EscM $ \env -> let (escs, ans) = unEscM m env
 
 -- Result: Marked binders --
 
-data KontOrFunc = MakeKont FixedArgs | MakeFunc
-type FixedArgs  = [Maybe FixedArg]
-data FixedArg   = FixedType Type | FixedVoidArg
+data KontOrFunc = MakeKont [ArgDesc] | MakeFunc
+data ArgDesc    = FixedType Type | FixedVoidArg | TyArg TyVar | ValArg Type
 data MarkedVar  = Marked Var KontOrFunc
 
 unmark :: MarkedVar -> Var
 unmark (Marked var _) = var
 
-markVar :: Id -> Core.CoreExpr -> TotalArity -> [Call] -> MarkedVar
-markVar x rhs arity calls
+markVar :: Id -> Core.CoreExpr -> TotalArity -> Call -> MarkedVar
+markVar x rhs arity call
   = Marked x ans
   where
     (bndrs, _body) = Core.collectBinders rhs
     realArity      = length bndrs
     
-    ans | arity /= realArity = MakeFunc -- TODO Should be able to handle more
-                                        -- arguments by eta-expansion
-        | otherwise          = MakeKont (mkFixedArgs (idType x) arity calls)
+    ans | arity < realArity = MakeFunc
+        | otherwise         = MakeKont (mkArgDescs (idType x) arity call)
 
--- | Return False for each argument that needs to be fixed. These are the type
--- arguments whose bound variables appear in the return type; these must all be
--- the same if the program is well-typed *and* we must *not* abstract over them
--- in the join point.
+-- | Return a constant value for each argument that needs one, given the type
+-- and total arity of a function to be contified and a call made to it. Any
+-- type parameters binding variables appearing in the return type must be made
+-- constant, since the contified function will return to a fixed continuation in
+-- which those parameters are not bound.
 --
 -- It's possible the total arity is greater than the number of arrows and foralls
 -- in the type, but only if the return type of the function is a type variable
 -- bound in an outer scope. This is fine, because the extra arguments cannot
 -- change the actual return type, so we don't need to fix (mask out) the extra
 -- arguments. TODO Be more sure about this.
-mkFixedArgs :: Type -> TotalArity -> [Call] -> FixedArgs
-mkFixedArgs ty arity calls
-  = mask ++ replicate rm Nothing -- keep leftover arguments
+mkArgDescs :: Type -> TotalArity -> Call -> [ArgDesc]
+mkArgDescs ty arity call
+  = go ty call
   where
-    (tyVars, retTy, rm)  = splitPiTyN ty arity
-    freeInRetTy          = tyVarsOfType retTy
-    mask                 = zipWith maskArg tyVars firstCall
-    firstCall:_          = calls
+    (_tyVars, retTy) = splitPiTyN ty arity
+    freeInRetTy     = tyVarsOfType retTy
     
-    maskArg (Just tyVar) (Core.Type ty) | tyVar `elemVarSet` freeInRetTy
-                                        = Just (FixedType ty)
-                                        | otherwise
-                                        = Nothing
-    maskArg Nothing      (Core.Var x)   | idType x `eqType` voidPrimTy
-                                        = Just FixedVoidArg
-    maskArg Nothing      _              = Nothing
-    maskArg _ _ = pprPanic "argMask" (ppr ty <+> ppr arity $$ ppr firstCall)
+    go ty (Core.Type tyArg : call)
+      | tyVar `elemVarSet` freeInRetTy
+      = FixedType tyArg : mkArgDescs (substTyWith [tyVar] [tyArg] bodyTy)
+                                     (length call) call -- start over with
+                                                        -- new return type
+      | otherwise
+      = TyArg tyVar : go bodyTy call
+      where
+        (tyVar, bodyTy) = splitForAllTy_maybe ty `orElse`
+                            pprPanic "mkArgDescs" (ppr ty <+> ppr tyArg)
+    go ty (arg : call)
+      | argTy `eqType` voidPrimTy
+      = FixedVoidArg : go retTy call
+      | otherwise
+      = ValArg argTy : go retTy call
+      where
+        (argTy, retTy) = splitFunTy_maybe ty `orElse`
+                           pprPanic "mkArgDescs" (ppr ty <+> ppr arg)
+                           
+    go _ _ = []
     
-splitPiTyN :: Type -> TotalArity -> ([Maybe TyVar], Type, Int)
+splitPiTyN :: Type -> TotalArity -> ([Maybe TyVar], Type)
 splitPiTyN ty n
   | Just (tyVar, ty') <- splitForAllTy_maybe ty
-  = let (args, retTy, rm) = splitPiTyN ty' (n-1)
-    in (Just tyVar : args, retTy, rm)
+  = let (args, retTy) = splitPiTyN ty' (n-1)
+    in (Just tyVar : args, retTy)
   | Just (_, ty') <- splitFunTy_maybe ty
-  = let (args, retTy, rm) = splitPiTyN ty' (n-1)
-    in (Nothing : args, retTy, rm)
+  = let (args, retTy) = splitPiTyN ty' (n-1)
+    in (Nothing : args, retTy)
   | otherwise
-  = ([], ty, n)
+  = ([], ty)
 
 -- Escape analysis --
 
@@ -352,8 +364,8 @@ escAnalBind lvl (Core.NonRec bndr rhs) escs_body
     (escs_rhs, rhs') <- captureAnalysis $ escAnalRhs rhs
     let (marked, escs_rhs')
           | isNotTopLevel lvl
-          , Just (NonEsc arity calls) <- occurrences escs_body bndr
-          = (markVar bndr rhs arity calls, escs_rhs)
+          , Just (NonEsc arity call) <- occurrences escs_body bndr
+          = (markVar bndr rhs arity call, escs_rhs)
           | otherwise
           = (Marked bndr MakeFunc, markAllAsEscaping escs_rhs)
     writeAnalysis escs_rhs'
@@ -481,7 +493,7 @@ escAnalUnfolding _                                            = return ()
 -- such continuations must be invoked using a jump, so 'ByJump' is the only
 -- constructor, but we must still keep track of which arguments are fixed and
 -- should be omitted when converting a function call.
-newtype KontCallConv = ByJump FixedArgs
+newtype KontCallConv = ByJump [ArgDesc]
 
 -- Auxiliary datatype for idToKontId
 data KontType = KTExists TyVar KontType | KTTuple [KontType] | KTType Type
@@ -493,20 +505,23 @@ idToPKontId p (ByJump fixed)
   = p `setIdType` kontTypeToType (go (idType p) fixed)
   where
     go _  [] = KTTuple []
-    go ty (Just (FixedType tyArg) : fixed')
+    go ty (FixedType tyArg : fixed')
       | Just (tyVar, ty') <- splitForAllTy_maybe ty
       = go (substTyWith [tyVar] [tyArg] ty') fixed'
-    go ty (Just FixedVoidArg : fixed')
+    go ty (FixedVoidArg : fixed')
       | Just (argTy, retTy) <- splitFunTy_maybe ty
       = assert (argTy `eqType` voidPrimTy) $
         go retTy fixed'
-    go ty (Nothing : fixed')
-      | Just (tyVar, ty') <- splitForAllTy_maybe ty
-      = KTExists tyVar (go ty' fixed')
-      | Just (argTy, retTy) <- splitFunTy_maybe ty
-      = argTy `consKT` go retTy fixed'
+    go ty (TyArg tyVar : fixed')
+      | Just (tyVar', ty') <- splitForAllTy_maybe ty
+      = assert (tyVar == tyVar') $
+        KTExists tyVar (go ty' fixed')
+    go ty (ValArg argTy : fixed')
+      | Just (argTy', retTy) <- splitFunTy_maybe ty
+      = assert (argTy `eqType` argTy') $
+        argTy `consKT` go retTy fixed'
     go _ _
-      = pprPanic "idToKontId" (pprBndr LetBind p $$ ppr fixed)
+      = pprPanic "idToPKontId" (pprBndr LetBind p $$ ppr fixed)
 
     kontTypeToType :: KontType -> Type
     kontTypeToType = mkKontTy . mkKontArgsTy . go
@@ -526,8 +541,9 @@ filterArgs :: [a] -> KontCallConv -> [a]
 filterArgs xs (ByJump fixed)
   = catMaybes (zipWith doArg xs fixed)
   where
-    doArg x Nothing  = Just x
-    doArg _ (Just _) = Nothing
+    doArg x (ValArg _)  = Just x
+    doArg x (TyArg _)   = Just x
+    doArg _ _           = Nothing
 
 -- Environment for Core -> Sequent Core translation --
 
@@ -651,21 +667,41 @@ fromCoreExprAsTerm env expr mkId
     ty = substTy subst (Core.exprType (unmarkExpr expr))
     env' = env `bindCurrentKont` k
 
-fromCoreExprAsPKont :: FromCoreEnv -> SeqCoreKont -> FixedArgs
+fromCoreExprAsPKont :: FromCoreEnv -> SeqCoreKont -> [ArgDesc]
                     -> Core.Expr MarkedVar
                     -> SeqCorePKont
-fromCoreExprAsPKont env kont fixed expr
-  = PKont bndrs_final comm
+fromCoreExprAsPKont env kont descs expr
+  = result
   where
-    (bndrs, body) = collectNBinders (length fixed) expr
     subst = fce_subst env
-    bndrs_unmarked = map unmark bndrs
-    (subst', bndr_maybes) = mapAccumR doBndr subst (zip bndrs_unmarked fixed)
-    bndrs_final = catMaybes bndr_maybes
     
-    doBndr subst (bndr, Just (FixedType ty))
-      = (CoreSubst.extendTvSubst subst bndr ty, Nothing)
-    doBndr subst (bndr, Just FixedVoidArg)
+    -- Calculate outer binders (existing ones from expr, minus fixed args)
+    (bndrs, body) = Core.collectBinders expr
+    bndrs_unmarked = map unmark bndrs
+    (subst', bndr_maybes) = mapAccumL doBndr subst (zip bndrs_unmarked descs)
+    bndrs' = catMaybes bndr_maybes
+
+    -- Calculate eta-expanding binders and arguments
+    extraArgs = drop (length bndrs) descs -- will need to eta-expand with these
+    (subst'', etaBndr_maybes_args) = mapAccumL mkEtaBndr subst' (zip [1..] extraArgs)
+    (etaBndr_maybes, etaArgs) = unzip etaBndr_maybes_args
+    etaBndrs = catMaybes etaBndr_maybes
+    
+    -- Eta-expand the body *before* translating to Sequent Core. This is easier
+    -- than dealing with the 
+    etaBody | null extraArgs = body
+            | otherwise      = Core.mkApps body etaArgs
+    
+    env' = env { fce_subst = subst'' }
+    comm = fromCoreExpr env' etaBody kont
+    bndrs_final = bndrs' ++ etaBndrs
+    result = PKont bndrs_final comm
+    
+    -- Process a binder, possibly dropping it, and return a new subst
+    doBndr :: Subst -> (Var, ArgDesc) -> (Subst, Maybe Var)
+    doBndr subst (bndr, FixedType ty)
+      = (CoreSubst.extendTvSubst subst bndr (substTy subst ty), Nothing)
+    doBndr subst (bndr, FixedVoidArg)
       -- Usually, a binder for a Void# is dead, but in case it's not, take the
       -- argument to be void#. Note that, under the let/app invariant, any
       -- argument of unlifted type must be ok-for-speculation, and any
@@ -674,19 +710,31 @@ fromCoreExprAsPKont env kont fixed expr
       -- still be case x +# y of z -> void#, but then we can eliminate the case).
       -- So this is always correct.
       = (extendSubstWithVar subst bndr voidPrimId, Nothing)
-    doBndr subst (bndr, Nothing)
-      = (subst, Just bndr)
+    doBndr subst (bndr, TyArg _tyVar)
+      = (subst', Just bndr')
+      where
+        (subst', bndr') = substBndr subst bndr
+    doBndr subst (bndr, ValArg _)
+      = (subst', Just bndr')
+      where
+        (subst', bndr') = substBndr subst bndr
     
-    env' = env { fce_subst = subst' }
-    comm = fromCoreExpr env' body kont
-
-collectNBinders :: TotalArity -> Core.Expr MarkedVar -> ([MarkedVar], Core.Expr MarkedVar)
-collectNBinders 0 expr = ([], expr)
-collectNBinders n (Core.Lam x body) | n > 0 = (x:xs, body')
-  where
-    (xs, body') = collectNBinders (n - 1) body
-collectNBinders n body = pprPanic "collectNBinders" (int n <+> ppr body)
-
+    -- From an ArgDesc, generate an argument to apply and (possibly) a parameter
+    -- to the eta-expanded function
+    mkEtaBndr :: Subst -> (Int, ArgDesc) -> (Subst, (Maybe Var, Core.Expr MarkedVar))
+    mkEtaBndr subst (_, FixedType ty)
+      = (subst, (Nothing, Core.Type (substTy subst ty)))
+    mkEtaBndr subst (_, FixedVoidArg)
+      = (subst, (Nothing, Core.Var voidPrimId))
+    mkEtaBndr subst (_, TyArg tyVar)
+      = (subst', (Just tv', Core.Type (mkTyVarTy tv')))
+      where
+        (subst', tv') = substBndr subst tyVar
+    mkEtaBndr subst (n, ValArg ty)
+      = (subst', (Just x, Core.Var x))
+      where
+        (subst', x) = freshEtaId n subst ty
+    
 -- | Translates a Core case alternative into Sequent Core.
 fromCoreAlt :: FromCoreEnv -> SeqCoreKont -> Core.Alt MarkedVar
             -> SeqCoreAlt
@@ -886,9 +934,11 @@ instance OutputableBndr MarkedVar where
   pprPrefixOcc (Marked var _) = pprPrefixOcc var
   pprInfixOcc  (Marked var _) = pprInfixOcc  var
 
-instance Outputable FixedArg where
+instance Outputable ArgDesc where
   ppr (FixedType ty) = text "fixed type:" <+> ppr ty
-  ppr FixedVoidArg = text "fixed void#"
+  ppr FixedVoidArg   = text "fixed void#"
+  ppr (TyArg tyVar)  = text "type arg:" <+> pprBndr LambdaBind tyVar
+  ppr (ValArg ty)    = text "arg of type" <+> ppr ty
 
 mapCore :: (a -> b) -> Core.Expr a -> Core.Expr b
 mapCore f = go
@@ -913,3 +963,13 @@ mapCore f = go
 
 unmarkExpr :: Core.Expr MarkedVar -> Core.CoreExpr
 unmarkExpr = mapCore unmark
+
+-- copied from CoreArity
+freshEtaId :: Int -> Subst -> Type -> (Subst, Id)
+freshEtaId n subst ty
+      = (subst', eta_id')
+      where
+        ty'     = substTy subst ty
+        eta_id' = uniqAway (substInScope subst) $
+                  mkSysLocal (fsLit "eta") (mkBuiltinUnique n) ty'
+        subst'  = extendInScope subst eta_id'           
