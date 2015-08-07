@@ -101,5 +101,13 @@ case8c_yes
         k x = x
     in k id 1
 
+case9_yes :: Bool -> Int# -> Int# -> Int#
+case9_yes b z
+  = let {-# NOINLINE j #-}
+        j x y = if x then z +# y else z -# y
+    in case b of
+      False -> j True
+      True  -> j False
+
 main :: IO ()
 main = return ()

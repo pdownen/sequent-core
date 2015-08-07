@@ -283,14 +283,12 @@ unmark :: MarkedVar -> Var
 unmark (Marked var _) = var
 
 markVar :: Id -> Core.CoreExpr -> TotalArity -> Call -> MarkedVar
-markVar x rhs arity call
+markVar x _rhs arity call
   = Marked x ans
   where
-    (bndrs, _body) = Core.collectBinders rhs
-    realArity      = length bndrs
-    
-    ans | arity < realArity = MakeFunc
-        | otherwise         = MakeKont (mkArgDescs (idType x) arity call)
+    ans | idHasRules x = MakeFunc -- unlikely but possible, and contification
+                                  -- would likely get in the way of rule firings
+        | otherwise    = MakeKont (mkArgDescs (idType x) arity call)
 
 -- | Return a constant value for each argument that needs one, given the type
 -- and total arity of a function to be contified and a call made to it. Any
@@ -676,7 +674,7 @@ fromCoreExprAsPKont env kont descs expr
     subst = fce_subst env
     
     -- Calculate outer binders (existing ones from expr, minus fixed args)
-    (bndrs, body) = Core.collectBinders expr
+    (bndrs, body) = collectNBinders (length descs) expr
     bndrs_unmarked = map unmark bndrs
     (subst', bndr_maybes) = mapAccumL doBndr subst (zip bndrs_unmarked descs)
     bndrs' = catMaybes bndr_maybes
@@ -734,6 +732,13 @@ fromCoreExprAsPKont env kont descs expr
       = (subst', (Just x, Core.Var x))
       where
         (subst', x) = freshEtaId n subst ty
+        
+    collectNBinders :: TotalArity -> Core.Expr b -> ([b], Core.Expr b)
+    collectNBinders = go []
+      where
+        go acc 0 e              = (reverse acc, e)
+        go acc n (Core.Lam x e) = go (x:acc) (n-1) e
+        go acc _ e              = (reverse acc, e)
     
 -- | Translates a Core case alternative into Sequent Core.
 fromCoreAlt :: FromCoreEnv -> SeqCoreKont -> Core.Alt MarkedVar
