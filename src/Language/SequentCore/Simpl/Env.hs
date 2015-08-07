@@ -14,6 +14,7 @@ module Language.SequentCore.Simpl.Env (
   mkBoundTo, mkBoundToPKont, findDef, setDef,
   initialEnv, getMode, activeRule, enterScope, enterScopes, mkFreshVar, mkFreshKontId,
   substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar,
+  getTvSubst, getCvSubst,
   extendIdSubst, extendPvSubst, zapSubstEnvs, staticPart, setStaticPart, mkSuspension,
   inDynamicScope, zapSubstEnvsStatic, retType,
   

@@ -25,7 +25,7 @@ import Language.SequentCore.Util
 import Language.SequentCore.WiredIn
 
 import BasicTypes
-import Coercion    ( Coercion, coercionKind, isCoVar )
+import Coercion    ( Coercion, coercionKind, isCoVar, mkTransCo )
 import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      CoreM, defaultPlugin, reinitializeGlobals,
                      isZeroSimplCount, pprSimplCount, putMsg, errorMsg
@@ -43,10 +43,11 @@ import Literal     ( litIsDupable )
 import Maybes      ( whenIsJust )
 import MonadUtils
 import Name        ( mkSystemVarName )
+import OptCoercion
 import Outputable
 import Pair
 import qualified PprCore as Core
-import Type        ( Type, applyTy, funResultTy, isUnLiftedType, mkTyVarTy )
+import Type        ( Type, applyTy, eqType, funResultTy, isUnLiftedType, mkTyVarTy )
 import TysWiredIn  ( mkTupleTy )
 import UniqSupply
 import Var
@@ -423,7 +424,6 @@ simplPKontBind env_j j j' env_pk pk _recFlag
               -- No parameters, so we can float things out
               let env_pk' = zapFloats (env_pk `inDynamicScope` env_j)
               (env_with_floats, comm') <- simplCommand env_pk' comm
-              -- TODO Something like Simplify.prepareRhs
               env_j'
                 <- if isEmptyFloats env_with_floats
                       then return env_j
@@ -835,6 +835,19 @@ simplKont env fs end
         arg' <- simplTermNoFloats env arg
         go env fs end (App arg' : fs')
     go env (Cast co : fs) end fs'
+      | fromTy `eqType` toTy -- coercion is reflexivity (or equivalent)
+      = go env fs end fs'
+      where
+        Pair fromTy toTy = coercionKind co
+    go env (Cast co1 : Cast co2 : fs) end fs'
+      | fromTy1 `eqType` toTy2 -- coercions cancel out
+      = go env fs end fs'
+      | otherwise
+      = go env (Cast (mkTransCo co1 co2) : fs) end fs'
+      where
+        Pair fromTy1 _toTy2 = coercionKind co1
+        Pair _fromTy1 toTy2 = coercionKind co2
+    go env (Cast co : fs) end fs'
       = do
         co' <- simplCoercion env co
         go env fs end (Cast co' : fs')
@@ -878,8 +891,7 @@ simplAlt env _scrut_maybe _notAmong _caseBndr (Alt con xs c)
 
 simplCoercion :: SimplEnv -> Coercion -> SimplM Coercion
 simplCoercion env co =
-  -- TODO Actually simplify
-  return $ substCo env co
+  return $ optCoercion (getCvSubst env) co
 
 simplVar :: SimplEnv -> InVar -> SimplM OutTerm
 simplVar env x
