@@ -14,6 +14,7 @@
 \newcommand{\V}{V}
 \newcommand{\whnf}{W}
 \newcommand{\ko}{k}
+\newcommand{\frm}{o}
 \newcommand{\ty}{\tau}
 \newcommand{\sty}{\sigma}
 \newcommand{\ki}{\kappa}
@@ -37,6 +38,7 @@
 \newcommand{\typejmptm}[3]{#1 \vdash_{jtm} \Jump #2 : #3}
 \newcommand{\typeko}[4]{#1; #2 \vdash_{ko} #3 : #4}
 \newcommand{\typejmpko}[4]{#1; #2 \vdash_{jko} #3 : #4}
+\newcommand{\typefrm}[4]{#1 \vdash_{frm} #2 : #3 \Rightarrow #4}
 \newcommand{\typebind}[5]{#1; #2 \vdash_{bind} #3 : (#4; #5)}
 \newcommand{\typebp}[5]{#1; #2 \vdash_{bp} #3 : (#4; #5)}
 \newcommand{\typealt}[4]{#1; #2 \vdash_{alt} #3 : #4}
@@ -50,6 +52,7 @@
 \newcommand{\scopetm}[2]{#1 \vdash_{tm} #2 \Ok}
 \newcommand{\scopejmp}[2]{#1 \vdash_{jmp} #2 \Ok}
 \newcommand{\scopeko}[3]{#1; #2 \vdash_{ko} #3 \Ok}
+\newcommand{\scopefrm}[2]{#1 \vdash_{frm} #2 \Ok}
 \newcommand{\scopebind}{\typebind}
 \newcommand{\scopebp}{\typebp}
 \newcommand{\scopealt}[3]{#1; #2 \vdash_{alt} #3 \Ok}
@@ -84,7 +87,7 @@
 \newcommand{\ann}[2]{#1{:}{#2}}
 \newcommand{\vect}[2][]{{\vv{#2}}^{#1}}
 
-\newcommand{\subst}[2]{[#2/#1]}
+\newcommand{\subst}[2]{\left[#2\middle/#1\right]}
 \newcommand{\subp}[1]{[#1]}
 
 \newcommand{\hole}{\square}
@@ -120,12 +123,17 @@
 \newcommand{\coerce}[2]{{#1}\triangleright{#2}}
 
 \newcommand{\ret}[1]{\Ret #1}
-\newcommand{\letin}{\compute}
-\newcommand{\app}[2]{{#1}\cdot{#2}}
-\newcommand{\koerce}[2]{{#1}\triangleleft{#2}}
-\newcommand{\tick}[2]{#1; #2}
 \newcommand{\caseas}[2]{\Case\As{#1}\Of{#2}}
+\newcommand{\letin}{\compute}
+\newcommand{\app}[2]{\appto{#1}\then{#2}}
+\newcommand{\koerce}[2]{\castby{#1}\then{#2}}
+\newcommand{\tick}[2]{{#1}\then{#2}}
 \newcommand{\tp}{exit}
+
+\newcommand{\appto}[1]{\${#1}}
+\newcommand{\inst}[1]{\appto{#1}}
+\newcommand{\castby}[1]{\triangleright{#1}}
+\newcommand{\then}{;}
 
 \newcommand{\bind}[2]{#1 = #2}
 \newcommand{\bindk}[2]{\Cont\bind{#1}{#2}}

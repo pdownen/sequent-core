@@ -4,6 +4,7 @@
 \usepackage{amssymb}
 \usepackage{stmaryrd}
 \usepackage{proof}
+\usepackage{braket}
 \usepackage{hyperref}
 \usepackage{ifthen}
 \usepackage{preamble}
@@ -32,7 +33,7 @@
   \cmd &\in Command
   &
   &::= \Let \abind \In c
-  \Alt \cut{\tm}{\ko}
+  \Alt \braket{\tm | \vect[n]{\frm_n} | \ko}
   \Alt \jump{\vect[n]{\tm_n}}{j}
   \\
   \tm &\in Term
@@ -47,9 +48,12 @@
   \ko &\in Kont
   &
   &::= \ret q
-  \Alt \app{\tm}{\ko}
-  \Alt \koerce{\cn}{\ko}
   \Alt \caseas{\ann x \ty}{\vect[n]{\analt_n}}
+  % \Alt \vect[n]{\frm} \then \ko
+  \\
+  \frm &\in Frame
+  &
+  &::= \appto{\tm} \Alt \castby{\cn}
   \\
   \abind &\in Binding
   &
@@ -103,15 +107,15 @@ We use some conventional shorthands to make programs easier to read:
 \item If the type annotations on variables, \emph{ie} the $\ty$ in $\ann x \ty$,
   are not important to a particular example, we will often omit them.
 
-\item The function call constructor $\app{\blank}{\blank}$ associates to the
-  right, so $\app{1}{\app{2}{\app{3}{\ret q}}}$ is the same as
-  $\app{1}{(\app{2}{(\app{3}{\ret q})})}$.  Similarly, coercion continuations
-  associate to the right as well, so that
-  $\koerce{\cn_1}{\koerce{\cn_2}{\ret q}}$ is the same as
-  $\koerce{\cn_1}{(\koerce{\cn_2}{\ret q})}$.  Both function calls and coercions
-  share the same precedence and may be intermixed, so that
-  $\app{1}{\koerce{\cn_2}{\app{3}{\ret q}}}$ is the same as
-  $\app{1}{(\koerce{\cn_2}{(\app{3}{\ret q})})}$.
+% \item The function call constructor $\app{\blank}{\blank}$ associates to the
+%   right, so $\app{1}{\app{2}{\app{3}{\ret q}}}$ is the same as
+%   $\app{1}{(\app{2}{(\app{3}{\ret q})})}$.  Similarly, coercion continuations
+%   associate to the right as well, so that
+%   $\koerce{\cn_1}{\koerce{\cn_2}{\ret q}}$ is the same as
+%   $\koerce{\cn_1}{(\koerce{\cn_2}{\ret q})}$.  Both function calls and coercions
+%   share the same precedence and may be intermixed, so that
+%   $\app{1}{\koerce{\cn_2}{\app{3}{\ret q}}}$ is the same as
+%   $\app{1}{(\koerce{\cn_2}{(\app{3}{\ret q})})}$.
 
 \item We will not always write the binding variable $\ann x \ty$ in the case
   continuation $\caseas{\ann x \ty}{\vect[n]{\analt_n}}$ when it turns out that
@@ -122,6 +126,28 @@ We use some conventional shorthands to make programs easier to read:
   often arises in a case continuation with \emph{only} a default alternative,
   $\caseas{\ann x \ty}{\alt{\blank}{\cmd}}$, which we write as the shortened
   $\Case\alt{\ann x \ty}{\cmd}$.
+
+\item We will write the command $\braket{\tm | \mt | \ko}$ as just
+  $\cut{\tm}{\ko}$.
+
+\item
+  % A sequence of frames, $\vect[n]{\frm_n}$, may be prepended onto a
+  % continuation $\ko$, giving the new continuation $\vect[n]{\frm_n} \then \ko$
+  % which transforms its input by each $\frm_n$ in turn before finally consuming
+  % it with $\ko$.
+  Sometimes it is handy to append a sequence of frames onto a term, as in
+  $\tm ~ \vect[n]{\frm_n}$, which transforms the output of $\tm$ by each
+  $\frm_n$ in turn before finally returning the result.  This form of term is
+  defined as the macro-expansion in terms of a $\mu$-abstraction:
+  \begin{align*}
+    \tm ~ \vect[n]{\frm_n}
+    &=
+    \begin{cases}
+      \tm & \text{if } \vect[n]{\frm_n} = \mt
+      \\
+      \comp{r}\braket{\tm | \vect[n]{\frm_n} | \ret r} & \text{otherwise}
+    \end{cases}
+  \end{align*}
 \end{itemize}
 
 \section{Scope and exit analysis}
@@ -180,36 +206,42 @@ Continuation scoping: $\scopeko{\Gamma}{\Delta}{\ko}$
   {q \in \Delta}
   \qquad
   \infer
-  {\scopeko{\Gamma}{\Delta}{\app{\tm}{\ko}}}
-  {
-    \scopetm{\Gamma}{\tm}
-    &
-    \scopeko{\Gamma}{\Delta}{\ko}
-  }
-  \qquad
-  \infer
-  {\scopeko{\Gamma}{\Delta}{\app{\ty}{\ko}}}
-  {
-    \scopety{\Gamma}{\ty}
-    &
-    \scopeko{\Gamma}{\Delta}{\ko}
-  }
-  \\\\
-  \infer
-  {\scopeko{\Gamma}{\Delta}{\koerce{\cn}{\ko}}}
-  {
-    \scopecn{\Gamma}{\cn}
-    &
-    \scopeko{\Gamma}{\Delta}{\ko}
-  }
-  \qquad
-  \infer
   {\scopeko{\Gamma}{\Delta}{\caseas{x}{\vect[n]{\analt_n}}}}
   {
     \vect[n]{
       \scopealt{\Gamma, x}{\Delta}{\analt_n}
     }
   }
+  % \qquad
+  % \infer
+  % {\scopeko{\Gamma}{\Delta}{\vect[n]{\frm_n} \then \ko}}
+  % {
+  %   \scopefrm{\Gamma}{\vect[n]{\frm_n}}
+  %   &
+  %   \scopeko{\Gamma}{\Delta}{\ko}
+  % }
+\end{gather*}
+
+Frame scoping: $\scopefrm{\Gamma}{\frm}$ and
+$\scopefrm{\Gamma}{\vect[n]{\frm_n}}$
+\begin{gather*}
+  \axiom{\scopefrm{\Gamma}{\mt}}
+  \qquad
+  \infer
+  {\scopefrm{\Gamma}{\frm' \then \vect[n]{\frm_n}}}
+  {
+    \scopefrm{\Gamma}{\frm'}
+    &
+    \scopefrm{\Gamma}{\vect[n]{\frm_n}}
+  }
+  \qquad
+  \infer
+  {\scopefrm{\Gamma}{\appto{\tm}}}
+  {\scopetm{\Gamma}{\tm}}
+  \qquad
+  \infer
+  {\scopefrm{\Gamma}{\castby{\cn}}}
+  {\scopecn{\Gamma}{\cn}}
 \end{gather*}
 
 Command scoping: $\scopecmd{\Gamma}{\Delta}{\cmd}$
@@ -223,9 +255,11 @@ Command scoping: $\scopecmd{\Gamma}{\Delta}{\cmd}$
   }
   \\\\
   \infer
-  {\scopecmd{\Gamma}{\Delta}{\cut{\tm}{\ko}}}
+  {\scopecmd{\Gamma}{\Delta}{\braket{\tm | \vect[n]{\frm_n} | \ko}}}
   {
     \scopetm{\Gamma}{\tm}
+    &
+    \scopefrm{\Gamma}{\vect[n]{\frm_n}}
     &
     \scopeko{\Gamma}{\Delta}{\ko}
   }
@@ -439,36 +473,47 @@ Continuation typing: $\typeko{\Gamma}{\Delta}{\ko}{\ty}$
   {q:\ty \in \Delta}
   \qquad
   \infer
-  {\typeko{\Gamma}{\Delta}{\app{\tm}{\ko}}{\ty_1 \to \ty_2}}
-  {
-    \typetm{\Gamma}{\tm}{\ty_1}
-    &
-    \typeko{\Gamma}{\Delta}{\ko}{\ty_2}
-  }
-  \qquad
-  \infer
-  {\typeko{\Gamma}{\Delta}{\app{\ty_1}{\ko}}{\forall \ann a \ki. \ty_2}}
-  {
-    \typety{\Gamma}{\ty_1}{\ki}
-    &
-    \typeko{\Gamma}{\Delta}{\ko}{\ty_2\subst{a}{\ty_1}}
-  }
-  \\\\
-  \infer
-  {\typeko{\Gamma}{\Delta}{\koerce{\cn}{\ko}}{\ty_1}}
-  {
-    \typecn{\Gamma}{\cn}{\eqty{\ty_1}{\ty_2}}
-    &
-    \typeko{\Gamma}{\Delta}{\ko}{\ty_2}
-  }
-  \qquad
-  \infer
   {\typeko{\Gamma}{\Delta}{\caseas{\ann x \ty}{\vect[n]{\analt_n}}}{\ty}}
   {
     \vect[n]{
       \typealt{\Gamma, x:\ty}{\Delta}{\analt_n}{\ty}
     }
   }
+  % \\\\
+  % \infer
+  % {\typeko{\Gamma}{\Delta}{\vect[n]{\frm_n} \then \ko}{\ty}}
+  % {
+  %   \typefrm{\Gamma}{\vect[n]{\frm_n}}{\ty}{\ty'}
+  %   &
+  %   \typeko{\Gamma}{\Delta}{\ko}{\ty'}
+  % }
+\end{gather*}
+
+Frame typing: $\typefrm{\Gamma}{\frm}{\ty}{\ty'}$ and
+$\typefrm{\Gamma}{\vect[n]{\frm_n}}{\ty}{\ty'}$
+\begin{gather*}
+  \axiom{\typefrm{\Gamma}{\mt}{\ty}{\ty}}
+  \qquad
+  \infer
+  {\typefrm{\Gamma}{\frm' \then \vect[n]{\frm_n}}{\ty_1}{\ty_3}}
+  {
+    \typefrm{\Gamma}{\frm'}{\ty_1}{\ty_2}
+    &
+    \typefrm{\Gamma}{\vect[n]{\frm_n}}{\ty_2}{\ty_3}
+  }
+\end{gather*}
+\begin{gather*}
+  \infer
+  {\typefrm{\Gamma}{\appto{\tm}}{(\ty \to \ty')}{\ty'}}
+  {\typetm{\Gamma}{\tm}{\ty}}
+  \qquad
+  \infer
+  {\typefrm{\Gamma}{\inst{\ty}}{(\forall a:\ki.\ty')}{\ty'\subst{a}{\ty}}}
+  {\typety{\Gamma}{\ty}{\ki}}
+  \\\\
+  \infer
+  {\typefrm{\Gamma}{\castby{\cn}}{\ty}{\ty'}}
+  {\typecn{\Gamma}{\cn}{\eqty{\ty}{\ty'}}}
 \end{gather*}
 
 Command typing: $\typecmd{\Gamma}{\Delta}{\cmd}$
@@ -482,11 +527,13 @@ Command typing: $\typecmd{\Gamma}{\Delta}{\cmd}$
   }
   \\\\
   \infer
-  {\typecmd{\Gamma}{\Delta}{\cut{\tm}{\ko}}}
+  {\typecmd{\Gamma}{\Delta}{\braket{\tm | \vect[n]{\frm_n} | \ko}}}
   {
     \typetm{\Gamma}{\tm}{\ty}
     &
-    \typeko{\Gamma}{\Delta}{\ko}{\ty}
+    \typefrm{\Gamma}{\vect[n]{\frm}}{\ty}{\ty'}
+    &
+    \typeko{\Gamma}{\Delta}{\ko}{\ty'}
   }
   \qquad
   \infer
@@ -701,73 +748,116 @@ sub-formula property are the various \emph{cut} rules for commands that cancel
 out arbitrary types, where the $\Let$-form of command allows us to perform
 multiple cuts simultaneously.  The other interesting violators of note are:
 \begin{itemize}
-\item The rule for a polymorphic call-stack,
-  $\app{\ty_1}{\ko} : \forall\ann{a}{\ki}.\ty_2$, which substitutes the
-  specified type $\ty_1$ in for the variable $a$ in $\ty_2$ to get the type for
-  the continuation.  This rule does not have the sub-formula property since
-  $\ty_2\subst{a}{\ty_1}$ is a new type generated by the substitution.
+\item The rule for pushing a frame onto the stack,
+  $\frm' \then \vect[n]{\frm_n}$, which is effectively another form of cut
+  between the output type of $\frm'$ and the input type of $\vect[n]{\frm_n}$.
 
-  Since universal quantification is dual to existential quantification, the
-  polymorphic call-stack is dual to the existential pair
-  $(\tau_1,\tm) : \exists\ann{a}{\ki}.\tau_2$, and shares the same properties.
-  In particular, $\app{\tau_1}{\ko}$ does not have a \emph{unique} type.  For
-  example, given the continuation variable $r$ of type $Bool$, then the
-  polymorphic call-stack $\app{Int}{\app{1}{\app{2}{\ret q}}}$ can be given the
-  types $\forall \ann{a}{\star}. a \to a \to Bool$,
-  $\forall \ann{a}{\star}. Int \to a \to Bool$, and so on.  So following the
-  bottom-up preference of a sequent calculus presentation, it is easy to type
-  check a polymorphic call-stack if we already know the type of function it
-  expects, but in general it is hard to guess its type.
+\item The rule for the cast frame $\castby{\cn}$, which eliminates the equality
+  type $\eqty{\ty}{\ty'}$ into the input/ispell typing judgement of a frame.
+  This is a less severe infraction, since the two are isomorphic, no essential
+  information is gained or lost.
 
-\item The rules for pattern matching on data types almost suffers from the same
-  issue as for polymorphic call-stacks, due to substitution of the choice for
-  polymorphic type variables.  However, the type annotations on variables bound
-  by pattern matching already specify the specialized types, so the issue is
-  avoided.
+% \item The rule for a polymorphic call-stack,
+%   $\app{\ty_1}{\ko} : \forall\ann{a}{\ki}.\ty_2$, which substitutes the
+%   specified type $\ty_1$ in for the variable $a$ in $\ty_2$ to get the type for
+%   the continuation.  This rule does not have the sub-formula property since
+%   $\ty_2\subst{a}{\ty_1}$ is a new type generated by the substitution.
 
-  Also note that the problem with existential pairs (or in general, existential
-  data structures) mentioned in the previous point is avoided on the term side.
-  This is because we do not represent data structures directly, as a
-  fully-applied constructor like $(\ty, \tm)$, but rather we represent them
-  indirectly as a constructor evaluated with a polymorphic call-stack,
-  $\cut{(,)}{\app{\ty}{\app{\tm}{\ret q}}}$.  That means that all the troubles
-  with checking user-defined existential data structures are contained solely in
-  polymorphic call stacks.
+%   Since universal quantification is dual to existential quantification, the
+%   polymorphic call-stack is dual to the existential pair
+%   $(\tau_1,\tm) : \exists\ann{a}{\ki}.\tau_2$, and shares the same properties.
+%   In particular, $\app{\tau_1}{\ko}$ does not have a \emph{unique} type.  For
+%   example, given the continuation variable $r$ of type $Bool$, then the
+%   polymorphic call-stack $\app{Int}{\app{1}{\app{2}{\ret q}}}$ can be given the
+%   types $\forall \ann{a}{\star}. a \to a \to Bool$,
+%   $\forall \ann{a}{\star}. Int \to a \to Bool$, and so on.  So following the
+%   bottom-up preference of a sequent calculus presentation, it is easy to type
+%   check a polymorphic call-stack if we already know the type of function it
+%   expects, but in general it is hard to guess its type.
 
-\item The rule for coercion continuations, $\koerce{\cn}{\ko} : \ty_1$, in which
-  the type of the continuation $\ko$ is hidden by the coercion.  Interestingly,
-  the typing rules for casting resembles a special sort of function application,
-  both with terms in System FC and continuations in Dual System FC.
+% \item The rules for pattern matching on data types almost suffers from the same
+%   issue as for polymorphic call-stacks, due to substitution of the choice for
+%   polymorphic type variables.  However, the type annotations on variables bound
+%   by pattern matching already specify the specialized types, so the issue is
+%   avoided.
+
+%   Also note that the problem with existential pairs (or in general, existential
+%   data structures) mentioned in the previous point is avoided on the term side.
+%   This is because we do not represent data structures directly, as a
+%   fully-applied constructor like $(\ty, \tm)$, but rather we represent them
+%   indirectly as a constructor evaluated with a polymorphic call-stack,
+%   $\cut{(,)}{\app{\ty}{\app{\tm}{\ret q}}}$.  That means that all the troubles
+%   with checking user-defined existential data structures are contained solely in
+%   polymorphic call stacks.
+
+% \item The rule for coercion continuations, $\koerce{\cn}{\ko} : \ty_1$, in which
+%   the type of the continuation $\ko$ is hidden by the coercion.  Interestingly,
+%   the typing rules for casting resembles a special sort of function application,
+%   both with terms in System FC and continuations in Dual System FC.
 \end{itemize}
+Observe that by factoring out frames from the final continuation, we actually
+improve the sub-formula property for polymorphic instantiation.  The polymorphic
+call stack $\app{\ty}{\ko}$ normally lacks the sub-formula property since $\ty$
+is substituted into the type of input that $\ko$ expects to receive.  As a
+single frame, however, $\inst{\ty}$ specifies both the polymorphic schema for
+the input it receives as well as the instantiated output it produces below the
+line of inference.
 
-Due to the difficulty of inferring the type of a polymorphic call-stack, the
-type checking algorithm for Sequent Core reveals some asymmetrical bias of type
-information.  As designed, reading the type off of a Sequent Core term is always
-straightforward.  However, continuations may have several different types (due
-to the polymorphic form of call stacks).  Instead, it is straightforward to
-check if a continuation has a particular type.  Contrarily, the type of the term
-arguments, $\Jump\vect{\tm}$, is easy to check but hard to infer, whereas the
-type of the parameterized continuation $\fnk{\vect{x:\ty}}\cmd$ is easy to
-infer.  This flow of type-inferring versus type-checking is captured in the
-structure of a command and gives us a type checking algorithm:
+Notice that the unique types of terms and final continuations (either the
+continuation variable $\ret q$ or case continuation
+$\caseas{\ann x \ty}{\vect[n]{\analt_n}}$) are easy to infer.  However, frames
+do \emph{not} have a unique type.  For example, the application frame
+$\appto{1}$ can take an input of type $Int \to \ty'$ and produce an output of
+type $\ty'$, for any choice of $\ty'$.  Even worse, the frame $\inst{\ty}$ for
+polymorphic instantiation connects any universally quantified type
+$\forall a:\ki.\ty'$ to the instantiated one $\ty'\subst{a}{\ty}$.  Thus, while
+terms and final continuations support a simple type inference procedure, frames
+do not.  Instead, we just check that a frame (or stack of frames) fits a chosen
+type.  Additionally, the type of the term arguments, $\Jump\vect{\tm}$, is easy
+to check but hard to infer, whereas the type of the parameterized continuation
+$\fnk{\vect{x:\ty}}\cmd$ is easy to infer.  This flow of type-inferring versus
+type-checking is captured in the structure of a command and gives us a type
+checking algorithm:
 \begin{itemize}
 \item If the command is a $\Let$-binding, gather the types for the bound local
   variables and confirm that they are bound to well-typed terms and
   continuations.
 \item If the command evaluates a term in the eye of a continuation,
-  $\cut{\tm}{\ko}$, then read the type off of $\tm$, thereby confirming that it
-  is well-typed, and check that $\ko$ has the same type.
+  $\braket{\tm | \vect[n]{\frm_n} | \ko}$, then read the type off of $\tm$ and
+  $\ko$, thereby confirming that they are well-typed, and check that
+  $\vect[n]{\frm_n}$ connects these two types.
 \item If the command is a jump, $\jump{\vect{\tm}}{j}$, then read the type off
   of $j$, and check that $\Jump\vect{\tm}$ has the same type.
 \end{itemize}
-Determining the explicit flow of type information (from term to continuation or
-continuation to term, depending on the form of the command) likely has something
-to do with the traditional form of bi-directional type checking from the
-literature.  Intuitively, the problem with inferring the type of polymorphic
-call stacks is identical to the problem with inferring the general existential
-tuples in the sequent calculus.  Thus, solving the problem with forall gives us
-a solution for exists by duality in the sequent calculus.  Symmetry saves the
-day!
+
+% Due to the difficulty of inferring the type of a polymorphic call-stack, the
+% type checking algorithm for Sequent Core reveals some asymmetrical bias of type
+% information.  As designed, reading the type off of a Sequent Core term is always
+% straightforward.  However, continuations may have several different types (due
+% to the polymorphic form of call stacks).  Instead, it is straightforward to
+% check if a continuation has a particular type.  Contrarily, the type of the term
+% arguments, $\Jump\vect{\tm}$, is easy to check but hard to infer, whereas the
+% type of the parameterized continuation $\fnk{\vect{x:\ty}}\cmd$ is easy to
+% infer.  This flow of type-inferring versus type-checking is captured in the
+% structure of a command and gives us a type checking algorithm:
+% \begin{itemize}
+% \item If the command is a $\Let$-binding, gather the types for the bound local
+%   variables and confirm that they are bound to well-typed terms and
+%   continuations.
+% \item If the command evaluates a term in the eye of a continuation,
+%   $\cut{\tm}{\ko}$, then read the type off of $\tm$, thereby confirming that it
+%   is well-typed, and check that $\ko$ has the same type.
+% \item If the command is a jump, $\jump{\vect{\tm}}{j}$, then read the type off
+%   of $j$, and check that $\Jump\vect{\tm}$ has the same type.
+% \end{itemize}
+% Determining the explicit flow of type information (from term to continuation or
+% continuation to term, depending on the form of the command) likely has something
+% to do with the traditional form of bi-directional type checking from the
+% literature.  Intuitively, the problem with inferring the type of polymorphic
+% call stacks is identical to the problem with inferring the general existential
+% tuples in the sequent calculus.  Thus, solving the problem with forall gives us
+% a solution for exists by duality in the sequent calculus.  Symmetry saves the
+% day!
 
 \section{Semantics}
 \label{sec:semantics}
@@ -790,14 +880,14 @@ $\Let$-bindings.
 First, we have the sequent equivalent of the usual $\beta$ and $\eta$ axioms for
 functions:
 \begin{align*}
-  \cut{\fn{\ann{x}{\ty}} \tm}{\app{\tm'}{\ko}}
+  \braket{\fn{\ann{x}{\ty}} \tm | \appto{\tm'} \then \vect[n]{\frm_n} | \ko}
   &=
-  \Let \nonrec{\bindv{\ann{x}{\ty}}{\tm'}} \In \cut{\tm}{\ko}
+  \Let \nonrec{\bindv{\ann{x}{\ty}}{\tm'}} \In \braket{\tm | \vect[n]{\frm_n} | \ko}
   &
   \Where
   x &\notin FV(\ko)
   \\
-  \fn{\ann{x}{\ty}}\comp{\ann{r}{\ty'}} \cut{\tm}{\app{x}{\ret r}}
+  \fn{\ann{x}{\ty}} \tm \appto{x}
   &=
   \tm
   &
@@ -811,12 +901,12 @@ For the $\beta$ axiom, we simplify a $\lambda$-abstraction that is evaluated
 with respect to a calling continuation by $\Let$-binding the argument and
 evaluating the body in the return return continuation.  For the $\eta$ axiom, we
 recognize that the functional abstraction
-$\fn{x}\comp{r}\cut{f}{\app{x}{\ret r}}$ immediately delegates to $f$, so the
-two are equivalent.  Note that, due to the presence of unconstrained,
-polymorphic strictness (for example,\texttt{seq}), the $\eta$ axiom can only be
-applied to terms of a function type that do not evaluate to bottom.  In other
-words, the $\eta$ axiom only applies to terms that are already equal to a
-$\lambda$-abstraction without the use of $\eta$.
+$\fn{x}f\appto{x}=\fn{x}\comp{r}\braket{f | \appto{x} | \ret r}$ immediately
+delegates to $f$, so the two are equivalent.  Note that, due to the presence of
+unconstrained, polymorphic strictness (for example, \texttt{seq}), the $\eta$
+axiom can only be applied to terms of a function type that do not evaluate to
+bottom.  In other words, the $\eta$ axiom only applies to terms that are already
+equal to a $\lambda$-abstraction without the use of $\eta$.
 
 Computation abstractions (that is, $\mu$-abstractions), also follow a form of
 $\beta$ and $\eta$ axioms:
@@ -851,12 +941,13 @@ data structure.
 \end{align*}
 \begin{align*}
   &
-  \cut
-  {K}
-  {\app
-    {\vect[n]{\tm_n}}
-    {\caseas{\ann{x}{\ty}}{
-      \dots;\alt{K ~ \vect[n]{\ann{y_n}{\sty_n}}}{\cmd};\dots}}}
+  \braket
+  { K
+  | 
+    \vect[n]{\appto{\tm_n}}
+  | \caseas{\ann{x}{\ty}}{
+      \dots; \alt{K ~ \vect[n]{\ann{y_n}{\sty_n}}}{\cmd}; \dots
+    } }
   \\
   &=
   \vect[n]{
@@ -865,9 +956,7 @@ data structure.
   \In
   }
   \Let \nonrec{
-    \bindv
-    {\ann{x}{\ty}}
-    {\comp{\ann{r}{\ty}}\cut{K}{\app{\vect[n]{y_n}}{\ret r}}}
+    \bindv{\ann{x}{\ty}}{K \vect[n]{\appto{y_n}}}
   } \In
     \cmd
 \end{align*}
@@ -875,24 +964,24 @@ The default alternative for a case continuation is selected when no other
 alternative matches, and only applies when the continuation is given a weak-head
 normal form (WHNF) as input.
 \begin{align*}
-  \cut{\tm'}{\app{\vect[n]{\tm_n}}{\caseas{\ann{x}{\ty}}{\dots;\alt{\blank}{\cmd}}}}
+  \braket
+  { \tm
+  | \vect[n]{\frm_n}
+  | \caseas{\ann{x}{\ty}}{\dots;\alt{\blank}{\cmd}} }
   &=
   \Let
-    \nonrec{\bindv{\ann{x}{\ty}}{\tm''}}
+    \nonrec{\bindv{\ann{x}{\ty}}{\tm ~ \vect[n]{\frm_n}}}
   \In
     \cmd
   \\
   \Where
-  \tm''
-  &=
-  \comp{\ann{r}{\ty}}\cut{\tm'}{\app{\vect[n]{\tm_n}}{\ret r}}
-  \in
+  \tm ~ \vect[n]{\frm_n}
+  &\in
   WHNF
 \end{align*}
-Note that the list of arguments, $\vect[n]{\tm_n}$, can only be non-empty when
-the head term $\tm$ is a constructor:
-$\comp{\ann{r}{\ty}}\cut{K}{\app{\vect[n]{\tm_n}}{\ret r}}$ is a WHNF.  The
-other possibility is that $\vect[n]{\tm_n}$ is empty and $\tm'$ is a literal or
+Note that the list of arguments, $\vect[n]{\frm_n}$, can only be non-empty when
+the head term $\tm$ is a constructor: $K ~ \vect[n]{\frm_n}$ is a WHNF.  The
+other possibility is that $\vect[n]{\frm_n}$ is empty and $\tm$ is a literal or
 a $\lambda$-abstraction.  We also have some extensional properties about case
 continuations.  First, we may replace the name for the input with the pattern in
 any alternative, or vice versa:
@@ -910,7 +999,7 @@ any alternative, or vice versa:
     \dots;
     \alt
     {K ~ \vect[n]{\ann{y_n}{\sty_n}}}
-    {\cmd\subst{x}{\comp{\ann{r}{\ty}}\cut{K}{\app{\vect[n]{y_n}}{r}}}};
+    {\cmd\subst{x}{K ~ \vect[n]{\appto{y_n}}}};
     \dots
     }
 \end{align*}
@@ -967,24 +1056,19 @@ of terms.  The substitution of a continuation binding  Then a $\Let$-binding com
   \cmd\subp{\bp}
 \end{align*}
 
-We now consider axioms for pushing casts around the program.  First, we
-introduce syntactic sugar for casting the output of a term via the dual form of
-casting the input of its continuation:
+We now consider axioms for pushing casts around the program.  A sequence of
+casts can be combined into a single cast of the composed coercion:
 \begin{align*}
-  \coerce{\tm}{\cn} &= \comp{r}\cut{\tm}{\koerce{\cn}{\ret r}}
-\end{align*}
-A sequence of casts can be combined into a single cast of the composed coercion:
-\begin{align*}
-  \koerce{\cn}{(\koerce{\cn'}{\ko})}
+  \castby{\cn} \then \castby{\cn'}
   &=
-  \koerce{(\compcn{\cn}{\cn'})}{\ko}
+  \castby{(\compcn{\cn}{\cn'})}
 \end{align*}
 Casting a coercion itself can be reduced to a modified coercion that pipes the
 type conversions together:
 \begin{align*}
-  \cut{\cn}{\koerce{\cn'}{\ko}}
+  \braket{\cn | \castby{\cn'} \then \vect[n]{\frm_n} | \ko }
   &=
-  \cut{\compcn{\cn'_0}{\compcn{\cn}{\cn'_1}}}{\ko}
+  \braket{\compcn{\cn'_0}{\compcn{\cn}{\cn'_1}} | \vect[n]{\frm_n} | \ko}
   &
   \Where
   \cn &: \eqty{\ty_0}{\ty_1}
@@ -996,11 +1080,11 @@ type conversions together:
   \cn'_1 &: \eqty{\ty_1}{\ty'_1} = \nth_1 \cn'
 \end{align*}
 In general, we will always push casts down structures.  For coercions between
-function type, this means pushing the cast down a call-stack:
+function type, this means pushing the cast down the call-stack:
 \begin{align*}
-  \koerce{\cn}{(\app{\tm}{\ko})}
+  \castby{\cn} \then \appto{\tm}
   &=
-  \app{(\coerce{\tm}{\cn_0})}{(\koerce{\cn_1}{\ko})}
+  \appto{(\tm \castby{\cn_0})} \then \castby{\cn_1}
   \\
   \Where
   \cn &: \eqty{(\ty_0 \to \ty_1)}{(\ty_0' \to \ty_1')}
@@ -1015,9 +1099,9 @@ function type, this means pushing the cast down a call-stack:
 Similarly, casts down polymorphic call-stacks for coercions between universally
 quantified types:
 \begin{align*}
-  \koerce{\cn}{(\app{\ty}{\ko})}
+  \castby{\cn} \then \appto{\ty}
   &=
-  \app{\ty}{(\koerce{\cn'}{\ko})}
+  \appto{\ty} \then \castby{\cn'}
   \\
   \Where
   \cn &: \eqty{\forall a:\ki. \ty'_1}{\forall a:\ki. \ty'_2}
@@ -1039,25 +1123,20 @@ equality of the literal type with itself:
 The most complicated push axiom is for data types.  Here, we push a cast on a
 constructed data structure into its sub-terms:
 \begin{align*}
-  \cut
-  {K}
- {\app
-   {\vect[m]{\ty_{m}}}
-   {\app
-     {\vect[m']{\sty_{m'}}}
-     {\app
-       {\vect[n]{\tm_n}}
-       {\koerce{\cn}{\ko}}}}}
+  \braket
+  { K
+  | \vect[m]{\inst{\ty_{m}}}
+    \then \vect[m']{\inst{\sty_{m'}}}
+    \then \vect[n]{\appto{\tm_n}}
+    \then \castby{\cn}
+  | \ko }
   &=
-  \cut
-  {K}
-  {\app
-    {\vect[m]{\ty'_{m}}}
-    {\app
-      {\vect[m']{\sty_{m'}}}
-      {\app
-        {\vect[n]{(\coerce{\tm_n}{\cn'_n})}}
-        {\ko}}}}
+  \braket
+  { K
+  | \vect[m]{\inst{\ty'_{m}}}
+    \then \vect[m']{\inst{\sty_{m'}}}
+    \then \vect[n]{\appto{(\tm_n \castby{\cn'_n})}}
+  | \ko }
   \\
   \Where
   \cn &: \eqty{T ~ \vect[m]{\ty_m}}{T ~ \vect[m]{\ty'_m}}
@@ -1092,93 +1171,153 @@ universally quantified types with the coerced ones.
 \subsection{Operational Semantics}
 
 Since we do not consider recursive bindings, the reduction steps in operational
-semantics of Sequent Core always apply the to the top of a command.  The
-reductions of non-recursive $\Let$-bindings, $\mu$-abstractions, and
-$\lambda$-abstractions are:
+semantics of Sequent Core always apply the to the top of a command.  The purely
+structural reductions, which substitute $\Let$- and $\mu$-bindings, are:
 \begin{align*}
   \Let \nonrec{\bp} \In \cmd
   &\sred
   \cmd\subp{\bp}
-\end{align*}
-\begin{align*}
-  \cut{\comp{r}\cmd}{\ko}
+  \\
+  \braket{\comp{r}\cmd | \vect[n]{\frm_n} | \ko}
   &\sred
-  \cmd\subst{r}{\ko}
-\end{align*}
-\begin{align*}
-  \cut{\fn x \tm}{\app{\tm'}{\ko}}
-  &\sred
-  \cut{\tm\subst{x}{\tm'}}{\ko}
+  \cmd
+  \subst
+    {\braket{\tm | \vect[m]{\frm'_m} | \ret r}}
+    {\braket{\tm | \vect[m]{\frm'_m} ; \vect[n]{\frm_n} | \ko}}
+  % \\
+  % \braket{\tm | \vect[n]{\frm_n} | \vect[m]{\frm_m} \then \ko}
+  % &\sred
+  % \braket{\tm | \vect[n]{\frm_n} \then \vect[m]{\frm_m} | \ko}
 \end{align*}
 
-For the purpose of the simplicity of the operational semantics, we assume fully
-saturated constructors, so an unapplied constructor
-$K : \vect[m]{\forall\ann{a_{m}}{\ki_{m}}}\vect[n]{\ty_{n}\to}\ty'$ is
-represented as
-$
-\vect[m]{\fn{a_{m}}}\vect[n]{\fn{x_{n}}}\comp{r}
-  \cut{K ~ \vect[m]{a_{m}} ~ \vect[n]{x_{n}}}{\ret r}
-$.
-The constructed form of term greatly simplifies the presentation of the
-operational semantics for case continuations.  The rules for reducing case
-continuations are:
+\begin{align*}
+  \braket{ \fn x \tm | \appto{\tm'} \then \vect[n]{\frm_n} | \ko}
+  &\sred
+  \braket{\tm\subst{x}{\tm'} | \vect[n]{\frm_n} | \ko}
+  % \\
+  % \braket{ \fn a \tm | \inst{\ty} \then \vect[n]{\frm_n} | \ko }
+  % &\sred
+  % \braket{\tm\subst{a}{\ty} | \vect[n]{\frm_n} | \ko}
+\end{align*}
+
+Recall that we use the syntactic sugar that
+$\tm\then\vect[n]{\frm_n}=\comp{r}\braket{\tm|\vect[n]{\frm_n}|\ret{r}}$. The
+rules for reducing case continuations are:
 \begin{align*}
   \cut{\lit}{\caseas{x}{\dots;\alt{\lit}{\cmd};\dots}}
   &\sred
   \cmd\subst{x}{\lit}
   \\
-  \cut
-  {K ~ \vect[m]{\ty_{m}} ~ \vect[n]{\tm_{n}}}
-  {\caseas{x}{\dots;\alt{K ~ \vect[n]{y_n}}{\cmd};\dots}}
+  \braket
+  { K
+  | \vect[m]{\inst{\ty_{m}}} \then \vect[n]{\appto{\tm_{n}}}
+  | \caseas{x}{\dots;\alt{K ~ \vect[n]{y_n}}{\cmd};\dots}
+  }
   &\sred
   \cmd
-  \subst{x}{(K ~ \vect[m]{\ty_{m}} ~ \vect[n]{\tm_{n}})}
+  \subst{x}{(K \then \vect[m]{\appto{\ty_{m}}} \then \vect[n]{\appto{\tm_{n}}})}
   \vect[n]{\subst{y_n}{\tm_n}}
   \\
-  \cut
-  {\whnf}
-  {\caseas{x}{\dots;\alt{\blank}{\cmd}}}
+  \braket
+  { \tm
+  | \vect[n]{\frm_n}
+  | \caseas{x}{\dots;\alt{\blank}{\cmd}} }
   &\sred
-  \cmd\subst{x}{\whnf}
+  \cmd\subst{x}{\tm \then \vect[n]{\frm_n}}
+  \\
+  \Where \tm \then \vect[n]{\frm_n} &\in WHNF
 \end{align*}
-Note that the $\whnf$ in the last rule stands for a WHNF, which is either a
-literal, a $\lambda$-abstraction, or a constructed term $K ~ \vect[n]{\tm_n}$.
+Note that the set of weak head normal forms ($WHNF$) includes literals,
+$\lambda$-abstractions, coercions, and constructed terms of the form
+$K \then \vect[n]{\frm_n}$.
 
 Finally, we have the reductions which push casts out of the way of $\beta$
-reductions at the last moment.  For function and type abstractions, we have:
+reductions at the last moment.  For applications, we have:
 \begin{align*}
-  \cut{\fn x \tm}{\koerce{\cn}{(\app{\tm'}{\ko})}}
+  \braket
+  { \tm'
+  | \vect[m]{\appto{\tm_m}}
+    \then \castby{\cn}
+    \then \castby{\cn'}
+    \then \vect[n]{\frm_n}
+  | \ko }
   &\sred
-  \cut
-  {\fn x \tm}
-  {\app{(\coerce{\tm'}{\sym(\nth_0 \cn)})}{(\koerce{\nth_1 \cn}{\ko})}}
-  &
-  \Where
-  \tm' &\notin Type
+  \braket
+  { \tm'
+  | \vect[m]{\appto{\tm_m}}
+    \then \castby{(\compcn{\cn}{\cn'})}
+    \then \vect[n]{\frm_n}
+  | \ko }
   \\
-  \cut{\fn a \tm}{\koerce{\cn}{(\app{\ty}{\ko})}}
+  \Where
+  \tm'; \vect[m]{\appto{\tm_m}} &\in WHNF
+  \\
+  \braket
+  { \tm'
+  | \vect[m]{\appto{\tm_m}}
+    \then \castby{\cn}
+    \then \appto{\tm'}
+    \then \vect[n]{\frm_n}
+  | \ko }
   &\sred
-  \cut
-  {\fn a \tm}
-  {\app{\ty}{(\koerce{\instancn{\cn}{\ty}}{\ko})}}
+  \braket
+  { \tm'
+  | \vect[m]{\appto{\tm_m}}
+    \then \appto{(\tm' \then \castby{\sym(\nth_0 \cn)})}
+    \then \castby{(\nth_1 \cn)}
+    \then \vect[n]{\frm_n}
+  | \ko }
+  \\
+  \Where
+  \cn &: \eqty{(\ty_1 \to \ty_2)}{(\ty'_1 \to \ty'_2)}
+  \\
+  \tm'; \vect[m]{\appto{\tm_m}} &\in WHNF
+  \\
+  \braket
+  { \tm'
+  | \vect[m]{\appto{\tm_m}}
+    \then \castby{\cn}
+    \then \inst{\ty}
+    \then \vect[n]{\frm_n}
+  | \ko }
+  &\sred
+  \braket
+  { \tm'
+  | \vect[m]{\appto{\tm_m}}
+    \then \inst{\ty}
+    \then \castby{(\instancn{\cn}{\ty})}
+    \then \vect[n]{\frm_n}
+  | \ko }
+  \\
+  \Where
+  \cn &: \eqty{(\forall a:\ki.\ty')}{(\forall a:\ki.\ty'')}
+  \\
+  \tm'; \vect[m]{\appto{\tm_m}} &\in WHNF
 \end{align*}
 For a matching literal case, we have:
 \begin{align*}
-  \cut{\lit}{\koerce{\cn}{\caseas{x}{\dots;\alt{\lit}{\cmd};\dots}}}
+  \braket{\lit | \castby{\cn} | \caseas{x}{\dots;\alt{\lit}{\cmd};\dots} }
   &\sred  
   \cut{\lit}{\caseas{x}{\dots;\alt{\lit}{\cmd};\dots}}
 \end{align*}
 For a matching constructed term, we have:
 \begin{align*}
   &
-  \cut
-  {K ~ \vect[m]{\ty_{m}} ~ \vect[m']{\sty_{m'}} ~ \vect[n]{\tm_{n}}}
-  {\koerce{\cn}{\caseas{x}{\dots;\alt{K ~ \vect[m']{b_{m'}} \vect[n]{y_{n}}}{\cmd};\dots}}}
+  \Braket
+  { K
+  | \vect[m]{\inst{\ty_{m}}}
+    \then \vect[m']{\inst{\sty_{m'}}}
+    \then \vect[n]{\appto{\tm_{n}}}
+    \then \castby{\cn}
+  | \caseas{x}{\dots;\alt{K ~ \vect[m']{b_{m'}} \vect[n]{y_{n}}}{\cmd};\dots} }
   \\
   &\sred
-  \cut
-  {K ~ \vect[m]{\ty'_{m}} ~ \vect[m']{\sty_{m'}} ~ \vect[n]{(\coerce{\tm_{n}}{\cn'_n})}}
-  {\caseas{x}{\dots;\alt{K ~ \vect[m']{b_{m'}} \vect[n]{y_{n}}}{\cmd};\dots}}
+  \Braket
+  { K
+  | \vect[m]{\inst{\ty'_{m}}}
+    \then \vect[m']{\inst{\sty_{m'}}}
+    \then \vect[n]{\appto{(\tm_{n} \then \castby{\cn'_n})}}
+  | \caseas{x}{\dots;\alt{K ~ \vect[m']{b_{m'}} \vect[n]{y_{n}}}{\cmd};\dots} }
   \\
   &\qquad
   \Where
@@ -1192,156 +1331,23 @@ For a matching constructed term, we have:
   \vect[n]{\sty'_{n} \to} T ~ \vect[m]{a_{m}}
   \\
   &\qquad\phantom{\Where}
-  \cn'_i = \sty'_i\vect[m]{\subst{a_{m}}{\nth_m \cn}}\vect[m']{\subst{b_{m'}}{\idcn{\sty_{m'}}}}
-\end{align*}
-The default alternative of a case continuation doesn't have anything to do with
-a particular type, so we can't really push the cast anywhere.  Instead, we
-include it with the substitution in another form of the default case reduction:
-\begin{align*}
-  \cut{\whnf}{\koerce{\cn}{\caseas{x}{\dots;\alt{\blank}{\cmd}}}}
-  &\sred
-  \cmd\subst{x}{\coerce{\whnf}{\cn}}
-\end{align*}
-% \begin{align*}
-%   &
-%   \begin{aligned}[b]
-%     &
-%     \Let \rec{\vect[n]{\bp_n}} \In
-%     \\ &
-%     \cut
-%     {K}
-%     {\app
-%       {\vect[m]{\ty_{m}}}
-%       {\app
-%         {\vect[m']{\sty_{m'}}}
-%         {\app
-%           {\vect[n']{\tm_{n'}}}
-%           {\koerce
-%             {\cn}
-%             {\caseas{x}{\dots;\alt{K ~ \vect[n']{y_{n'}}}{\cmd};\dots}}}}}}
-%   \end{aligned}
-%   \\
-%   &\sred
-%   \begin{aligned}[b]
-%     &
-%     \Let \rec{\vect[n]{\bp_n}} \In
-%     \\ &
-%     \cut
-%     {K}
-%     {\app
-%       {\vect[m]{\ty'_{m}}}
-%       {\app
-%         {\vect[m']{\sty_{m'}}}
-%         {\app
-%           {\vect[n']{(\coerce{\tm_{n'}}{\cn'_{n'}})}}
-%           {\caseas{x}{\dots;\alt{K ~ \vect[n']{y_{n'}}}{\cmd};\dots}}}}}
-%   \end{aligned}
-%   \\
-%   &
-%   \Where
-%   \cn : \eqty{T ~ \vect[m]{\ty_{m}}}{T ~ \vect[m]{\ty'_{m}}}
-%   \\
-%   &\phantom{\Where}
-%   K : \ty_K
-%   \\
-%   &\phantom{\Where}
-%   \cn_i = \arg_i(\idcn{\ty_K} ~ \vect[m]{\nth_{m} \cn} ~ \vect[m']{\idcn{\sty_{m'}}})
-% \end{align*}
-% \begin{align*}
-%   \begin{aligned}[b]
-%     &
-%     \Let \rec{\vect[n]{\bp_n}} \In
-%     \\ &
-%     \cut
-%     {\tm'}
-%     {\app{\vect[m]{\tm_{m}}}{\koerce{\cn}{\caseas{x}{\dots;\alt{\blank}{\cmd}}}}}
-%   \end{aligned}
-%   &\sred
-%   \begin{aligned}[b]
-%     &
-%     \Let \rec{\vect[n]{\bp_n}} \In
-%     \\ &
-%     \cmd\subst{x}{\tm''}
-%   \end{aligned}
-%   \\
-%   \Where
-%   \tm''
-%   &=
-%   \comp{r}\cut{\tm'}{\app{\vect[m]{\tm_{m}}}{\koerce{\cn}{\ret r}}}
-%   \text{ is a WHNF}
-% \end{align*}
-
-And finally, when we have two casts in a row, we merge them into a single cast
-of the composed coercion:
-\begin{align*}
-  \cut{\V}{\koerce{\cn}{\koerce{\cn'}{\ko}}}
-  &\sred
-  \cut{\V}{\koerce{\compcn{\cn}{\cn'}}{\ko}}
+  \cn'_i
+  =
+  \sty'_i\vect[m]{\subst{a_{m}}{\nth_m \cn}}\vect[m']{\subst{b_{m'}}{\idcn{\sty_{m'}}}}
 \end{align*}
 
+% And finally, when we have two casts in a row, we merge them into a single cast
+% of the composed coercion:
 % \begin{align*}
-%   \begin{aligned}[b]
-%     &
-%     \Let \rec{\vect[n]{\bp_n}} \In
-%     \\ &
-%     \cut{K}{\app{\vect[m]{\tm_m}}{\koerce{\cn}{(\app{\tm'}{\ko})}}}
-%   \end{aligned}
-%   &\sred  
-%   \begin{aligned}[b]
-%     &
-%     \Let \rec{\vect[n]{\bp_n}} \In
-%     \\ &
-%     \cut
-%     {K}
-%     {\app
-%       {\vect[m]{\tm_m}}
-%       {\app
-%         {(\coerce{\tm'}{\sym(\nth_0 \cn)})}
-%         {(\koerce{\nth_1 \cn}{\ko})}}}
-%   \end{aligned}
-%   \\
-%   \Where
-%   m &< arity(K)
-%   \\
-%   \tm' &\notin Type
-%   \\
-%   \begin{aligned}[b]
-%     &
-%     \Let \rec{\vect[n]{\bp_n}} \In
-%     \\ &
-%     \cut{K}{\app{\vect[m]{\tm_m}}{\koerce{\cn}{(\app{\ty}{\ko})}}}
-%   \end{aligned}
-%   &\sred  
-%   \begin{aligned}[b]
-%     &
-%     \Let \rec{\vect[n]{\bp_n}} \In
-%     \\ &
-%     \cut
-%     {K}
-%     {\app
-%       {\vect[m]{\tm_m}}
-%       {\app{\ty}{(\koerce{\cn ~ \ty}{\ko})}}}
-%   \end{aligned}
-%   \\
-%   \Where
-%   m &< arity(K)
-%   \\
-%   \begin{aligned}[b]
-%     &
-%     \Let \rec{\vect[n]{\bp_n}} \In
-%     \\ &
-%     \cut{K}{\app{\vect[m]{\tm_m}}{\koerce{\cn}{\koerce{\cn'}{\ko}}}}
-%   \end{aligned}
+%   \braket
+%   { \V
+%   | \castby{\cn} \then \castby{\cn'} \then \vect[n]{\frm_n}
+%   | \ko}
 %   &\sred
-%   \begin{aligned}[b]
-%     &
-%     \Let \rec{\vect[n]{\bp_n}} \In
-%     \\ &
-%     \cut{K}{\app{\vect[m]{\tm_m}}{\koerce{\compcn{\cn}{\cn'}}{\ko}}}
-%   \end{aligned}
-%   \\
-%   \Where
-%   m &< arity(K)
+%   \braket
+%   { \V
+%   | \castby{(\compcn{\cn}{\cn'})} \then \vect[n]{\frm_n}
+%   | \ko }
 % \end{align*}
 
 \section{Translation}
@@ -1395,9 +1401,10 @@ computation expressions all correspond to computation $\mu$-abstractions.
   Seq\trans{\expr_1 ~ \expr_2}
   &=
   \comp{\ann r \ty}
-    \cut
-    {Seq\trans{\expr_1}}
-    {\app{Seq\trans{\expr_2}}{r}}
+    \braket
+    { Seq\trans{\expr_1}
+    | \appto{Seq\trans{\expr_2}}
+    | \ret r }
   \\
   &
   \Where{}
@@ -1405,7 +1412,7 @@ computation expressions all correspond to computation $\mu$-abstractions.
   \\
   Seq\trans{\Let \abind \In \expr}
   &=
-  \comp{\ann r \ty}\Let Seq\trans{\abind} \In \cut{\expr}{r}
+  \comp{\ann r \ty}\Let Seq\trans{\abind} \In \cut{\expr}{\ret r}
   \\
   &
   \Where{}
@@ -1424,7 +1431,7 @@ computation expressions all correspond to computation $\mu$-abstractions.
   \\
   Seq\trans{\coerce{\expr}{\cn}}
   &=
-  \comp{\ann{r}{\ty}}\cut{Seq\trans{\expr}}{\koerce{\cn}{r}}
+  \comp{\ann{r}{\ty}}\braket{Seq\trans{\expr}|\castby{\cn}|\ret{r}}
   \\
   &
   \Where{}
@@ -1446,7 +1453,7 @@ binding of a $\Let$ expression and alternatives of a case expression:
 \begin{align*}
   Seq\trans{\blank \to \expr}_{r}
   &=
-  \blank \to \cut{Seq\trans{\expr}}{r}
+  \blank \to \cut{Seq\trans{\expr}}{\ret r}
   \\
   Seq\trans{
     K ~ \vect[n]{\ann{x_n}{\ty_n}} \to \expr
@@ -1454,11 +1461,11 @@ binding of a $\Let$ expression and alternatives of a case expression:
   &=
   K ~ \vect[n]{\ann{x_n}{\ty_n}}
   \to
-  \cut{Seq\trans{\expr}}{r}
+  \cut{Seq\trans{\expr}}{\ret r}
   \\
   Seq\trans{\lit \to \expr}_{r}
   &=
-  \lit \to \cut{Seq\trans{\expr}}{r}
+  \lit \to \cut{Seq\trans{\expr}}{\ret r}
 \end{align*}
 Note that because case alternatives in Sequent Core point to self-contained
 commands, we explicitly spell out the common continuation that every alternative
@@ -1469,7 +1476,7 @@ receive the final result of the program:
 \begin{align*}
   Seq\trans{\vect[n]{\decl_n}; e}_{r}
   &=
-  \vect[n]{\decl_n}; \cut{Seq\trans{e}}{r}
+  \vect[n]{\decl_n}; \cut{Seq\trans{e}}{\ret r}
 \end{align*}
 
 While the compositional translation is simple, it creates unnecessarily large
@@ -1499,7 +1506,7 @@ types), the translation is much the same:
   Seq\trans{\ty} &= \ty
   \\
   Seq\trans{\expr}
-  &= \comp{r:\ty} Seq\trans{\expr : \ty} r
+  &= \comp{r:\ty} Seq\trans{\expr : \ty} \mt ~ (\ret r)
   &
   \Where
   \expr &:\ty \text{ is an apparent computation}
@@ -1507,45 +1514,53 @@ types), the translation is much the same:
 The main difference is when we find an apparent computation (an application, let
 expression, case expression, or cast), identified by the last clause above.  In
 this case, we introduce \emph{one} $\mu$-abstraction, and then begin to collect
-the outer-most continuation and bindings of the computation:
+the outer-most frames of the computation:
 \begin{align*}
-  Seq\trans{\expr_1 ~ \expr_2} \ko
+  Seq\trans{\expr_1 ~ \expr_2} \vect[n]{\frm_n}  ~ \ko
   &=
-  Seq\trans{\expr_1} (\app{Seq\trans{\expr_2}}{\ko})
+  Seq\trans{\expr_1} (\appto{Seq\trans{\expr_2}};\vect[n]{\frm_n}) ~ \ko
   \\[1ex]
-  Seq\trans{\Let \abind \In \expr} \ko
+  Seq\trans{\Let \abind \In \expr} \vect[n]{\frm_n} ~ \ko
   &=
-  \Let Seq\trans{\abind} \In Seq\trans{\expr} \ko
+  \Let Seq\trans{\abind} \In Seq\trans{\expr} \vect[n]{\frm_n} ~ \ko
   \\
   \Where
     BV(\abind) &\notin FV(\ko)
   \\[1ex]
-  Seq\trans{\Case \expr \As \ann{x}{\ty} \Of \vect[n]{\analt_n}} \ko
+  Seq\trans{
+  \begin{aligned}
+   &\Case \expr \As \ann{x}{\ty} \Of
+   \\
+   &\qquad
+   \vect[m]{\analt_m} 
+  \end{aligned}
+  }
+  \vect[n]{\frm_n} ~ \ko
   &=
-  Seq\trans{\expr} (\caseas{\ann{x}{\ty}}{\vect[n]{Core\trans{\analt_n} \ko}})
-  \\
-  \Where
-  \ko &\text{ is small }
-  \\
-  Seq\trans{\Case \expr \As \ann{x}{\ty} \Of \vect[n]{\analt_n}} \ko
-  &=
-  \cut
-    {\comp{\ann{r}{\ty'}}
-      Seq\trans{\expr}
-      (\caseas{\ann{x}{\ty}}{\vect[n]{Core\trans{\analt_n} r}})
-    }
-    {\ko}
-  \\
-  \Where
-  \ko &:\ty' \text{ is large }
+  \Braket
+    { \comp{\ann{r}{\ty'}} Seq\trans{\expr} \mt ~ \ko'
+    | \vect[n]{\frm_n}
+    | \ko }
+  \\ &
+  \Where{}
+    \ko' =
+       \begin{aligned}[t]
+         &
+         \Case \As \ann{x}{\ty} \Of
+         \\
+         &\qquad
+         \vect[m]{Core\trans{\analt_m} \mt ~ (\ret r)}
+       \end{aligned}
+  \\ & \phantom{\Where{}}
+    (\Case \expr \As \ann{x}{\ty} \Of \vect[n]{\analt_n}) : \ty'
   \\[1ex]
-  Seq\trans{\coerce{\expr}{\cn}} \ko
+  Seq\trans{\coerce{\expr}{\cn}} \vect[n]{\frm_n} ~ \ko
   &=
-  Seq\trans{\expr} (\koerce{\cn}{\ko})
+  Seq\trans{\expr} (\castby{\cn} \then \vect[n]{\frm_n}) ~ \ko
   \\[1ex]
-  Seq\trans{\expr} \ko
+  Seq\trans{\expr} \vect[n]{\frm_n} \ko
   &=
-  \cut{Seq\trans{\expr}}{\ko}
+  \braket{Seq\trans{\expr} | \vect[n]{\frm_n} | \ko}
   \qquad
   \Where
     \expr \text{ is an apparent value }
@@ -1571,24 +1586,24 @@ we begin expecting the resulting expression to be computation-like:
   \rec{\vect[n]{\bindv{\ann{x_n}{\ty_n}}{Seq\trans{\expr_n}}}}
 \end{align*}
 \begin{align*}
-  Seq\trans{\blank \to \expr} \ko
+  Seq\trans{\blank \to \expr} \vect[n]{\frm_n} ~ \ko
   &=
-  \blank \to Seq\trans{\expr} \ko
+  \blank \to Seq\trans{\expr} \vect[n]{\frm_n} ~ \ko
   \\
-  Seq\trans{K ~ \vect[n]{\ann{x_n}{\ty_n}} \to \expr} \ko
+  Seq\trans{K ~ \vect[n]{\ann{x_n}{\ty_n}} \to \expr} \vect[n]{\frm_n} ~ \ko
   &=
-  K ~ \vect[n]{\ann{x_n}{\ty_n}}
+  K ~ \vect[m]{\ann{x_m}{\ty_m}}
   \to
-  Seq\trans{\expr} \ko
+  Seq\trans{\expr} \vect[n]{\frm_n} ~ \ko
   \\
-  Seq\trans{\lit \to \expr} \ko
+  Seq\trans{\lit \to \expr} \vect[n]{\frm_n} ~ \ko
   &=
-  \lit \to Seq\trans{\expr} \ko
+  \lit \to Seq\trans{\expr} \vect[n]{\frm_n} ~ \ko
 \end{align*}
 \begin{align*}
-  Seq\trans{\vect[n]{\decl_n}; \expr}{r}
+  Seq\trans{\vect[n]{\decl_n}; \expr}_{r}
   &=
-  \vect[n]{\decl_n}; Seq\trans{\expr} r
+  \vect[n]{\decl_n}; Seq\trans{\expr} \mt ~ (\ret r)
 \end{align*}
 
 \subsection{From Sequent Core to Core}
@@ -1618,30 +1633,38 @@ $Core\trans{\cmd}_{r}$:
   &=
   \Let Core\trans{\abind}_{r} \In Core\trans{\cmd}_{r}
   \\
-  Core\trans{\cut{\tm}{\ko}}_{r}
+  Core\trans{\braket{\tm | \vect[n]{\frm_n} | \ko}}_{r}
   &=
-  Core\trans{\ko}_{r}[Core\trans{\tm}]
+  Core\trans{\ko}_{r}[\vect[n]{Core\trans{\frm_n}}[Core\trans{\tm}]]
   \\
   Core\trans{\jump{\vect[n]{\tm_n}}{j}}_{r}
   &=
   j ~ \vect[n]{Core\trans{\tm_n}}
 \end{align*}
-A $\Let$-binding translates to a $\Let$-binding, a command $\cut{v}{k}$
-translates to evaluating expression corresponding to the term $v$ inside the
-evaluation context corresponding to the continuation $k$, and a jump
-$\jump{\vect{v}}{j}$ translates to a tail function call (more on this later).
-The evaluation contexts corresponding to continuations which return their result
-on $r$ are given by $Core\trans{k}_{r}$:
+A $\Let$-binding translates to a $\Let$-binding, a command
+$\braket{\tm|\vect[n]{\frm_n}|\ko}$ translates to evaluating expression
+corresponding to the term $\tm$ inside the evaluation context corresponding to
+the frames $\vect[n]{\frm_n}$ and final continuation $\ko$, and a jump
+$\jump{\vect{\tm}}{j}$ translates to a tail function call (more on this later).
+The evaluation contexts corresponding to a single frame are given by
+$Core\trans{\frm}$:
+\begin{align*}
+  Core\trans{\appto{\tm}} &= \hole ~ Core\trans{\tm}
+  \\
+  Core \trans{\castby{\cn}} &= \coerce{\hole}{\cn}
+\end{align*}
+The evaluation contexts corresponding to final continuations which return their
+result on $r$ are given by $Core\trans{\ko}_{r}$:
 \begin{align*}
   Core\trans{\ret r}_{r} &= \hole
-  \\
-  Core\trans{\app{\tm}{\ko}}_{r}
-  &=
-  Core\trans{\ko}_{r}[\hole ~ Core\trans{\tm}]
-  \\
-  Core\trans{\koerce{\cn}{\ko}}_{r}
-  &=
-  Core\trans{\ko}_{r}[\coerce{\hole}{\cn}]
+  % \\
+  % Core\trans{\app{\tm}{\ko}}_{r}
+  % &=
+  % Core\trans{\ko}_{r}[\hole ~ Core\trans{\tm}]
+  % \\
+  % Core\trans{\koerce{\cn}{\ko}}_{r}
+  % &=
+  % Core\trans{\ko}_{r}[\coerce{\hole}{\cn}]
   \\
   Core\trans{\caseas{\ann x \ty}{\vect[n]{\analt_n}}}_{r}
   &=
@@ -1785,7 +1808,12 @@ example, suppose that $\cmd_0$ is:
 \begin{align*}
   \cmd_0
   &=
-  \cut{z}{\Case\Of \{ True \to \cut{K_1}{\app{5}{\app{10}{q}}}; False \to \cut{z'}{q} \}}
+  \cut
+  {z}
+  {\Case\Of \{
+    True \to \braket{K_1 | \appto{5} \then \appto{10} | \ret q};
+    False \to \cut{z'}{\ret q}
+  \}}
 \end{align*}
 Inlining for $q$ everywhere in $\cmd_0$ then corresponds to the case-of-case
 transformation performed by GHC on Core expressions.
@@ -1823,26 +1851,23 @@ role of the polyadic form of continuation, which is able to receive multiple
 inputs before running.  In our example, we would move $\cmd_1$ and $\cmd_2$ into
 a named, polyadic continuations:
 \begin{gather*}
-\begin{aligned}
-  v
-  &=
-  \comp{r}
+v = \comp{r}
+\begin{aligned}[t]
   &
-    \Let
-      p_1 &= \fnk{\pack{x}{y}} \cmd_1;
+  \Let
+  \begin{aligned}[t]
+    j_1 &= \fnk{x ~ y} \cmd_1
+    \\
+    j_2 &= \fnk{} \cmd_2
+    \\
+    q &= \Case\Of \{
+    K_1 ~ x ~ y \to \jump{x ~ y}{j_1};
+    K_2 \to \jump{}{j_2}
+    \} 
+  \end{aligned}
   \\
-  &&
-      p_2 &= \fnk{\packs{}{}} \cmd_2;
-  \\
-  &&
-      q &= \Case\Of \{
-          K_1 ~ x ~ y \to \cut{\pack{x}{y}}{p_1};
-          K_2 \to \cut{\packs{}{}}{p_2}
-          \}
-  \\
-  &&
-    \In
-    \cmd_0
+  &
+  \In \cmd_0
 \end{aligned}
 \end{gather*}
 Now, $q$ stands for a small continuation, and so it can be inlined much more
@@ -1851,11 +1876,11 @@ $\cmd_0$:
 \begin{align*}
   \cmd_0
   &=
-  \cut{z}{\Case\Of \{ True \to \cut{\pack{5}{10}}{p_1}; False \to \cut{z'}{q} \}}
+  \cut{z}{\Case\Of \{ True \to \jump{5 ~ 10}{j_1}; False \to \cut{z'}{\ret q} \}}
 \end{align*}
 which avoids duplicating $\cmd_1$ at all.
 
-\subsection{Polymorphic-polyadic continuations and the existential stack}
+\subsection{Parameterized continuations and the existential stack}
 
 Due to the fact that some constructors to data types contain existentially
 quantified types, it is important that we be able to abstract over a command
@@ -1867,20 +1892,20 @@ represent these polymorphic continuations and continuations expecting multiple
 inputs as an uncurried $\lambda$-abstraction.  However, there are multiple other
 design choices which are possible for this purpose:
 \begin{itemize}
-\item Unboxed tuples: Morally, the stack $\pack{1}{\pack{2}{3}}$ for a polyadic
-  continuation is the same as the unboxed tuple $(\# 1, 2, 3 \#)$.  Why then do
-  we bother to introduce a new form of term, and a new type, instead of just
-  using unboxed tuples for this purpose?  The reason is the above-mentioned
-  existentially-quantified types, which lie outside the form of unboxed tuples
-  supported by Core.  We cannot represent
-  $\packrets[\stackty{a:\star}{a, a, a}]{\pack{Int}{\pack{1}{\pack{2}{3}}}}$ as
-  an unboxed tuple.
+\item Unboxed tuples: Morally, the call stack stack
+  $\appto{1}\then\appto{2}\then\appto{3}$ dual to the unboxed tuple
+  $(\# 1, 2, 3 \#)$.  Why then do we bother to introduce a new form of term, and
+  a new type, instead of just using unboxed tuples for this purpose?  The reason
+  is the above-mentioned existentially-quantified types, which lie outside the
+  form of unboxed tuples supported by Core.  We cannot represent the stack
+  $\inst{Int}\then\appto{1}\then\appto{2}\then\appto{3}$ as an unboxed tuple.
 
-  As a minor advantage, having the special form for existential stacks lets us
-  (actually, requires us to) translate them back into Core as a calling context
-  rather than a value, so $\cut{\pack{1}{\pack{2}{3}}}{q}$ becomes $q ~ 1 ~ 2 ~ 3$
-  instead of $q (\# 1, 2, 3 \#)$.  This results in Core expressions for join
-  points looking closer to what the current GHC simplifier actually produces.
+  As a minor advantage, having the special form for existential stacks in a
+  jumping command lets us (actually, requires us to) translate them back into
+  Core as a calling context rather than a value, so $\jump{1 ~ 2 ~ 3}{j}$
+  becomes $j ~ 1 ~ 2 ~ 3$ instead of $j ~ (\# 1, 2, 3 \#)$.  This results in Core
+  expressions for join points looking closer to what the current GHC simplifier
+  actually produces.
 
 \item Curried vs uncurried: Currently, the continuations which accept
   existential stacks are written in a totally-uncurried form.  By listing all
@@ -1912,11 +1937,11 @@ design choices which are possible for this purpose:
 \item Case alternative: Instead of introducing a special new form of
   continuations for accepting existential stacks, we could also have added a
   form of case alternative for matching on the stack.  That way the special
-  continuations $\fnk{\packs{\vect{\ann a \ki}}{\vect{\ann x \ty}}}\cmd$ would
-  just be written as another form of case continuation
-  $\Case\Of{\packs{\ann a \ki}{\ann x \ty} \to \cmd}$.  This unification might
-  make sense following the story that existential stacks are just a sort of
-  unboxed data type that are not available in Core, so it makes sense that we
+  continuations $\fnk{\vect{\ann a \ki} ~ \vect{\ann x \ty}}\cmd$ would just be
+  written as another form of case continuation
+  $\Case\Of{\vect{\ann a \ki} ~ \vect{\ann x \ty} \to \cmd}$.  This unification
+  might make sense following the story that existential stacks are just a sort
+  of unboxed data type that are not available in Core, so it makes sense that we
   would pattern match on them.
 
   For now we don't fold continuations for existential stacks, but it is unclear
@@ -1926,6 +1951,78 @@ design choices which are possible for this purpose:
   alternative design in mind, to evaluate which of the two options would pan out
   better in practice.
 \end{itemize}
+
+\subsection{General continuation bindings}
+
+As part of the syntactically-enforced separation between ordinary continuations
+and parameterized ones, we removed the ability to $\Let$-bind ordinary
+continuations.  In practice, this means that bare case continuations and call
+stacks cannot be named and inlined selectively: given a case continuation
+$\Case\Of\alt{K_1 ~ x ~ y}{\cmd_1}{K_2}{\cmd_2}$, we must either inline it
+everywhere, or nowhere.
+
+The all-or-nothing inlining of ordinary continuations is ameliorated by the fact
+that they can always be made ``small'' using parameterized continuations.  For
+example, we always shrink the case continuation appearing in
+\begin{align*}
+  \cut{\comp{q}\cmd_0}{\Case\Of\alt{K_1 ~ x ~ y}{\cmd_1};\alt{K_2}{\cmd_2}}
+\end{align*}
+by moving the bodies of its alternatives into $\Let$-bound parameterized
+continuations
+\begin{align*}
+  &\Let
+    \begin{aligned}[t]
+      \Cont j_1 &= \fnk{x ~ y} \cmd_1
+      \\
+      \Cont j_2 &= \fnk{} \cmd_2
+    \end{aligned}
+  \\
+  &\In
+    \cut{\comp{q}\cmd_0}{\Case\Of\alt{K_1 ~ x ~ y}{\jump{x~y}{j_1}};\alt{K_2}{\jump{}{j_2}}}
+\end{align*}
+and then inline for $q$ everywhere in $\cmd_0$.  Similarly, we can always shrink
+the call stack appearing in
+\begin{align*}
+  \braket{\comp{q}\cmd_0 | \appto{\tm_1} \then \appto{\tm_2} | \ret r}
+\end{align*}
+by moving the arguments into $\Let$-bindings
+\begin{align*}
+  &\Let
+    \begin{aligned}[t]
+      \Val x_1 &= \tm_1
+      \\
+      \Val x_2 &= \tm_2
+    \end{aligned}
+  \\
+  &\In
+    \braket{\comp{q}\cmd_0 | \appto{x_1} \then \appto{x_2} | \ret q}
+\end{align*}
+Thus, every combination of frame stack and final continuation can be shrunk into
+something small enough to be duplicated without significantly increasing the
+code size.
+
+A bit more fine-grained of a solution is to wrap up the entire continuation
+inside of a $\Let$-bound, parameterized continuation.  That way, the case
+statement and call stack themselves can be selectively inlined, perhaps using
+the shrinking process described above as well.  To replace the original
+continuation in the command, we would need to use the strict input continuation
+form, $\letin{x}\cmd$, which just immediately delegates to the parameterized
+continuation.  So we could turn the command
+\begin{align*}
+  \braket{\comp{q}\cmd_0 | \vect[n]{\frm_n} | \ko}
+\end{align*}
+into one where $\vect[n]{\frm_n} \then \ko$ is given a name,
+\begin{align*}
+  &\Let
+    \begin{aligned}[t]
+      \Cont j &= \fnk{x}\braket{x | \vect[n]{\frm_n} | \ko}
+    \end{aligned}
+  \\
+  &\In
+    \cut{\comp{q}\cmd_0}{\letin{x}\jump{x}{j}}
+\end{align*}
+This double-wrapping does introduce some new indirections, though, which could
+be undesirable for rewriting.
 
 \subsection{Continuation-closed terms}
 
