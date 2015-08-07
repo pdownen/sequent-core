@@ -13,7 +13,9 @@
 
 module Language.SequentCore.Simpl (plugin) where
 
+import Language.SequentCore.Arity
 import Language.SequentCore.Lint
+import Language.SequentCore.OccurAnal
 import Language.SequentCore.Pretty (pprTopLevelBinds)
 import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Simpl.Monad
@@ -28,21 +30,25 @@ import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      CoreM, defaultPlugin, reinitializeGlobals,
                      isZeroSimplCount, pprSimplCount, putMsg, errorMsg
                    )
-import CoreSyn     ( isRuntimeVar, isCheapUnfolding )
+import CoreSubst   ( deShadowBinds )
+import CoreSyn     ( CoreVect(..), isRuntimeVar, isCheapUnfolding, isConLikeUnfolding )
 import CoreUnfold  ( smallEnoughToInline )
-import DataCon
 import DynFlags    ( DynFlags, gopt, GeneralFlag(..), ufKeenessFactor, ufUseThreshold )
 import FastString
 import Id
-import HscTypes    ( ModGuts(..) )
-import Literal     ( Literal, litIsDupable )
+import IdInfo      ( IdInfo, demandInfo, strictnessInfo, vanillaIdInfo,
+                     setArityInfo, setDemandInfo, setStrictnessInfo )
+import HscTypes    ( ModGuts(..), VectInfo(..) )
+import Literal     ( litIsDupable )
+import Maybes      ( whenIsJust )
 import MonadUtils
-import OccurAnal   ( occurAnalysePgm )
+import Name        ( mkSystemVarName )
 import Outputable
 import Pair
 import qualified PprCore as Core
-import Type        ( Type, funResultTy, isUnLiftedType, mkTyVarTy )
+import Type        ( Type, applyTy, funResultTy, isUnLiftedType, mkTyVarTy )
 import TysWiredIn  ( mkTupleTy )
+import UniqSupply
 import Var
 import VarEnv
 import VarSet
@@ -50,7 +56,7 @@ import VarSet
 import Control.Exception   ( assert )
 import Control.Monad       ( foldM, forM, when )
 
-import Data.Maybe          ( isJust )
+import Data.Maybe          ( catMaybes, isJust, mapMaybe )
 
 tracing, dumping, linting :: Bool
 tracing = False
@@ -80,59 +86,89 @@ plugin = defaultPlugin {
 
 runSimplifier :: Int -> SimplifierMode -> ModGuts -> CoreM ModGuts
 runSimplifier iters mode guts
-  = go 1 guts
+  = do
+    when (tracing || dumping) $ putMsg  $ text "RUNNING SEQUENT CORE SIMPLIFIER"
+                                       $$ text "Mode:" <+> ppr mode
+    -- FIXME deShadowBinds is a crutch - type variable shadowing causes bugs
+    let coreBinds = deShadowBinds (mg_binds guts)
+        binds = fromCoreModule coreBinds
+    when dumping $ putMsg  $ text "INITIAL CORE"
+                          $$ text "------------"
+                          $$ Core.pprCoreBindings coreBinds
+    when (dumping && not (null rules)) $
+      putMsg  $ text "CORE RULES"
+             $$ text "----------"
+             $$ ppr rules
+    when linting $ whenIsJust (lintCoreBindings binds) $ \err ->
+      pprPgmError "Sequent Core Lint error (pre-simpl)"
+        (withPprStyle defaultUserStyle $ err
+                                      $$ pprTopLevelBinds binds 
+                                      $$ text "--- Original Core: ---"
+                                      $$ Core.pprCoreBindings coreBinds)
+    binds' <- go 1 binds
+    let coreBinds' = bindsToCore binds'
+    when dumping $ putMsg  $ text "FINAL CORE"
+                          $$ text "----------"
+                          $$ Core.pprCoreBindings coreBinds'
+    return $ guts { mg_binds = coreBinds' }
   where
-    go n guts
+    rules = mg_rules guts
+
+    go n binds
       | n > iters
       = do
         errorMsg  $  text "Ran out of gas after"
                  <+> int iters
                  <+> text "iterations."
-        return guts
+        return binds
       | otherwise
       = do
-        let globalEnv = SimplGlobalEnv { sg_mode = mode }
-            mod       = mg_module guts
-            coreBinds = mg_binds guts
-            occBinds  = runOccurAnal mod coreBinds
-            binds     = fromCoreModule occBinds
-        when linting $ case lintCoreBindings binds of
-          Just err -> pprPgmError "Sequent Core Lint error (pre-simpl)"
-            (withPprStyle defaultUserStyle $ err $$ pprTopLevelBinds binds $$ Core.pprCoreBindings occBinds)
-          Nothing -> return ()
+        dflags <- getDynFlags
+        let mod       = mg_module guts
+            vectVars  = mkVarSet $
+                          catMaybes [ fmap snd $ lookupVarEnv (vectInfoVar (mg_vect_info guts)) bndr
+                                    | Vect bndr _ <- mg_vect_decls guts]
+                          ++
+                          catMaybes [ fmap snd $ lookupVarEnv (vectInfoVar (mg_vect_info guts)) bndr
+                                    | bndr <- bindersOfBinds binds]
+                                    -- FIXME: This second comprehensions is only needed as long as we
+                                    --        have vectorised bindings where we get "Could NOT call
+                                    --        vectorised from original version".
+            (maybeVects, maybeVectVars)
+                      = case sm_phase mode of
+                          InitialPhase -> (mg_vect_decls guts, vectVars)
+                          _            -> ([], vectVars)
+            env = initialEnv dflags mode
+            occBinds = runOccurAnal env mod maybeVects maybeVectVars binds
         when dumping $ putMsg  $ text "BEFORE" <+> int n
-                              $$ text "--------" $$ pprTopLevelBinds binds
-        (binds', count) <- runSimplM globalEnv $ simplModule binds
-        when linting $ case lintCoreBindings binds' of
-          Just err -> pprPanic "Sequent Core Lint error"
+                              $$ text "--------" $$ pprTopLevelBinds occBinds
+        when linting $ whenIsJust (lintCoreBindings occBinds) $ \err ->
+          pprPanic "Sequent Core Lint error (in occurrence analysis)"
+            (withPprStyle defaultUserStyle $ err)
+        (binds', count) <- runSimplM $ simplModule env occBinds
+        when linting $ whenIsJust (lintCoreBindings binds') $ \err ->
+          pprPanic "Sequent Core Lint error"
             (withPprStyle defaultUserStyle $ err $$ pprTopLevelBinds binds')
-          Nothing -> return ()
-        when dumping $ putMsg  $ text "AFTER" <+> int n
-                              $$ text "-------" $$ pprTopLevelBinds binds'
-        let coreBinds' = bindsToCore binds'
-            guts'      = guts { mg_binds = coreBinds' }
         when dumping $ putMsg  $ text "SUMMARY" <+> int n
-                              $$ text "---------" $$ pprSimplCount count
-                              $$ text "CORE AFTER" <+> int n
-                              $$ text "------------" $$ ppr coreBinds'
+                              $$ text "---------"
+                              $$ pprSimplCount count
+                              $$ text "AFTER" <+> int n
+                              $$ text "-------"
+                              $$ pprTopLevelBinds binds'
         if isZeroSimplCount count
           then do
             when tracing $ putMsg  $  text "Done after"
                                   <+> int n <+> text "iterations"
-            return guts'
-          else go (n+1) guts'
-    runOccurAnal mod core
-      = let isRuleActive = const False
-            rules        = []
-            vects        = []
-            vectVars     = emptyVarSet
-        in occurAnalysePgm mod isRuleActive rules vects vectVars core
+            return binds'
+          else go (n+1) binds'
+    runOccurAnal env mod vects vectVars binds
+      = let isRuleActive = activeRule env
+        in occurAnalysePgm mod isRuleActive rules vects vectVars binds
 
-simplModule :: [InBind] -> SimplM [OutBind]
-simplModule binds
+simplModule :: SimplEnv -> [InBind] -> SimplM [OutBind]
+simplModule env binds
   = do
-    dflags <- getDynFlags
-    finalEnv <- simplBinds (initialEnv dflags) binds TopLevel
+    finalEnv <- simplBinds env binds TopLevel
     freeTick SimplifierDone
     return $ getFloatBinds (getFloats finalEnv)
 
@@ -153,12 +189,17 @@ simplCommand env (Let bind comm)
   = do
     env' <- simplBind env bind NotTopLevel
     simplCommand env' comm
-simplCommand env (Eval term kont)
-  = simplCut env term (staticPart env) kont
+simplCommand env (Eval term (Kont fs end))
+  = simplCut env term (staticPart env) fs end
 simplCommand env (Jump args j)
   = simplJump env args j
 
 simplTermNoFloats :: SimplEnv -> InTerm -> SimplM OutTerm
+simplTermNoFloats env (Compute p comm)
+  = do
+    let (env', p') = enterScope env p
+    comm' <- simplCommandNoFloats env' comm
+    return $ mkCompute p' comm'
 simplTermNoFloats env term
   = do
     (env', term') <- simplTerm (zapFloats env) term
@@ -181,7 +222,7 @@ simplTerm env v
   = do
     (env', p) <- mkFreshKontId env (fsLit "*termk") ty
     let env'' = zapFloats env'
-    (env''', comm) <- simplCut env'' v (staticPart env'') (Return p)
+    (env''', comm) <- simplCut env'' v (staticPart env'') [] (Return p)
     return (env, mkCompute p (wrapFloats env''' comm))
   where ty = substTy env (termType v)
 
@@ -241,14 +282,117 @@ simplLazyBind env_x x x' env_v v level recFlag
         -- TODO Handle floating type lambdas
         let env_v' = zapFloats (env_v `inDynamicScope` env_x)
         (env_v'', v') <- simplTerm env_v' v
-        -- TODO Something like Simplify.prepareRhs
-        (env_x', v'')
-          <- if not (doFloatFromRhs level recFlag False v' env_v')
-                then do v'' <- wrapFloatsAroundTerm env_v'' v'
-                        return (env_x, v'')
+        (env_v_final, v'') <- prepareRhsTerm env_v'' level x' v'
+        (env_x', v''')
+          <- if not (doFloatFromRhs level recFlag False v'' env_v_final)
+                then do v''' <- wrapFloatsAroundTerm env_v_final v''
+                        return (env_x, v''')
                 else do tick LetFloatFromLet
-                        return (env_x `addFloats` env_v'', v')
-        completeBind env_x' x x' (Left v'') level
+                        return (env_x `addFloats` env_v_final, v'')
+        completeBind env_x' x x' (Left v''') level
+
+prepareRhsTerm :: SimplEnv -> TopLevelFlag -> OutId -> OutTerm
+               -> SimplM (SimplEnv, OutTerm)
+prepareRhsTerm env _ _ v
+  | isTrivialTerm v
+  = return (env, v)
+prepareRhsTerm env level x (Compute p comm)
+  = do
+    (env', term') <- prepComm env comm
+    return (env', term')
+  where
+    prepComm env (Eval term (Kont fs (Return p')))
+      = assert (p == p') $ do
+        (_isExp, env', fs', co_maybe) <- go (0 :: Int) fs
+        case co_maybe of
+          Just co -> do
+                     let Pair fromTy _toTy = coercionKind co
+                     -- Don't use mkFreshKontId here because it sets the current continuation
+                     (env'', q) <- mkFreshVar env' (fsLit "*castk") (mkKontTy fromTy)
+                     (env''', x') <- mkFreshVar env'' (fsLit "ca") (kontTyArg (idType q))
+                     -- x' shares its strictness and demand info with x, since
+                     -- x only adds a cast to x'
+                     let info = idInfo x
+                         sanitizedInfo = vanillaIdInfo `setStrictnessInfo` strictnessInfo info
+                                                       `setDemandInfo` demandInfo info
+                         x'_final = x' `setIdInfo` sanitizedInfo
+                         x'_rhs = Compute q (Eval term (Kont fs' (Return q)))
+                     if isTrivialTerm x'_rhs
+                       then -- No sense turning one trivial term into two, as
+                            -- the simplifier will just end up substituting one
+                            -- into the other and keep on looping
+                            return (env', Compute p (Eval term (Kont fs' (Return p))))
+                       else do
+                            env'''' <- completeNonRecTerm env''' False x'_final x'_final x'_rhs level
+                            x'_final_value <- simplVar env'''' x'_final
+                            return (env'''', Compute p (Eval x'_final_value (Kont [Cast co] (Return p))))
+          Nothing -> return (env', Compute p (Eval term (Kont fs' (Return p))))
+      where
+        -- The possibility of a coercion split makes all of this tricky. Suppose
+        -- we have
+        --
+        --   let x = compute (p :: Cont# b). < v | ... `cast` (g :: a ~ b); ret p >
+        --
+        -- where the ellipses indicate some arguments and inner coercions. We're
+        -- going to want to split this in two:
+        --   
+        --   let x' = compute (q :: Cont# a). < v | ... ret q >
+        --       x  = compute (p :: Cont# b). < x' | `cast` (g :: a ~ b); ret p >
+        --
+        -- Now we get to inline x everywhere and hope to find more redexes (see
+        -- Note [Float coercions] in GHC Simplify.lhs).
+        -- 
+        -- Whether or not we do the split, the arguments in the ellipses will
+        -- get ANF'd if we learn that this is an expandable application (a PAP
+        -- or application of a constructor or CONLIKE function).
+        --
+        -- The protocol: go nValArgs kont takes the number of value args seen
+        -- so far and the remaining continuation. It returns:
+        --
+        --   * True iff it turns out this is an expandable application
+        --   * An updated environment, perhaps with some new bindings floated
+        --   * A function representing the new continuation, but perhaps without
+        --     the Return (in the sense that a difference list is a list without
+        --     its end). This is represented as the ellipses above. If we do a
+        --     coercion split, this will end up in the new binding; otherwise,
+        --     it will stay in the original one.
+        --   * The top-level coercion, if we're doing a coercion split.
+        -- 
+        -- TODO It would be easier to pass everything downward instead,
+        -- employing a bit of knot-tying for the Bool, but for some reason
+        -- there's no MonadFix CoreM, so we can't write MonadFix SimplM.
+        go :: Int -> [OutFrame] -> SimplM (Bool, SimplEnv, [OutFrame], Maybe Coercion)
+        go nValArgs (App (Type ty) : fs)
+          = prepending (App (Type ty)) $ go nValArgs fs
+        go nValArgs (App arg : fs)
+          = do
+            (isExp, env', fs', split) <- go (nValArgs+1) fs
+            if isExp
+              then do
+                   (env'', arg') <- makeTrivial level env' arg
+                   return (True,  env'', App arg' : fs', split)
+              else return (False, env',  App arg  : fs', split)
+        go nValArgs [Cast co]
+          | let Pair fromTy _toTy = coercionKind co
+          , not (isUnLiftedType fromTy) -- Don't coercion-split on unlifted type
+          = return (isExpFor nValArgs, env, [], Just co)
+        go nValArgs (Cast co : fs)
+          = prepending (Cast co) $ go nValArgs fs
+        go nValArgs []
+          = return (isExpFor nValArgs, env, [], Nothing)
+        go _ _
+          = return (False, env, [], Nothing)
+        
+        isExpFor nValArgs
+          | Var f <- term = isExpandableApp f nValArgs
+          | otherwise     = False
+        
+        prepending f m
+          = do { (isExp, env', fs, split) <- m; return (isExp, env', f : fs, split) }
+    prepComm env comm
+      = return (env, Compute p comm)
+prepareRhsTerm env _ _ term
+  = return (env, term)
 
 simplNonRecPKont :: SimplEnv -> InPKontId -> StaticEnv -> InPKont -> SimplM SimplEnv
 simplNonRecPKont env_j j env_pk pk
@@ -273,67 +417,173 @@ simplPKontBind env_j j j' env_pk pk _recFlag
             env' = extendPvSubst env_j j rhs
         return env'
       else do
-        -- TODO Handle floating type lambdas
-        let PKont xs comm = pk
-            env_pk' = zapFloats (env_pk `inDynamicScope` env_j)
-            (env_pk'', xs') = enterScopes env_pk' xs
-        (env_with_floats, comm') <- simplCommand env_pk'' comm
-        -- TODO Something like Simplify.prepareRhs
-        env_j'
-          <- if isEmptyFloats env_with_floats
-                then return env_j
-                else do tick LetFloatFromLet -- Can always float through a cont binding
-                        return $ env_j `addFloats` env_with_floats
+        (env_j', xs', comm') <-
+          case pk of
+            PKont [] comm -> do
+              -- No parameters, so we can float things out
+              let env_pk' = zapFloats (env_pk `inDynamicScope` env_j)
+              (env_with_floats, comm') <- simplCommand env_pk' comm
+              -- TODO Something like Simplify.prepareRhs
+              env_j'
+                <- if isEmptyFloats env_with_floats
+                      then return env_j
+                      else do tick LetFloatFromLet -- Can always float through a cont binding
+                              return $ env_j `addFloats` env_with_floats
+              return (env_j', [], comm')
+            PKont xs comm -> do
+              -- There are parameters, so no floating
+              let (env_pk', xs') = enterScopes (env_pk `inDynamicScope` env_j) xs
+              comm' <- simplCommandNoFloats env_pk' comm
+              return (env_j, xs', comm')
         completeBind env_j' j j' (Right (PKont xs' comm')) NotTopLevel
 
-bindAsCurrentKont :: SimplEnv -> InKontId -> StaticEnv -> InKont -> SimplM SimplEnv
-bindAsCurrentKont env_p p env_k k
-  = let (env_p', _) = enterScope env_p p
-    in return env_p' { se_retKont = Just (Susp env_k k) }
+-- | Bind a continuation as the current one (as bound by a Compute). Unlike with
+-- simplLazyBind and simplPKontBind, here we *have* to substitute (that is,
+-- either pre-inline or post-inline) since we can't give a continuation a
+-- let binding.
+simplKontBind :: SimplEnv -> InKontId -> StaticEnv -> InKont -> SimplM SimplEnv
+simplKontBind env_p p env_k k
+  | tracing
+  , pprTraceShort "simplKontBind" (pprBndr LetBind p $$ ppr k) False
+  = undefined
+  | preInline
+  = do
+    tick $ PreInlineUnconditionally p
+    return env_p' { se_retKont = Just (Susp env_k k) }
+  | otherwise
+  = do
+    tick $ PostInlineUnconditionally p
+    (env_k', k') <- mkDupableKont (zapFloats (env_k `inDynamicScope` env_p'))
+                                  (kontTyArg (substTy env_p (idType p)))
+                                  k
+    return (env_p' `addFloats` env_k') { se_retKont = Just (Done k') }
+  where
+    (env_p', _) = enterScope env_p p -- ignore cloned p because we're
+                                     -- substituting anyway
+    
+    -- Pre-inline (i.e. substitute whole rather than making it dupable first)
+    -- whenever 
+    preInline
+      = case idOccInfo p of
+          OneOcc _ notInBranch _ -> notInBranch
+          other                  -> warnPprTrace True __FILE__ __LINE__
+                                    (text "weird OccInfo for cont var"
+                                      <+> ppr p <> colon <+> ppr other)
+                                    False
+
+{-
+Note [Wrap around compute]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Suppose we have floats F and we wrap around a term (compute p. c), that is, we
+calculate
+
+F[compute p. c].
+
+Remembering that terms are continuation-closed, we know two things:
+
+1. Any continuations let-bound in F will be dead bindings, and
+2. Any terms bound in F can float into c.
+
+We are safe, then, in saying
+
+F[compute p. c] = compute p. F'[c],
+
+where F' contains only the term bindings from F. Of course, if a binding *is*
+trying to float up past a compute, something has gone very wrong, so we check
+for this condition and warn.
+-}
 
 wrapFloatsAroundTerm :: SimplEnv -> OutTerm -> SimplM OutTerm
 wrapFloatsAroundTerm env term
   | isEmptyFloats env
   = return term
-  | otherwise
+wrapFloatsAroundTerm env (Compute p comm)
+  -- See Note [Wrap around compute]
+  = warnPprTrace (not $ hasNoKontFloats env) __FILE__ __LINE__
+      (text "cont floats escaping body of command:" <+> ppr comm $$
+       text "floats:" <+> brackets (pprWithCommas (ppr . bindersOf)
+                                                  (getFloatBinds (getFloats env)))) $
+    return $ Compute p (wrapFloats (zapKontFloats env) comm)
+wrapFloatsAroundTerm env term
   = do
     let ty = termType term
     (env', k) <- mkFreshKontId env (fsLit "*wrap") ty
-    return $ mkCompute k $ wrapFloats env' (mkCommand [] term (Return k))
+    return $ mkCompute k $ wrapFloats env' (mkCommand [] term (Kont [] (Return k)))
 
-completeNonRec :: SimplEnv -> InVar -> OutVar -> OutRhs
+completeNonRecTerm :: SimplEnv -> Bool -> InVar -> OutVar -> OutTerm
                -> TopLevelFlag -> SimplM SimplEnv
--- TODO Something like Simplify.prepareRhs
-completeNonRec = completeBind
+completeNonRecTerm env is_strict old_bndr new_bndr new_rhs top_lvl
+ = do  { (env1, rhs1) <- prepareRhsTerm (zapFloats env) top_lvl new_bndr new_rhs
+       ; (env2, rhs2) <-
+               if doFloatFromRhs NotTopLevel NonRecursive is_strict rhs1 env1
+               then do { tick LetFloatFromLet
+                       ; return (addFloats env env1, rhs1) }     -- Add the floats to the main env
+               else do { rhs1' <- wrapFloatsAroundTerm env1 rhs1 -- Wrap the floats around the RHS
+                       ; return (env, rhs1') }
+       ; completeBind env2 old_bndr new_bndr (Left rhs2) NotTopLevel }
 
 completeBind :: SimplEnv -> InVar -> OutVar -> OutRhs
              -> TopLevelFlag -> SimplM SimplEnv
 completeBind env x x' v level
   = do
-    postInline <- postInlineUnconditionally env (mkBindPair x v) level
+    (newArity, v') <- tryEtaExpandRhs env x' v
+    postInline <- postInlineUnconditionally env (mkBindPair x v') level
     if postInline
       then do
         tick (PostInlineUnconditionally x)
-        -- Nevermind about substituting x' for x; we'll substitute v instead
-        return $ either (extendIdSubst env x . Done) (extendPvSubst env x . Done) v
+        -- Nevermind about substituting x' for x; we'll substitute v' instead
+        return $ either (extendIdSubst env x . Done) (extendPvSubst env x . Done) v'
       else do
-        -- TODO Eta-expansion goes here
-        def <- mkDef env level v
-        let (env', x'') = setDef env (x' `setIdInfo` idInfo x) def
+        def <- mkDef env level v'
+        let info' = idInfo x `setArityInfo` newArity
+            (env', x'') = setDef env (x' `setIdInfo` info') def
         when tracing $ liftCoreM $ putMsg (text "defined" <+> ppr x'' <+> equals <+> ppr def)
-        return $ addNonRecFloat env' (mkBindPair x'' v)
+        return $ addNonRecFloat env' (mkBindPair x'' v')
 
 mkDef :: SimplEnv -> TopLevelFlag -> OutRhs -> SimplM Definition
-mkDef _env level rhs
+mkDef env level rhs
   = do
     dflags <- getDynFlags
-    -- FIXME Be smarter about this! Sometimes we want a BoundToDFun!
-    -- Currently this is causing a lot of dictionaries to fail to inline
-    -- at obviously desirable times.
-    -- See simplUnfolding in Simplify
+    -- FIXME Make a BoundToDFun when possible
     return $ case rhs of
-               Left term -> mkBoundTo dflags term level
+               Left term -> mkBoundTo env dflags term (termArity term) level
                Right pkont -> mkBoundToPKont dflags pkont
+
+tryEtaExpandRhs :: SimplEnv -> OutId -> OutRhs -> SimplM (Arity, OutRhs)
+tryEtaExpandRhs env x (Left v)
+  = do (arity, v') <- tryEtaExpandRhsTerm env x v
+       return (arity, Left v')
+tryEtaExpandRhs _ _ (Right pk@(PKont xs _))
+  = return (length (filter isId xs), Right pk)
+
+tryEtaExpandRhsTerm :: SimplEnv -> OutId -> OutTerm -> SimplM (Arity, OutTerm)
+-- See Note [Eta-expanding at let bindings]
+-- and Note [Eta expansion to manifest arity]
+tryEtaExpandRhsTerm env bndr rhs
+  = do { dflags <- getDynFlags
+       ; (new_arity, new_rhs) <- try_expand dflags
+
+       ; warnPprTrace (new_arity < old_arity) __FILE__ __LINE__ (
+               (ptext (sLit "Arity decrease:") <+> (ppr bndr <+> ppr old_arity
+                <+> ppr new_arity) $$ ppr new_rhs) )
+                        -- Note [Arity decrease]
+         return (new_arity, new_rhs) }
+  where
+    try_expand dflags
+      | isTrivialTerm rhs
+      = return (termArity rhs, rhs)
+
+      | sm_eta_expand (getMode env)      -- Provided eta-expansion is on
+      , let new_arity = findRhsArity dflags bndr rhs old_arity
+      , new_arity > manifest_arity      -- And the curent manifest arity isn't enough
+      = do { tick (EtaExpansion bndr)
+           ; return (new_arity, etaExpand new_arity rhs) }
+      | otherwise
+      = return (manifest_arity, rhs)
+
+    manifest_arity = manifestArity rhs
+    old_arity  = idArity bndr
 
 -- Function named after that in GHC Simplify, so named for historical reasons it
 -- seems. Basically, do completeBind but don't post-inline or do anything but
@@ -367,74 +617,92 @@ simplRec env xvs level
 -- TODO Deal with casts. Should maybe take the active cast as an argument;
 -- indeed, it would make sense to think of a cut as involving a term, a
 -- continuation, *and* the coercion that proves they're compatible.
-simplCut :: SimplEnv -> InTerm -> StaticEnv -> InKont
+simplCut :: SimplEnv -> InTerm -> StaticEnv -> [InFrame] -> InEnd
                      -> SimplM (SimplEnv, OutCommand)
-simplCut env_v v env_k kont
+simplCut env_v v env_k fs end
   | tracing
   , pprTraceShort "simplCut" (
-      ppr env_v $$ ppr v $$ ppr env_k $$ ppr kont
+      ppr env_v $$ ppr v $$ ppr env_k $$ ppr (Kont fs end)
     ) False
   = undefined
-simplCut env_v v env_k (Return p)
+simplCut env_v v env_k [] (Return p)
   = case substKv (env_k `inDynamicScope` env_v) p of
-      DoneId p'     -> simplCut2 env_v v env_k (Return p')
-      Done k        -> simplCut2 env_v v (zapSubstEnvsStatic env_k) k
-      Susp env_k' k -> simplCut  env_v v env_k' k
-simplCut env_v v env_k k
-  = simplCut2 env_v v env_k k
+      DoneId p'      -> simplCut2 (p /= p') env_v v env_k [] (Return p')
+      Done k'        -> simplCut2 True  env_v v (zapSubstEnvsStatic env_k) fs' end'
+        where Kont fs' end' = k'
+      Susp env_k' k' -> simplCut        env_v v env_k' fs' end'
+        where Kont fs' end' = k'
+simplCut env_v v env_k fs end
+  = simplCut2 False env_v v env_k fs end
 
 -- Second phase of simplCut. Now, if the continuation is a variable, it has no
 -- substitution (it's a parameter). In other words, if it's a KontId, it's an
 -- OutKontId.
-simplCut2 :: SimplEnv -> InTerm -> StaticEnv -> InKont
-                      -> SimplM (SimplEnv, OutCommand)
-simplCut2 env_v (Var x) env_k kont
+simplCut2 :: Bool -> SimplEnv -> InTerm -> StaticEnv -> [InFrame] -> InEnd
+          -> SimplM (SimplEnv, OutCommand)
+simplCut2 verb env_v v env_k fs end
+  | tracing, verb
+  , pprTraceShort "simplCut2" (
+      ppr env_v $$ ppr v $$ ppr env_k $$ ppr (Kont fs end)
+    ) False
+  = undefined
+simplCut2 _ env_v (Var x) env_k fs end
   = case substId env_v x of
       DoneId x'
         -> do
-           term'_maybe <- callSiteInline env_v x' kont
+           let lone | App {} : _ <- fs = False
+                    | otherwise        = True
+           let term'_maybe = callSiteInline env_v x' (activeUnfolding env_v x')
+                                            lone (Kont fs end)
            case term'_maybe of
              Nothing
-               -> simplCut3 env_v (Var x') env_k kont
+               -> simplCut3 (x /= x') env_v (Var x') env_k fs end
              Just term'
                -> do
                   tick (UnfoldingDone x')
-                  simplCut2 (zapSubstEnvs env_v) term' env_k kont
+                  simplCut2 True (zapSubstEnvs env_v) term' env_k fs end
       Done v
         -- Term already simplified (then PostInlineUnconditionally'd), so
         -- don't do any substitutions when processing it again
-        -> simplCut3 (zapSubstEnvs env_v) v env_k kont
+        -> simplCut3 True (zapSubstEnvs env_v) v env_k fs end
       Susp stat v
-        -> simplCut2 (env_v `setStaticPart` stat) v env_k kont
-simplCut2 env_v term env_k kont
-  -- Proceed to phase 2
-  = simplCut3 env_v term env_k kont
+        -> simplCut2 True (env_v `setStaticPart` stat) v env_k fs end
+simplCut2 _ env_v term env_k fs end
+  -- Proceed to phase 3
+  = simplCut3 False env_v term env_k fs end
 
 -- Third phase of simplCut. Now, if the term is a variable, we looked it up
 -- and substituted it but decided not to inline it. (In other words, if it's an
 -- id, it's an OutId.)
-simplCut3 :: SimplEnv -> OutTerm -> StaticEnv -> InKont
-                      -> SimplM (SimplEnv, OutCommand)
-simplCut3 env_v (Type ty) _env_k kont
-  = assert (isReturnKont kont) $
+simplCut3 :: Bool -> SimplEnv -> OutTerm -> StaticEnv -> [InFrame] -> InEnd
+          -> SimplM (SimplEnv, OutCommand)
+simplCut3 verb env_v v env_k fs end
+  | tracing, verb
+  , pprTraceShort "simplCut3" (
+      ppr env_v $$ ppr v $$ ppr env_k $$ ppr (Kont fs end)
+    ) False
+  = undefined
+simplCut3 _ env_v (Type ty) _env_k fs end
+  = assert (null fs && isReturn end) $
     let ty' = substTy env_v ty
-    in return (env_v, Eval (Type ty') kont)
-simplCut3 env_v (Coercion co) _env_k kont
-  = assert (isReturnKont kont) $
+    in return (env_v, Eval (Type ty') (Kont fs end))
+simplCut3 _ env_v (Coercion co) _env_k fs end
+  = assert (null fs && isReturn end) $
     let co' = substCo env_v co
-    in return (env_v, Eval (Coercion co') kont)
-simplCut3 env_v (Lam x body) env_k (App arg kont)
+    in return (env_v, Eval (Coercion co') (Kont fs end))
+simplCut3 _ env_v (Lam x body) env_k (App arg : fs) end
   = do
     tick (BetaReduction x)
     env_v' <- simplNonRec env_v x env_k arg NotTopLevel
-    simplCut env_v' body env_k kont
-simplCut3 env_v (Lam x body) env_k kont
+    simplCut env_v' body env_k fs end
+simplCut3 _ env_v term@(Lam {}) env_k fs end
   = do
-    let (env_v', x') = enterScope env_v x
+    let (xs, body) = lambdas term
+        (env_v', xs') = enterScopes env_v xs
     body' <- simplTermNoFloats env_v' body
-    simplKontWith (env_v' `setStaticPart` env_k) (Lam x' body') kont
-simplCut3 env_v term env_k kont
-  | Just (value, Case x alts) <- splitValue term kont
+    simplKontWith (env_v' `setStaticPart` env_k) (mkLambdas xs' body') fs end
+simplCut3 _ env_v term env_k fs end
+  | Just (value, Kont [] (Case x alts)) <- splitValue term (Kont fs end)
   , Just (pairs, body) <- matchCase env_v value alts
   = do
     tick (KnownBranch x)
@@ -446,7 +714,7 @@ simplCut3 env_v term env_k kont
 
 -- Adapted from Simplify.rebuildCase (clause 2)
 -- See [Case elimination] in Simplify
-simplCut3 env_v term env_k (Case case_bndr [Alt _ bndrs rhs])
+simplCut3 _ env_v term env_k [] (Case case_bndr [Alt _ bndrs rhs])
  | all isDeadBinder bndrs       -- bndrs are [InId]
  
  , if isUnLiftedType (idType case_bndr)
@@ -507,14 +775,14 @@ simplCut3 env_v term env_k (Case case_bndr [Alt _ bndrs rhs])
       -- Could allow for let bindings,
       -- but the original code in Simplify suggests doing so would be expensive
 
-simplCut3 env_v (Compute p c) env_k kont
+simplCut3 _ env_v (Compute p c) env_k fs end
   = do
-    env_v' <- bindAsCurrentKont env_v p env_k kont
+    env_v' <- simplKontBind env_v p env_k (Kont fs end)
     simplCommand env_v' c
-simplCut3 env_v term@(Lit {}) env_k kont
-  = simplKontWith (env_v `setStaticPart` env_k) term kont
-simplCut3 env_v term@(Var {}) env_k kont
-  = simplKontWith (env_v `setStaticPart` env_k) term kont
+simplCut3 _ env_v term@(Lit {}) env_k fs end
+  = simplKontWith (env_v `setStaticPart` env_k) term fs end
+simplCut3 _ env_v term@(Var {}) env_k fs end
+  = simplKontWith (env_v `setStaticPart` env_k) term fs end
 
 -- TODO Somehow handle updating Definitions with NotAmong values?
 matchCase :: SimplEnv -> InValue -> [InAlt]
@@ -542,70 +810,60 @@ matchCase env_v value (_ : alts)
 matchCase _ _ []
   = Nothing
 
-simplKont :: SimplEnv -> InKont -> SimplM (SimplEnv, OutKont)
-simplKont env kont
+simplKont :: SimplEnv -> [InFrame] -> InEnd -> SimplM (SimplEnv, OutKont)
+simplKont env fs end
   | tracing
   , pprTraceShort "simplKont" (
-      ppr env $$ ppr kont
+      ppr env $$ ppr (Kont fs end)
     ) False
   = undefined
-simplKont env kont
-  = go env kont (\k -> k)
+simplKont env fs end
+  = go env fs end []
   where
-    go :: SimplEnv -> InKont -> (OutKont -> OutKont) -> SimplM (SimplEnv, OutKont)
-    go env kont _
+    go :: SimplEnv -> [InFrame] -> InEnd -> [OutFrame] -> SimplM (SimplEnv, OutKont)
+    go env fs end _
       | tracing
       , pprTraceShort "simplKont::go" (
-          ppr env $$ ppr kont
+          ppr env $$ ppr (Kont fs end)
         ) False
       = undefined
-    go env (App arg kont) kc
+    go env (App arg : fs) end fs'
       -- TODO Handle strict arguments differently? GHC detects whether arg is
       -- strict, but here we've lost that information.
       = do
         -- Don't float out of arguments (see Simplify.rebuildCall)
         arg' <- simplTermNoFloats env arg
-        go env kont (kc . App arg')
-    go env (Cast co kont) kc
+        go env fs end (App arg' : fs')
+    go env (Cast co : fs) end fs'
       = do
         co' <- simplCoercion env co
-        go env kont (kc . Cast co')
-    go env (Case x alts) kc
+        go env fs end (Cast co' : fs')
+    go env [] (Case x alts) fs'
       = do
-        env' <- case alts of
-                  -- We're about to fork the context, thus duplicating the return
-                  -- continuation, so now's when we make sure it's okay to duplicate it.
-                  (_:_:_) -> ensureRetKontDupable env
-                  _       -> return env
-        let (env'', x') = enterScope env' x
+        let (env', x') = enterScope env x
         -- FIXME The Nothing there could be the scrutinee, but we don't ever
         -- have access to it here.
-        alts' <- forM alts (simplAlt env'' Nothing [] x)
-        -- FIXME We're forgetting that we made the ret cont dupable! Can this
-        -- be a problem? (Maybe not: How can there be another reference to it if
-        -- we just split its scope for the first time?)
-        
-        -- Long-term solution is to have a sequent-aware occurrence analyser so
-        -- we can know from the start whether we need to duplicate a
-        -- continuation (the binder would say whether it's used in multiple
-        -- branches).
-        return (env `addFloats` env', kc (Case x' alts'))
-    go env (Tick ti kont) kc
-      = go env kont (kc . Tick ti)
-    go env (Return x) kc
-      -- TODO Consider call-site inline
+        alts' <- forM alts (simplAlt env' Nothing [] x')
+        done env fs' (Case x' alts')
+    go env (Tick ti : fs) end fs'
+      = go env fs end (Tick ti : fs')
+    go env [] (Return x) fs'
       = case substKv env x of
           DoneId x'
-            -> return (env, kc (Return x'))
-          Done k
-            -> go (zapSubstEnvs env) k kc
-          Susp stat k
-            -> go (env `setStaticPart` stat) k kc
+            -> done env fs' (Return x')
+          Done (Kont fs end)
+            -> go (zapSubstEnvs env) fs end fs'
+          Susp stat (Kont fs end)
+            -> go (env `setStaticPart` stat) fs end fs'
+    
+    done env' fs' end'
+      = return (env', Kont (reverse fs') end')
 
-simplKontWith :: SimplEnv -> OutTerm -> InKont -> SimplM (SimplEnv, OutCommand)
-simplKontWith env term kont
+simplKontWith :: SimplEnv -> OutTerm -> [InFrame] -> InEnd
+              -> SimplM (SimplEnv, OutCommand)
+simplKontWith env term fs end
   = do
-    (env', kont') <- simplKont env kont
+    (env', kont') <- simplKont env fs end
     return (env', mkCommand [] term kont')
 
 simplAlt :: SimplEnv -> Maybe OutValue -> [AltCon] -> OutId -> InAlt -> SimplM OutAlt
@@ -662,10 +920,10 @@ simplJump env args j
 -- Based on preInlineUnconditionally in SimplUtils; see comments there
 preInlineUnconditionally :: SimplEnv -> StaticEnv -> InBindPair
                          -> TopLevelFlag -> SimplM Bool
-preInlineUnconditionally _env_x _env_rhs pair level
+preInlineUnconditionally env_x _env_rhs pair level
   = do
-    ans <- go <$> getMode <*> getDynFlags
-    --liftCoreM $ putMsg $ "preInline" <+> ppr x <> colon <+> text (show ans))
+    ans <- go (getMode env_x) <$> getDynFlags
+    when tracing $ liftCoreM $ putMsg $ text "preInline" <+> ppr x <> colon <+> text (show ans)
     return ans
   where
     x = binderOfPair pair
@@ -704,10 +962,10 @@ preInlineUnconditionally _env_x _env_rhs pair level
 -- Based on postInlineUnconditionally in SimplUtils; see comments there
 postInlineUnconditionally :: SimplEnv -> OutBindPair -> TopLevelFlag
                           -> SimplM Bool
-postInlineUnconditionally _env pair level
+postInlineUnconditionally env pair level
   = do
-    ans <- go <$> getMode <*> getDynFlags
-    -- liftCoreM $ putMsg $ "postInline" <+> ppr x <> colon <+> text (show ans)
+    ans <- go (getMode env) <$> getDynFlags
+    when tracing $ liftCoreM $ putMsg $ text "postInline" <+> ppr (binderOfPair pair) <> colon <+> text (show ans)
     return ans
   where
     go mode dflags
@@ -731,153 +989,229 @@ postInlineUnconditionally _env pair level
         active = isActive (sm_phase mode) (idInlineActivation x)
         unfolding = idUnfolding x
 
--- Heavily based on section 7 of the Secrets paper (JFP version)
-callSiteInline :: SimplEnv -> InVar -> InKont
-               -> SimplM (Maybe OutTerm)
-callSiteInline env_v x kont
-  = do
-    ans <- go <$> getMode <*> getDynFlags
-    when tracing $ liftCoreM $ putMsg $ ans `seq`
-      hang (text "callSiteInline") 6 (pprBndr LetBind x <> colon
-        <+> (if isJust ans then text "YES" else text "NO") $$ ppr def)
-    return ans
+computeDiscount :: DynFlags -> Arity -> [Int] -> Int -> [ArgSummary] -> CallCtxt
+                -> Int
+computeDiscount dflags uf_arity arg_discounts res_discount arg_infos cont_info
+         -- We multiple the raw discounts (args_discount and result_discount)
+        -- ty opt_UnfoldingKeenessFactor because the former have to do with
+        --  *size* whereas the discounts imply that there's some extra 
+        --  *efficiency* to be gained (e.g. beta reductions, case reductions) 
+        -- by inlining.
+
+  = 10          -- Discount of 1 because the result replaces the call
+                -- so we count 1 for the function itself
+
+    + 10 * length (take uf_arity arg_infos)
+                  -- Discount of (un-scaled) 1 for each arg supplied, 
+                  -- because the result replaces the call
+
+    + round (ufKeenessFactor dflags *
+             fromIntegral (arg_discount + res_discount'))
   where
-    go _mode _dflags
-      | Just (BoundTo rhs level guid) <- def
-      , shouldInline env_v rhs (idOccInfo x) level guid kont
-      = Just rhs
-      | Just (BoundToDFun bndrs con args) <- def
-      = inlineDFun env_v bndrs con args kont
-      | otherwise
-      = Nothing
-    def = findDef env_v x
+    arg_discount = sum (zipWith mk_arg_discount arg_discounts arg_infos)
 
-shouldInline :: SimplEnv -> OutTerm -> OccInfo -> TopLevelFlag -> Guidance
-             -> InKont -> Bool
-shouldInline env rhs occ level guid kont
-  = case occ of
-      IAmALoopBreaker weak
-        -> weak -- inline iff it's a "rule-only" loop breaker
-      IAmDead
-        -> pprPanic "shouldInline" (text "dead binder")
-      OneOcc True True _ -- occurs once, but inside a non-linear lambda
-        -> whnfOrBot env rhs && someBenefit env rhs level kont
-      OneOcc False False _ -- occurs in multiple branches, but not in lambda
-        -> inlineMulti env rhs level guid kont
-      _
-        -> whnfOrBot env rhs && inlineMulti env rhs level guid kont
+    mk_arg_discount _              TrivArg    = 0 
+    mk_arg_discount _        NonTrivArg = 10
+    mk_arg_discount discount ValueArg   = discount 
 
-someBenefit :: SimplEnv -> OutTerm -> TopLevelFlag -> InKont -> Bool
-someBenefit env rhs level kont
-  | termIsConstruction rhs, Case {} <- kont
-  = True
-  | Lit {} <- rhs, Case {} <- kont
-  = True
-  | Lam {} <- rhs
-  = consider xs args
-  | otherwise
-  = False
+    res_discount' = case cont_info of
+                        BoringCtxt  -> 0
+                        CaseCtxt    -> res_discount  -- Presumably a constructor
+                        ValAppCtxt  -> res_discount  -- Presumably a function
+                        _           -> 40 `min` res_discount
+                -- ToDo: this 40 `min` res_dicount doesn't seem right
+                --   for DiscArgCtxt it shouldn't matter because the function will
+                --    get the arg discount for any non-triv arg
+                --   for RuleArgCtxt we do want to be keener to inline; but not only
+                --    constructor results
+                --   for RhsCtxt I suppose that exposing a data con is good in general
+                --   And 40 seems very arbitrary
+                --
+                -- res_discount can be very large when a function returns
+                -- constructors; but we only want to invoke that large discount
+                -- when there's a case continuation.
+                -- Otherwise we, rather arbitrarily, threshold it.  Yuk.
+                -- But we want to aovid inlining large functions that return 
+                -- constructors into contexts that are simply "interesting"
+
+data ArgSummary = TrivArg        -- Nothing interesting
+                | NonTrivArg        -- Arg has structure
+                | ValueArg        -- Arg is a con-app or PAP
+                            -- ..or con-like. Note [Conlike is interesting]
+
+interestingArg :: SeqCoreTerm -> ArgSummary
+-- See Note [Interesting arguments]
+interestingArg e = goT e 0
   where
-    (xs, _)       = lambdas rhs
-    (args, kont') = collectArgs kont
+    -- n is # value args to which the expression is applied
+    goT (Lit {}) _              = ValueArg
+    goT (Var v)  n
+       | isConLikeId v     = ValueArg        -- Experimenting with 'conlike' rather that
+                                             --    data constructors here
+       | idArity v > n           = ValueArg  -- Catches (eg) primops with arity but no unfolding
+       | n > 0                   = NonTrivArg        -- Saturated or unknown call
+       | conlike_unfolding = ValueArg        -- n==0; look for an interesting unfolding
+                                      -- See Note [Conlike is interesting]
+       | otherwise         = TrivArg        -- n==0, no useful unfolding
+       where
+         conlike_unfolding = isConLikeUnfolding (idUnfolding v)
 
-    -- See Secrets, section 7.2, for the someBenefit criteria
-    consider :: [OutVar] -> [InTerm] -> Bool
-    consider [] (_:_)      = True -- (c) saturated call in interesting context
-    consider [] []         | Case {} <- kont' = True -- (c) ditto
-                           -- Check for (d) saturated call to nested
-                           | otherwise = isNotTopLevel level
-    consider (_:_) []      = False -- unsaturated
-                           -- Check for (b) nontrivial or known-var argument
-    consider (_:xs) (a:as) = nontrivial a || knownVar a || consider xs as
+    goT (Type _)         _ = TrivArg
+    goT (Coercion _)     _ = TrivArg
+    goT (Lam v e)           n 
+       | isTyVar v     = goT e n
+       | n>0           = goT e (n-1)
+       | otherwise     = ValueArg
+    goT (Compute _ c) n    = goC c n
     
-    nontrivial arg   = not (isTrivialTerm arg)
-    knownVar (Var x) = x `elemVarEnv` se_defs env
-    knownVar _       = False
+    goC (Let _ c)    n = case goC c n of { ValueArg -> ValueArg; _ -> NonTrivArg }
+    goC (Eval v k)   n = maybe NonTrivArg (goT v) (goK k n)
+    goC (Jump vs j)  _ = goT (Var j) (length (filter isValueArg vs))
+    
+    goK (Kont _ (Case {}))   _ = Nothing
+    goK (Kont fs (Return _)) n = Just $ length (filter realArg fs) + n
+    
+    realArg (App (Type _))     = False
+    realArg (App (Coercion _)) = False
+    realArg (App _)            = True
+    realArg _                  = False
 
-whnfOrBot :: SimplEnv -> OutTerm -> Bool
-whnfOrBot _ (Lam {})  = True
-whnfOrBot _ term      = any ($ term) [isTrivialTerm, termIsBottom, termIsConstruction]
+nonTriv ::  ArgSummary -> Bool
+nonTriv TrivArg = False
+nonTriv _       = True
 
-inlineMulti :: SimplEnv -> OutTerm -> TopLevelFlag -> Guidance -> InKont -> Bool
-inlineMulti env rhs level guid kont
-  = noSizeIncrease rhs kont
-    || someBenefit env rhs level kont && smallEnough env rhs guid kont
 
-noSizeIncrease :: OutTerm -> InKont -> Bool
-noSizeIncrease _rhs _kont = False --TODO
+instance Outputable ArgSummary where
+  ppr TrivArg    = ptext (sLit "TrivArg")
+  ppr NonTrivArg = ptext (sLit "NonTrivArg")
+  ppr ValueArg   = ptext (sLit "ValueArg")
 
-smallEnough :: SimplEnv -> OutTerm -> Guidance -> InKont -> Bool
-smallEnough _ _ Never _ = False
-smallEnough _env term (Usually unsatOk boringOk) kont
-  = (unsatOk || not unsat) && (boringOk || not boring)
+data CallCtxt
+  = BoringCtxt
+  | RhsCtxt             -- Rhs of a let-binding; see Note [RHS of lets]
+  | DiscArgCtxt         -- Argument of a fuction with non-zero arg discount
+  | RuleArgCtxt         -- We are somewhere in the argument of a function with rules
+
+  | ValAppCtxt          -- We're applied to at least one value arg
+                        -- This arises when we have ((f x |> co) y)
+                        -- Then the (f x) has argument 'x' but in a ValAppCtxt
+
+  | CaseCtxt            -- We're the scrutinee of a case
+                        -- that decomposes its scrutinee
+
+instance Outputable CallCtxt where
+  ppr CaseCtxt    = ptext (sLit "CaseCtxt")
+  ppr ValAppCtxt  = ptext (sLit "ValAppCtxt")
+  ppr BoringCtxt  = ptext (sLit "BoringCtxt")
+  ppr RhsCtxt     = ptext (sLit "RhsCtxt")
+  ppr DiscArgCtxt = ptext (sLit "DiscArgCtxt")
+  ppr RuleArgCtxt = ptext (sLit "RuleArgCtxt")
+
+callSiteInline :: SimplEnv -> OutId -> Bool -> Bool -> InKont -> Maybe OutTerm
+callSiteInline env id active_unfolding lone_variable kont
+  = case findDef env id of 
+      -- idUnfolding checks for loop-breakers, returning NoUnfolding
+      -- Things with an INLINE pragma may have an unfolding *and* 
+      -- be a loop breaker  (maybe the knot is not yet untied)
+      Just BoundTo { defTerm = unf_template, defLevel = is_top 
+                 , defIsWorkFree = is_wf, defArity = uf_arity
+                   , defGuidance = guidance, defIsExpandable = is_exp }
+                   | active_unfolding -> let (arg_infos, cont_info) = distillKont kont
+                                         in tryUnfolding (se_dflags env) id lone_variable
+                                             arg_infos cont_info unf_template (isTopLevel is_top)
+                                             is_wf is_exp uf_arity guidance
+                   | tracing
+                   -> pprTrace "Inactive unfolding:" (ppr id) Nothing
+                   | otherwise -> Nothing
+      _            -> Nothing
+
+-- Impedence mismatch between Sequent Core code and logic from CoreUnfold.
+-- TODO This never generates most of the CallCtxt values. Need to keep track of
+-- more in able to answer more completely.
+distillKont :: InKont -> ([ArgSummary], CallCtxt)
+distillKont (Kont fs end) = (mapMaybe doFrame fs, doEnd end)
   where
-    unsat = length valArgs < termArity term
-    (_, valArgs, _) = collectTypeAndOtherArgs kont
-    boring = isReturnKont kont
+    doFrame (App v)    = Just (interestingArg v)
+    doFrame _          = Nothing
+    
+    doEnd (Return {})  = BoringCtxt
+    doEnd (Case {})    = CaseCtxt
 
-smallEnough env _term (Sometimes bodySize argWeights resWeight) kont
-  -- The Formula (p. 40)
-  = bodySize - sizeOfCall - keenness `times` discounts <= threshold
+tryUnfolding :: DynFlags -> Id -> Bool -> [ArgSummary] -> CallCtxt
+             -> OutTerm -> Bool -> Bool -> Bool -> Arity -> Guidance
+             -> Maybe OutTerm
+tryUnfolding dflags id lone_variable 
+             arg_infos cont_info unf_template is_top 
+             is_wf is_exp uf_arity guidance
+                        -- uf_arity will typically be equal to (idArity id), 
+                        -- but may be less for InlineRules
+ | tracing
+ = pprTrace ("Considering inlining: " ++ showSDocDump dflags (ppr id))
+                 (vcat [text "arg infos" <+> ppr arg_infos,
+                        text "uf arity" <+> ppr uf_arity,
+                        text "interesting continuation" <+> ppr cont_info,
+                        text "some_benefit" <+> ppr some_benefit,
+                        text "is exp:" <+> ppr is_exp,
+                        text "is work-free:" <+> ppr is_wf,
+                        text "guidance" <+> ppr guidance,
+                        extra_doc,
+                        text "ANSWER =" <+> if yes_or_no then text "YES" else text "NO"])
+                 result
+  | otherwise  = result
+
   where
-    (_, args, kont') = collectTypeAndOtherArgs kont
-    sizeOfCall           | null args =  0 -- a lone variable or polymorphic value
-                         | otherwise = 10 * (1 + length args)
-    keenness             = ufKeenessFactor (se_dflags env)
-    discounts            = argDiscs + resDisc
-    threshold            = ufUseThreshold (se_dflags env)
-    argDiscs             = sum $ zipWith argDisc args argWeights
-    argDisc arg w        | isEvald arg = w
-                         | otherwise   = 0
-    resDisc              | length args > length argWeights || isCase kont'
-                         = resWeight
-                         | otherwise = 0
+    n_val_args = length arg_infos
+    saturated  = n_val_args >= uf_arity
+    cont_info' | n_val_args > uf_arity = ValAppCtxt
+               | otherwise             = cont_info
 
-    isEvald term         = termIsHNF env term
+    result | yes_or_no = Just unf_template
+           | otherwise = Nothing
 
-    isCase (Case {})     = True
-    isCase _             = False
+    interesting_args = any nonTriv arg_infos 
+            -- NB: (any nonTriv arg_infos) looks at the
+            -- over-saturated args too which is "wrong"; 
+            -- but if over-saturated we inline anyway.
 
-    real `times` int     = ceiling (real * fromIntegral int)
+           -- some_benefit is used when the RHS is small enough
+           -- and the call has enough (or too many) value
+           -- arguments (ie n_val_args >= arity). But there must
+           -- be *something* interesting about some argument, or the
+           -- result context, to make it worth inlining
+    some_benefit 
+       | not saturated = interesting_args        -- Under-saturated
+                                                 -- Note [Unsaturated applications]
+       | otherwise = interesting_args            -- Saturated or over-saturated
+                  || interesting_call
 
-inlineDFun :: SimplEnv -> [Var] -> DataCon -> [OutTerm] -> InKont -> Maybe OutTerm
-inlineDFun _env bndrs con conArgs kont
---  | pprTraceShort "inlineDFun" (sep ([ppr bndrs, ppr con, ppr conArgs, ppr kont, ppr args, ppr kont']) $$
---      if enoughArgs && kontIsCase env kont' then text "YES" else text "NO") False
---  = undefined
-  | enoughArgs, Case {} <- kont'
-  = Just term
-  | otherwise
-  = Nothing
-  where
-    (args, kont') = collectArgsUpTo (length bndrs) kont
-    enoughArgs    = length args == length bndrs
-    term          = mkLambdas bndrs bodyTerm
-    bodyTerm      = mkAppTerm (Var (dataConWorkId con)) conArgs
+    interesting_call 
+      = case cont_info' of
+          CaseCtxt   -> not (lone_variable && is_wf)  -- Note [Lone variables]
+          ValAppCtxt -> True                          -- Note [Cast then apply]
+          RuleArgCtxt -> uf_arity > 0  -- See Note [Unfold info lazy contexts]
+          DiscArgCtxt -> uf_arity > 0  --
+          RhsCtxt     -> uf_arity > 0  --
+          _           -> not is_top && uf_arity > 0   -- Note [Nested functions]
+                                                      -- Note [Inlining in ArgCtxt]
 
-ensureRetKontDupable :: SimplEnv -> SimplM SimplEnv
-ensureRetKontDupable env
-  | se_retKontDupable env
-  = return env
-  | otherwise
-  -- Arguably, se_retKont and se_retKontDupable are redundant; as of this
-  -- writing, se_retKontDupable is False iff se_retKont is Just (Susp _ _). This
-  -- seems like a fragile circumstance, though.
-  = case se_retKont env of
-      Just (Done k)          -> warnPprTrace True __FILE__ __LINE__
-                                (text "OutKont not marked as dupable in env:" <+> ppr k)
-                                return env_markedDupable
-      Just (DoneId {})       -> return env_markedDupable
-      Nothing                -> return env_markedDupable
-      Just (Susp env_k kont) -> do
-                                (env', kont') <- mkDupableKont (env_k `inDynamicScope` env) ty kont
-                                return (env' `setStaticPart` staticPart env)
-                                         { se_retKont = Just (Done kont')
-                                         , se_retKontDupable = True }
-  where
-    env_markedDupable = env { se_retKontDupable = True }
-    retId = se_retId env `orElse` panic "ensureRetKontDupable at top level"
-    ty = kontTyArg (idType retId)
+    (yes_or_no, extra_doc)
+      = case guidance of
+          Never -> (False, empty)
+
+          Usually { guEvenIfUnsat = unsat_ok, guEvenIfBoring = boring_ok }
+             -> (enough_args && (boring_ok || some_benefit), empty )
+             where      -- See Note [INLINE for small functions (3)]
+               enough_args = saturated || (unsat_ok && n_val_args > 0)
+
+          Sometimes { guArgDiscounts = arg_discounts, guResultDiscount = res_discount,
+                      guSize = size }
+             -> ( is_wf && some_benefit && small_enough
+                , (text "discounted size =" <+> int discounted_size) )
+                 where
+                   discounted_size = size - discount
+                   small_enough = discounted_size <= ufUseThreshold dflags
+                   discount = computeDiscount dflags uf_arity arg_discounts 
+                                              res_discount arg_infos cont_info'
 
 -- | Make a continuation into something we're okay with duplicating into each
 -- branch of a case (and each branch of those branches, ...), possibly
@@ -888,53 +1222,58 @@ ensureRetKontDupable env
 --   2. Duplicate casts.
 --   3. Don't duplicate ticks (because GHC doesn't).
 --   4. Duplicate applications, but ANF-ize them first to share the arguments.
---   5. Don't duplicate cases (!) because, unlike with Simplify.mkDupableCont,
---        we don't need to (see comment in Case clause). But "ANF-ize" in a dual
---        sense by creating a join point for each branch.
---   6. Don't duplicate lambdas (they're usually already join points!).
+--   5. Don't duplicate single-branch cases.
+--   5. Duplicate cases, but "ANF-ize" in a dual sense by creating a join point
+--        for each branch.
 
 mkDupableKont :: SimplEnv -> Type -> InKont -> SimplM (SimplEnv, OutKont)
 mkDupableKont env ty kont
   = do
-    when tracing $ liftCoreM $ putMsg $ hang (text "mkDupableKont") 4 (ppr env $$ ppr kont)
-    (env', ans) <- go env (\kont' -> kont') ty kont
+    when tracing $ liftCoreM $ putMsg $ hang (text "mkDupableKont") 4 (ppr env $$ ppr ty $$ ppr kont)
+    let Kont fs end = kont
+    (env', ans) <- go env [] ty fs end
     when tracing $ liftCoreM $ putMsg $ hang (text "mkDupableKont DONE") 4 $
       ppr ans $$ vcat (map ppr (getFloatBinds (getFloats env')))
     return (env', ans)
   where
     -- The OutKont -> OutKont is a continuation for the outer continuation (!!).
-    go :: SimplEnv -> (OutKont -> OutKont) -> Type -> InKont
+    go :: SimplEnv -> [OutFrame] -> Type -> [InFrame] -> InEnd
        -> SimplM (SimplEnv, OutKont)
-    go env kk ty (Return kid)
+    go env fs' ty [] (Return kid)
       = case substKv env kid of
-          DoneId kid'               -> return (env, kk (Return kid'))
-          Done   kont'              -> do
-                                       let env' = zapFloats (zapSubstEnvs env)
-                                       go env' kk ty kont'
-          Susp stat kont'           -> do
-                                       let env' = zapFloats (stat `inDynamicScope` env)
-                                       go env' kk ty kont'
+          DoneId kid'               -> done env fs' (Return kid')
+          Done (Kont fs end)        -> do
+                                       let env' = zapSubstEnvs env
+                                       go env' fs' ty fs end
+          Susp stat (Kont fs end)   -> do
+                                       let env' = stat `inDynamicScope` env
+                                       go env' fs' ty fs end
     
-    go env kk _ty (Cast co kont)
+    go env fs' _ty (Cast co : fs) end
       = do
         co' <- simplCoercion env co
-        go env (kk . Cast co') (pSnd (coercionKind co')) kont
+        go env (Cast co' : fs') (pSnd (coercionKind co')) fs end
     
-    go env kk ty kont@(Tick {})
-      = split env kk ty kont
+    go env fs' ty fs@(Tick {} : _) end
+      = split env fs' ty fs end (fsLit "*tickj")
     
-    go env kk ty (App arg kont)
+    go env fs' ty (App (Type tyArg) : fs) end
+      = let tyArg' = substTy env tyArg
+            ty'    = applyTy ty  tyArg'
+        in go env (App (Type tyArg') : fs') ty' fs end
+    
+    go env fs' ty (App arg : fs) end
       = do
         (env', arg') <- mkDupableTerm env arg
-        go env' (kk . App arg') (funResultTy ty) kont
+        go env' (App arg' : fs') (funResultTy ty) fs end
 
     -- Don't duplicate seq (see Note [Single-alternative cases] in GHC Simplify.lhs)
-    go env kk ty kont@(Case caseBndr [Alt _altCon bndrs _rhs])
+    go env fs' ty [] end@(Case caseBndr [Alt _altCon bndrs _rhs])
       | all isDeadBinder bndrs
       , not (isUnLiftedType (idType caseBndr))
-      = split env kk ty kont
+      = split env fs' ty [] end (fsLit "*seqj")
 
-    go env kk _ty (Case caseBndr alts)
+    go env fs' _ty [] (Case caseBndr alts)
       -- This is dual to the App case: We have several branches and we want to
       -- bind each to a join point.
       = do
@@ -945,14 +1284,14 @@ mkDupableKont env ty kont
         -- case. May be worth checking that we get the same result.
         
         let (altEnv, caseBndr') = enterScope env caseBndr
-        alts' <- mapM (simplAlt altEnv Nothing [] caseBndr) alts
-        (env', alts'') <- mkDupableAlts env caseBndr alts'
+        alts' <- mapM (simplAlt altEnv Nothing [] caseBndr') alts
+        (env', alts'') <- mkDupableAlts env caseBndr' alts'
         
-        return (env', kk (Case caseBndr' alts''))
+        done env' fs' (Case caseBndr' alts'')
         
-    split :: SimplEnv -> (OutKont -> OutKont) -> Type -> InKont
+    split :: SimplEnv -> [OutFrame] -> Type -> [InFrame] -> InEnd -> FastString
           -> SimplM (SimplEnv, OutKont)
-    split env kk ty kont
+    split env fs' ty fs end name
         -- XXX This is a bit ugly, but it is currently the only way to split a
         -- non-parameterized continuation in two:
         --   Edup[Knodup] ==> let cont j x = < x | Knodup >
@@ -963,13 +1302,16 @@ mkDupableKont env ty kont
         -- revisit this.
       = do
         let kontTy = mkKontTy (mkKontArgsTy (mkTupleTy UnboxedTuple [ty]))
-        (env', j) <- mkFreshVar env (fsLit "*tickj") kontTy
+        (env', j) <- mkFreshVar env name kontTy
         let (env'', x) = enterScope env' (mkKontArgId ty)
-            join_rhs  = PKont [x] (Eval (Var x) kont)
+            join_rhs  = PKont [x] (Eval (Var x) (Kont fs end))
             join_kont = Case x [Alt DEFAULT [] (Jump [Var x] j)]
-        env_final <- simplNonRecPKont env'' j (staticPart env'') join_rhs
+        env_final <- simplPKontBind env'' j j (staticPart env'') join_rhs NonRecursive
         
-        return (env_final, kk join_kont)
+        done env_final fs' join_kont
+    
+    done :: SimplEnv -> [OutFrame] -> OutEnd -> SimplM (SimplEnv, OutKont)
+    done env fs end = return (env, Kont (reverse fs) end)
     
 mkDupableTerm :: SimplEnv -> InTerm
                         -> SimplM (SimplEnv, OutTerm)
@@ -1038,13 +1380,16 @@ commandIsDupable dflags c
     go n (T (Var {}))      = decrement n
     go n (T (Lit lit))     | litIsDupable dflags lit = decrement n
     
-    go n (K (Tick _ k))    = go n (K k)
-    go n (K (Cast _ k))    = go n (K k)
-    go n (K (App f k))     = go n  (T f) >>= \n' ->
-                             go n' (K k)
+    go n (K (Kont fs (Return _))) = goF n fs
     
     go _ _ = Nothing
-
+    
+    goF n (Tick _ : fs) = goF n fs
+    goF n (Cast _ : fs) = goF n fs
+    goF n (App  v : fs) = go n (T v) >>= \n' ->
+                          goF n' fs
+    goF n []            = Just n
+    
     decrement :: Int -> Maybe Int
     decrement 0 = Nothing
     decrement n = Just (n-1)
@@ -1053,28 +1398,43 @@ commandIsDupable dflags c
 dupAppSize :: Int
 dupAppSize = 8
 
--- TODO This might be generally useful; move to Syntax.hs?
-data Value b
-  = LitVal Literal
-  | LamVal [b] (Term b)
-  | ConsVal DataCon [Type] [Term b]
-  
-type SeqCoreValue = Value SeqCoreBndr
-type InValue = SeqCoreValue
-type OutValue = SeqCoreValue
-  
-splitValue :: Term b -> Kont b -> Maybe (Value b, Kont b)
-splitValue (Lit lit) kont = Just (LitVal lit, kont)
-splitValue term@(Lam {}) kont = Just (uncurry LamVal (lambdas term), kont)
-splitValue (Var fid) kont
-  | Just dc <- isDataConWorkId_maybe fid
-  , length valArgs == dataConRepArity dc
-  = Just (ConsVal dc tyArgs valArgs, kont')
-  where
-    (tyArgs, valArgs, kont') = collectTypeAndOtherArgs kont
-splitValue _ _               = Nothing
+makeTrivial :: TopLevelFlag -> SimplEnv -> OutTerm -> SimplM (SimplEnv, OutTerm)
+-- Binds the expression to a variable, if it's not trivial, returning the variable
+makeTrivial top_lvl env term = makeTrivialWithInfo top_lvl env vanillaIdInfo term
 
-valueToTerm :: SeqCoreValue -> SeqCoreTerm
-valueToTerm (LitVal lit)          = Lit lit
-valueToTerm (LamVal xs t)         = mkLambdas xs t
-valueToTerm (ConsVal dc tys vals) = mkConstruction dc tys vals
+makeTrivialWithInfo :: TopLevelFlag -> SimplEnv -> IdInfo
+                    -> OutTerm -> SimplM (SimplEnv, OutTerm)
+-- Propagate strictness and demand info to the new binder
+-- Note [Preserve strictness when floating coercions]
+-- Returned SimplEnv has same substitution as incoming one
+makeTrivialWithInfo top_lvl env info term
+  | isTrivialTerm term                          -- Already trivial
+  || not (bindingOk top_lvl term term_ty)       -- Cannot trivialise
+                                                --   See Note [Cannot trivialise]
+  = return (env, term)
+  | otherwise           -- See Note [Take care] below
+  = do  { uniq <- getUniqueM
+        ; let name = mkSystemVarName uniq (fsLit "a")
+              var = mkLocalIdWithInfo name term_ty info
+        ; env'  <- completeNonRecTerm env False var var term top_lvl
+        ; expr' <- simplVar env' var
+        ; return (env', expr') }
+        -- The simplVar is needed becase we're constructing a new binding
+        --     a = rhs
+        -- And if rhs is of form (rhs1 |> co), then we might get
+        --     a1 = rhs1
+        --     a = a1 |> co
+        -- and now a's RHS is trivial and can be substituted out, and that
+        -- is what completeNonRecX will do
+        -- To put it another way, it's as if we'd simplified
+        --    let var = e in var
+  where
+    term_ty = termType term
+
+bindingOk :: TopLevelFlag -> SeqCoreTerm -> Type -> Bool
+-- True iff we can have a binding of this expression at this level
+-- Precondition: the type is the type of the expression
+bindingOk top_lvl _ term_ty
+  | isTopLevel top_lvl = not (isUnLiftedType term_ty)
+  | otherwise          = True
+

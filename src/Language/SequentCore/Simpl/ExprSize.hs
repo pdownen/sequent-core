@@ -115,26 +115,28 @@ bodySize dflags cap topArgs expr
         (xs, body)          = lambdas term
         erased              = all (\x -> not (isId x) || isRealWorldId x) xs
     
-    size (K (Return _))     = sizeZero
-    size (K (Cast _ kont))  = size (K kont)
-    size (K (Tick _ kont))  = size (K kont)
-    size (K (App arg kont)) = sizeArg arg `addSizeNSD` size (K kont)
-    size (K (Case _ alts))  = sizeAlts alts
+    size (K (Kont fs end))  = foldr addSizeNSD (sizeEnd end) (map sizeFrame fs)
 
     size (C (Let b c))      = addSizeNSD (sizeBind b) (size (C c))
-    size (C (Eval v k))       = sizeCut v k
+    size (C (Eval v k))     = sizeCut v k
     size (C (Jump args j))  = sizeJump args j
+    
+    sizeFrame (App arg)     = sizeArg arg
+    sizeFrame _             = sizeZero
+    
+    sizeEnd (Return _)      = sizeZero
+    sizeEnd (Case _ alts)   = sizeAlts alts
     
     sizeCut :: SeqCoreTerm -> SeqCoreKont -> BodySize
     -- Compare this clause to size_up_app in CoreUnfold; already having the
     -- function and arguments at hand avoids some acrobatics
-    sizeCut (Var f) kont@(App {})
+    sizeCut (Var f) kont@(Kont (App {} : _) _)
       = let (args, kont') = collectArgs kont
             realArgs      = filter (not . isErasedTerm) args
             voids         = count isRealWorldTerm realArgs
         in sizeArgs realArgs `addSizeNSD` sizeCall f realArgs voids
                              `addSizeOfKont` kont'
-    sizeCut (Var x) (Case _b alts)
+    sizeCut (Var x) (Kont [] (Case _b alts))
       | x `elem` topArgs
       = combineSizes total max
       where
@@ -225,12 +227,13 @@ bodySize dflags cap topArgs expr
       | otherwise              = size1 `addSizeNSD` size (K kont)
 
     isPassThroughKont :: Kont b -> Bool
-    isPassThroughKont (Return _)     = True
-    isPassThroughKont (Tick _ kont)  = isPassThroughKont kont
-    isPassThroughKont (Cast _ kont)  = isPassThroughKont kont
-    isPassThroughKont (App arg kont) = isErasedTerm arg
-                                         && isPassThroughKont kont
-    isPassThroughKont _              = False
+    isPassThroughKont (Kont _  (Case {}))  = False
+    isPassThroughKont (Kont fs (Return _)) = all passThrough fs
+      where
+        passThrough f = case f of
+                          Tick _  -> True
+                          Cast _  -> True
+                          App arg -> isErasedTerm arg
 
     infixl 6 `addSizeN`, `addSizeNSD`, `addSizeOfKont`
 

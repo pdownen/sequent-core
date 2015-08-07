@@ -153,12 +153,20 @@ lintKontBndrTypes env bndr argBndrs
           bndr:bndrs' -> go (applyUbxExists ty (substTy env (mkTyVarTy bndr))) bndrs'
       | isUnboxedTupleType ty
       , Just (_, argTys) <- splitTyConApp_maybe ty
-      , and $ zipWith eqType argTys (map (substTy env . idType) bndrs)
-      = return ()
+      = goTup argTys bndrs
       | otherwise
+      = complain
+    
+    goTup []             []           = return ()
+    goTup [lastArgTy]    bndrs        | isUbxExistsTy lastArgTy
+                                      = go lastArgTy bndrs
+    goTup (argTy:argTys) (bndr:bndrs) | argTy `eqType` substTy env (idType bndr)
+                                      = goTup argTys bndrs
+    goTup _              _            = complain
+      
+    complain  
       = Left $ text "wrong binder types for continuation binder:" <+> pprBndr LetBind bndr
             $$ text "binders:" <+> sep (map (pprBndr LambdaBind) argBndrs)
-            $$ text "as of:" <+> ppr ty $$ text "and:" <+> ppr bndrs
 
 lintCoreTerm :: TermEnv -> SeqCoreTerm -> LintM Type
 lintCoreTerm env (Var x)
@@ -229,25 +237,78 @@ lintCoreJump env args j
                 Just argsTy -> return argsTy
                 Nothing     -> Left $ text "target of jump should have type Cont# (ContArgs# _):" <+>
                                       pprBndr LetBind j
-    go args argsTy args
+    go argsTy args
   where
-    go (Type argTy : args') ty topArgs
+    topArgs = args
+    
+    go ty (Type argTy : args)
       = case applyUbxExists_maybe ty (substTy (termEnv env) argTy) of
-          Just ty' -> go args' ty' topArgs
+          Just ty' -> go ty' args
           Nothing  -> mkError (text "type of polymorphic jump")
                               (text "existential type") (ppr ty)
-    go args' ty topArgs
+    go ty args
       | isUnboxedTupleType ty
       , Just (_, argTys) <- splitTyConApp_maybe ty
-      = forM_ (zip3 [1..] argTys args') $ \(n, argTy, arg) ->
-          checkingType (speakNth n <+> text "argument of jump") argTy $
-            lintCoreTerm (termEnv env) arg
-      | otherwise
+      = goTup 1 argTys args
+    go _ _
+      = complain
+      
+    goTup _ [] [] = return ()
+    goTup _ [ty] args@(Type _ : _)
+      | isUbxExistsTy ty
+      = go ty args
+    goTup n (argTy:argTys) (arg:args)
+      = do
+        void $ checkingType (speakNth n <+> text "argument of jump") argTy $
+          lintCoreTerm (termEnv env) arg
+        goTup (n+1) argTys args
+    goTup _ _ _
+      = complain
+    
+    complain
       = Left $ text "bad parameterized continuation type in binder:" <+> pprBndr LetBind j
             $$ text "for args:" <+> ppr topArgs
 
 lintCoreKont :: SDoc -> LintEnv -> Type -> SeqCoreKont -> LintM ()
-lintCoreKont desc env ty (Return k)
+lintCoreKont desc env ty (Kont frames end)
+  = do
+    (env', ty') <- foldM (uncurry (lintCoreFrame desc)) (env, ty) frames
+    lintCoreEnd desc env' ty' end
+
+lintCoreFrame :: SDoc -> LintEnv -> Type -> SeqCoreFrame -> LintM (LintEnv, Type)
+lintCoreFrame desc env ty (App (Type tyArg))
+  | Just (tyVar, resTy) <- splitForAllTy_maybe (substTy (termEnv env) ty)
+  = do
+    let tyArg' = substTy (termEnv env) tyArg
+    if typeKind tyArg' `isSubKind` idType tyVar
+      then do
+           let env' = mapTermLintEnv (\ent -> extendTvSubst ent tyVar tyArg') env
+               -- Don't reapply the rest of the substitution; just apply the new thing
+               resTy' = substTy (extendTvSubst emptyTvSubst tyVar tyArg') resTy
+           return (env', resTy')
+      else mkError (desc <> colon <+> text "type argument" <+> ppr tyArg)
+             (ppr (typeKind tyArg')) (ppr (idType tyVar))
+  | otherwise
+  = Left $ desc <> colon <+> text "not a forall type:" <+> ppr ty
+lintCoreFrame desc env ty (App arg)
+  | Just (argTy, resTy) <- splitFunTy_maybe (substTy (termEnv env) ty)
+  = do
+    void $ checkingType (desc <> colon <+> ppr arg) argTy $ lintCoreTerm (termEnv env) arg
+    return (env, resTy)
+  | otherwise
+  = Left $ desc <> colon <+> text "not a function type:" <+> ppr ty
+lintCoreFrame desc env ty (Cast co)
+  = do
+    let Pair fromTy toTy = coercionKind co
+        fromTy' = substTy (termEnv env) fromTy
+        toTy'   = substTy (termEnv env) toTy
+    void $ checkingType (desc <> colon <+> text "incoming type of" <+> ppr co) ty $ return fromTy'
+    return (env, toTy')
+lintCoreFrame _ env ty (Tick _)
+  = return (env, ty)
+
+lintCoreEnd :: SDoc -> LintEnv -> Type -> SeqCoreEnd -> LintM ()
+lintCoreEnd desc env ty (Return k)
   | Just k' <- lookupInScope (getTvInScope (kontEnv env)) k
   = if substTy (termEnv env) (idType k) `eqType` idType k'
       then void $
@@ -257,37 +318,7 @@ lintCoreKont desc env ty (Return k)
                                                          <+> pprBndr LetBind k'
   | otherwise
   = Left $ desc <> colon <+> text "not found in context:" <+> pprBndr LetBind k
-lintCoreKont desc env ty (App (Type tyArg) kont)
-  | Just (tyVar, resTy) <- splitForAllTy_maybe (substTy (termEnv env) ty)
-  = do
-    let tyArg' = substTy (termEnv env) tyArg
-    if typeKind tyArg' `isSubKind` idType tyVar
-      then do
-           let env' = mapTermLintEnv (\ent -> extendTvSubst ent tyVar tyArg') env
-               -- Don't reapply the rest of the substitution; just apply the new thing
-               resTy' = substTy (extendTvSubst emptyTvSubst tyVar tyArg') resTy
-           lintCoreKont desc env' resTy' kont
-      else mkError (desc <> colon <+> text "type argument" <+> ppr tyArg)
-             (ppr (typeKind tyArg')) (ppr (idType tyVar))
-  | otherwise
-  = Left $ desc <> colon <+> text "not a forall type:" <+> ppr ty
-lintCoreKont desc env ty (App arg kont)
-  | Just (argTy, resTy) <- splitFunTy_maybe (substTy (termEnv env) ty)
-  = do
-    void $ checkingType (desc <> colon <+> ppr arg) argTy $ lintCoreTerm (termEnv env) arg
-    lintCoreKont desc env resTy kont
-  | otherwise
-  = Left $ desc <> colon <+> text "not a function type:" <+> ppr ty
-lintCoreKont desc env ty (Cast co kont)
-  = do
-    let Pair fromTy toTy = coercionKind co
-        fromTy' = substTy (termEnv env) fromTy
-        toTy'   = substTy (termEnv env) toTy
-    void $ checkingType (desc <> colon <+> text "incoming type of" <+> ppr co) ty $ return fromTy'
-    lintCoreKont desc env toTy' kont
-lintCoreKont desc env ty (Tick _ kont)
-  = lintCoreKont desc env ty kont
-lintCoreKont desc env ty (Case bndr alts)
+lintCoreEnd desc env ty (Case bndr alts)
   = do
     let env' = mapTermLintEnv (\ent -> extendTvInScopeSubsted ent bndr) env
     forM_ alts $ \(Alt _ bndrs rhs) ->
@@ -306,7 +337,7 @@ extendTvInScopeListSubsted :: TvSubst -> [Var] -> TvSubst
 extendTvInScopeListSubsted tvs vars
   = foldr (flip extendTvInScopeSubsted) tvs vars
 
-mkError :: SDoc -> SDoc -> SDoc -> LintM ()
+mkError :: SDoc -> SDoc -> SDoc -> LintM a
 mkError desc ex act = Left (desc $$ text "expected:" <+> ex
                                  $$ text "actual:" <+> act)
   

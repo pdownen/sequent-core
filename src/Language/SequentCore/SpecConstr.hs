@@ -209,25 +209,27 @@ specInTerm _ v
   = return (emptyScUsage, v)
 
 specInKont :: ScEnv -> SeqCoreKont -> CoreM (ScUsage, SeqCoreKont)
-specInKont env (App v k)
+specInKont env (Kont frames end)
   = do
-    (usage1, v') <- specInTerm env v
-    (usage2, k') <- specInKont env k
-    return (usage1 <> usage2, App v' k')
-specInKont env (Case x as)
+    (usages, frames') <- mapAndUnzipM (specInFrame env) frames
+    (usage2, end') <- specInEnd env end
+    return (mconcat usages <> usage2, Kont frames' end')
+
+specInFrame :: ScEnv -> SeqCoreFrame -> CoreM (ScUsage, SeqCoreFrame)
+specInFrame env (App v)
+  = do
+    (usage, v') <- specInTerm env v
+    return (usage, App v')
+specInFrame _ frame
+  = return (emptyScUsage, frame)
+
+specInEnd :: ScEnv -> SeqCoreEnd -> CoreM (ScUsage, SeqCoreEnd)
+specInEnd env (Case x as)
   = do
     (usages, as') <- mapAndUnzipM (specInAlt env) as
     return (mconcat usages, Case x as')
-specInKont env (Cast co k)
-  = do
-    (usage, k') <- specInKont env k
-    return (usage, Cast co k')
-specInKont env (Tick ti k)
-  = do
-    (usage, k') <- specInKont env k
-    return (usage, Tick ti k')
-specInKont _ k
-  = return (emptyScUsage, k)
+specInEnd _ (Return p)
+  = return (emptyScUsage, Return p)
 
 specInRhs :: ScEnv -> SeqCoreRhs -> CoreM (ScUsage, SeqCoreRhs)
 specInRhs env (Left term)
@@ -275,7 +277,7 @@ specInCut env v k
     return (u <> u_v <> u_k, v', k')
 
 usageFromCut :: ScEnv -> SeqCoreTerm -> SeqCoreKont -> ScUsage
-usageFromCut env (Var x) (Case {})
+usageFromCut env (Var x) (Kont [] (Case {}))
   | Just SpecArg <- sc_how_bound env `lookupVarEnv` x
   = ScUsage emptyVarEnv (unitVarSet x)
 -- Implementation note: The Sequent Core form simplifies this function by making
