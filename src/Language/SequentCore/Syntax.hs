@@ -10,7 +10,7 @@ module Language.SequentCore.Syntax (
   -- * AST Types
   Term(..), Arg, Kont(..), Frame(..), End(..), PKont(..), Command(..),
   Bind(..), BindPair(..), Rhs,
-  Alt(..), AltCon(..), Expr(..), Program, KontId, PKontId,
+  Alt(..), AltCon(..), Expr(..), Program, PKontId,
   SeqCoreTerm, SeqCoreArg, SeqCoreKont, SeqCoreFrame, SeqCoreEnd, SeqCorePKont,
     SeqCoreCommand, SeqCoreBind, SeqCoreBindPair, SeqCoreRhs, SeqCoreBndr,
     SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
@@ -40,7 +40,7 @@ module Language.SequentCore.Syntax (
   termIsCheapBy, kontIsCheapBy, commandIsCheapBy, rhsIsCheapBy,
   applyTypeToArg,
   -- * Continuation ids
-  isKontId, isPKontId, asKontId, Language.SequentCore.WiredIn.mkKontTy, kontTyArg,
+  isPKontId, Language.SequentCore.WiredIn.mkKontTy, kontTyArg,
   -- * Values
   Value(..), SeqCoreValue, splitValue, valueToTerm, valueToCommandWith,
   -- * Alpha-equivalence
@@ -56,8 +56,7 @@ import CoreSyn   ( AltCon(..), Tickish, tickishCounts, isRuntimeVar
 import DataCon   ( DataCon, dataConTyCon, dataConRepArity
                  , dataConUnivTyVars, dataConExTyVars, dataConWorkId )
 import Id        ( Id, isDataConWorkId, isDataConWorkId_maybe, isConLikeId
-                 , idArity, idType, idDetails, idUnfolding 
-                 , setIdType, isBottomingId )
+                 , idArity, idType, idDetails, idUnfolding, isBottomingId )
 import IdInfo    ( IdDetails(..) )
 import Literal   ( Literal, isZeroLit, litIsTrivial, literalType )
 import Maybes    ( orElse )
@@ -87,7 +86,7 @@ data Term b     = Lit Literal       -- ^ A primitive literal value.
                                     -- nullary constructor; use 'Cons' for this.
                 | Lam b (Term b)    -- ^ A function. Binds some arguments and
                                     -- a continuation. The body is a command.
-                | Compute b (Command b)
+                | Compute Type (Command b)
                                     -- ^ A value produced by a computation.
                                     -- Binds a continuation.
                 | Type Type         -- ^ A type. Used to pass a type as an
@@ -113,8 +112,8 @@ data Frame b    = App {- expr -} (Arg b)
                 | Tick (Tickish Id) {- expr -}
                   -- ^ Annotate the enclosed frame. Used by the profiler.
 
-data End b      = Return KontId
-                  -- ^ Pass to a bound continuation.
+data End b      = Return
+                  -- ^ Pass to the bound continuation.
                 | Case {- expr -} b [Alt b]
                   -- ^ Perform case analysis on the value.
 
@@ -123,9 +122,6 @@ data End b      = Return KontId
 -- parameterized continuation is a point in the control flow that many different
 -- computations might jump to.
 data PKont b    = PKont [b] (Command b)
-
--- | A continuation variable.
-type KontId = Id
 
 -- | The identifier for a parameterized continuation, i.e. a join point.
 type PKontId = Id
@@ -204,9 +200,8 @@ type SeqCoreProgram = Program Var
 -- A smart constructor. If the term happens to be a Compute, may fold its
 -- command into the result.
 mkCommand :: HasId b => [Bind b] -> Term b -> Kont b -> Command b
-mkCommand binds (Compute kbndr comm) kont
-  | (binds', Left (term, Kont [] (Return q))) <- flattenCommand comm
-  , identifier kbndr == q
+mkCommand binds (Compute _ comm) kont
+  | (binds', Left (term, Kont [] Return)) <- flattenCommand comm
   = mkCommand (binds ++ binds') term kont
 
 mkCommand binds term kont
@@ -220,28 +215,26 @@ mkVarTerm x | Type.isTyVar x = Type (Type.mkTyVarTy x)
 mkLambdas :: [b] -> Term b -> Term b
 mkLambdas = flip (foldr Lam)
 
-mkCompute :: HasId b => b -> Command b -> Term b
+mkCompute :: HasId b => Type -> Command b -> Term b
 -- | Wraps a command that returns to the given continuation id in a term using
 -- 'Compute'. If the command is a value command (see 'asValueCommand'), unwraps
 -- it instead.
-mkCompute k comm
-  | Just val <- asValueCommand kid comm
+mkCompute ty comm
+  | Just val <- asValueCommand comm
   = val
   | otherwise
-  = Compute k comm
-  where
-    kid = identifier k
+  = Compute ty comm
   
 mkAppTerm :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreTerm
-mkAppTerm fun args = mkCompute k (Eval fun (Kont (map App args) (Return k)))
+mkAppTerm fun args = mkCompute retTy (Eval fun (Kont (map App args) Return))
   where
-    k = mkArgKontId retTy
     (tyArgs, _) = partitionTypes args
     (_, retTy) = Type.splitFunTys $ Type.applyTys (termType fun) tyArgs
 
 mkCast :: SeqCoreTerm -> Coercion -> SeqCoreTerm
-mkCast term co = Compute p $ Eval term (Kont [Cast co] (Return p))
-  where p = mkCastKontId (pSnd (coercionKind co))
+mkCast term co = Compute ty $ Eval term (Kont [Cast co] Return)
+  where
+    ty = pSnd (coercionKind co)
 
 mkConstruction :: DataCon -> [Type] -> [SeqCoreTerm] -> SeqCoreTerm
 mkConstruction dc tyArgs valArgs
@@ -262,8 +255,9 @@ addNonRec pair comm
   
 addLetsToTerm :: [SeqCoreBind] -> SeqCoreTerm -> SeqCoreTerm
 addLetsToTerm [] term = term
-addLetsToTerm binds term = mkCompute k (mkCommand binds term (Kont [] (Return k)))
-  where k = mkLetKontId (termType term)
+addLetsToTerm binds term = mkCompute ty (mkCommand binds term (Kont [] Return))
+  where
+    ty = termType term
 
 consFrame :: Frame b -> Kont b -> Kont b
 consFrame f (Kont fs end) = Kont (f : fs) end
@@ -391,8 +385,8 @@ isTrivialTerm _           = True
 -- coercions). Ticks are not considered trivial, since this would cause them to
 -- be inlined.
 isTrivialKont :: HasId b => Kont b -> Bool
-isTrivialKont (Kont fs (Return _)) = all isTrivialFrame fs
-isTrivialKont _                    = False
+isTrivialKont (Kont fs Return) = all isTrivialFrame fs
+isTrivialKont _                = False
 
 isTrivialFrame :: HasId b => Frame b -> Bool
 isTrivialFrame (App v)  = isErasedTerm v
@@ -405,13 +399,13 @@ isTrivialPKont (PKont xs comm) = all (not . isRuntimeVar) (identifiers xs)
 
 -- | True if the given continuation is a return continuation, @Kont [] (Return _)@.
 isReturnKont :: Kont b -> Bool
-isReturnKont (Kont [] (Return _)) = True
-isReturnKont _                    = False
+isReturnKont (Kont [] Return) = True
+isReturnKont _                = False
 
--- | True if the given continuation end is a return, @Return _@.
+-- | True if the given continuation end is a return, @Return@.
 isReturn :: End b -> Bool
-isReturn (Return _) = True
-isReturn _          = False
+isReturn Return = True
+isReturn _      = False
 
 -- | True if the given alternative is a default alternative, @Alt DEFAULT _ _@.
 isDefaultAlt :: Alt b -> Bool
@@ -441,7 +435,7 @@ termAsConstruction (Var id)      | Just dc <- isDataConWorkId_maybe id
                                  , null (dataConUnivTyVars dc)
                                  , null (dataConExTyVars dc)
                                  = Just (dc, [], [])
-termAsConstruction (Compute k c) = commandAsConstruction (identifier k) c
+termAsConstruction (Compute _ c) = commandAsConstruction c
 termAsConstruction _             = Nothing
 
 splitConstruction :: Term b -> Kont b -> Maybe (DataCon, [Type], [Term b], Kont b)
@@ -454,13 +448,12 @@ splitConstruction (Var fid) kont
 splitConstruction _ _
   = Nothing
 
-commandAsConstruction :: KontId -> Command b
+commandAsConstruction :: Command b
                       -> Maybe (DataCon, [Type], [Term b])
-commandAsConstruction retId (Eval term kont)
-  | Just (dc, tyArgs, valArgs, Kont [] (Return retId')) <- splitConstruction term kont
-  , retId == retId'
+commandAsConstruction (Eval term kont)
+  | Just (dc, tyArgs, valArgs, Kont [] Return) <- splitConstruction term kont
   = Just (dc, tyArgs, valArgs)
-commandAsConstruction _ _
+commandAsConstruction _
   = Nothing
 
 -- | If the given term is a function, and the given continuation would provide
@@ -478,11 +471,10 @@ asSaturatedCall term kont
 
 -- | If a command does nothing but provide a value to the given continuation id,
 -- returns that value.
-asValueCommand :: KontId -> Command b -> Maybe (Term b)
-asValueCommand k (Eval term (Kont [] (Return k')))
-  | k == k'
+asValueCommand :: Command b -> Maybe (Term b)
+asValueCommand (Eval term (Kont [] Return))
   = Just term
-asValueCommand _ _
+asValueCommand _
   = Nothing
 
 flattenBind :: Bind b -> [BindPair b]
@@ -532,7 +524,7 @@ termType :: HasId b => Term b -> Type
 termType (Lit l)        = literalType l
 termType (Var x)        = idType x
 termType (Lam x t)      = Type.mkPiType (identifier x) (termType t)
-termType (Compute k _)  = kontTyArg (idType (identifier k))
+termType (Compute ty _) = ty
 -- see exprType in GHC CoreUtils
 termType _other         = alphaTy
 
@@ -613,7 +605,7 @@ frameOk (Tick ti) = not (tickishCounts ti)
 frameOk (Cast _)  = True
 
 endOk :: (PrimOp -> Bool) -> End b -> Bool
-endOk _ (Return _) = False -- TODO Should look at unfolding??
+endOk _ Return = False
 endOk primOpOk (Case _bndr alts)
   =  all (\(Alt _ _ rhs) -> commOk primOpOk rhs) alts
   && altsAreExhaustive
@@ -690,7 +682,7 @@ frameCheap (Cast _)  = True
 frameCheap (Tick ti) = not (tickishCounts ti)
 
 endCheap :: HasId b => CheapAppMeasure -> End b -> Bool
-endCheap _        (Return _)    = True
+endCheap _        Return        = True
 endCheap appCheap (Case _ alts) = and [commCheap appCheap rhs | Alt _ _ rhs <- alts]
 
 commCheap :: HasId b => CheapAppMeasure -> Command b -> Bool
@@ -767,19 +759,8 @@ applyTypeToArg ty _            = Type.funResultTy ty
 --------------------------------------------------------------------------------
 
 -- | Find whether an id is a continuation id.
-isKontId :: Id -> Bool
-isKontId x = isKontTy (idType x)
-
--- | Find whether an id is a parameterized continuation id.
 isPKontId :: Id -> Bool
-isPKontId x | Just argTy <- isKontTy_maybe ty = isKontArgsTy argTy
-            | otherwise                       = False
-  where ty = idType x
-
--- | Tag an id as a continuation id.
-asKontId :: Id -> KontId
-asKontId x | isKontId x = x
-           | otherwise  = x `setIdType` mkKontTy (idType x)
+isPKontId x = isKontTy (idType x)
 
 kontTyArg :: Type -> Type
 kontTyArg ty = isKontTy_maybe ty `orElse` pprPanic "kontTyArg" (ppr ty)
@@ -876,8 +857,8 @@ instance HasId b => AlphaEq (Term b) where
     = aeqIn env co1 co2
   aeqIn env (Var x1) (Var x2)
     = env `rnOccL` x1 == env `rnOccR` x2
-  aeqIn env (Compute k1 c1) (Compute k2 c2)
-    = aeqIn (rnBndr2 env (identifier k1) (identifier k2)) c1 c2
+  aeqIn env (Compute ty1 c1) (Compute ty2 c2)
+    = ty1 `Type.eqType` ty2 && aeqIn env c1 c2
   aeqIn _ _ _
     = False
 
@@ -896,8 +877,8 @@ instance HasId b => AlphaEq (Frame b) where
     = False
     
 instance HasId b => AlphaEq (End b) where
-  aeqIn env (Return x1) (Return x2)
-    = env `rnOccL` x1 == env `rnOccR` x2
+  aeqIn _ Return Return
+    = True
   aeqIn env (Case x1 as1) (Case x2 as2) 
     = aeqIn env' as1 as2
       where env' = rnBndr2 env (identifier x1) (identifier x2)

@@ -228,8 +228,8 @@ specInEnd env (Case x as)
   = do
     (usages, as') <- mapAndUnzipM (specInAlt env) as
     return (mconcat usages, Case x as')
-specInEnd _ (Return p)
-  = return (emptyScUsage, Return p)
+specInEnd _ Return
+  = return (emptyScUsage, Return)
 
 specInRhs :: ScEnv -> SeqCoreRhs -> CoreM (ScUsage, SeqCoreRhs)
 specInRhs env (Left term)

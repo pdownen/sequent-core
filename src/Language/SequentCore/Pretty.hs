@@ -66,8 +66,7 @@ ppr_comm add_par comm
             -> sep [text "<" <> pprCoreTerm term,
                     cat $ ppr_block "|" ";" ">" $ (ppr_kont_frames fs ++ [ppr_end end])]
           Right (args, j)
-            -> sep [text "<jump" <+> parens (sep $ punctuate comma (map pprCoreTerm args)),
-                    text "|" <+> ppr j <> text ">"]
+            -> text "jump" <+> ppr j <+> parens (pprWithCommas pprCoreTerm args)
 
 ppr_term :: OutputableBndr b => (SDoc -> SDoc) -> Term b -> SDoc
 ppr_term _ (Var name) = ppr name
@@ -75,20 +74,20 @@ ppr_term add_par (Type ty) = add_par $ char '@' <+> ppr ty
 ppr_term _ (Coercion _) = text "CO ..."
 ppr_term add_par (Lit lit) = GHC.pprLiteral add_par lit
 ppr_term add_par term@(Lam {})
-  | Compute kbndr comm <- body
+  | Compute ty comm <- body
   = add_par $
-      hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs ++
-                                [char '|', pprBndr LambdaBind kbndr]) <+> arrow)
+      hang (char '\\' <+> fsep (map (pprBndr LambdaBind) bndrs ++
+                                [char '|', parens (text "ret" <+> dcolon <+> ppr ty)]) <+> arrow)
         2 (pprCoreComm comm)
   | otherwise
   = add_par $
-      hang (char '\\' <+> sep (map (pprBndr LambdaBind) bndrs) <+> arrow)
+      hang (char '\\' <+> fsep (map (pprBndr LambdaBind) bndrs) <+> arrow)
         2 (pprCoreTerm body)
   where
     (bndrs, body) = lambdas term
-ppr_term add_par (Compute kbndr comm)
+ppr_term add_par (Compute ty comm)
   = add_par $
-      hang (text "compute" <+> pprBndr LambdaBind kbndr)
+      hang (text "compute" <+> parens (text "ret" <+> dcolon <+> ppr ty))
         2 (pprCoreComm comm)
 
 ppr_kont_frames :: OutputableBndr b => [Frame b] -> [SDoc]
@@ -102,8 +101,8 @@ ppr_kont_frames []
   = []
 
 ppr_end :: OutputableBndr b => End b -> SDoc
-ppr_end (Return k)
-  = text "ret" <+> ppr k
+ppr_end Return
+  = text "ret"
 ppr_end (Case var alts)
   = hang (text "case as" <+> pprBndr LetBind var <+> text "of") 2 $
       vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)
@@ -115,9 +114,13 @@ ppr_kont add_par (Kont frames end)
 ppr_pkont :: OutputableBndr b => (SDoc -> SDoc) -> PKont b -> SDoc
 ppr_pkont add_par (PKont bndrs body)
   = add_par $
-      hang (char '\\' <+> parens (sep (punctuate comma $ map (pprBndr LambdaBind) bndrs))
-                      <+> arrow)
+      hang (char '\\' <+> argTuple <+> arrow)
         2 (pprCoreComm body)
+  where
+    argTuple
+      = case bndrs of
+          [bndr] -> pprBndr LambdaBind bndr
+          _      -> parens (pprWithCommas (pprBndr LambdaBind) bndrs)
 
 pprCoreAlt :: OutputableBndr b => Alt b -> SDoc
 pprCoreAlt (Alt con args rhs)

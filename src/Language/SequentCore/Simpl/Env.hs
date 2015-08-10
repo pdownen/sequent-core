@@ -6,13 +6,13 @@ module Language.SequentCore.Simpl.Env (
 
   InCommand, InTerm, InArg, InKont, InFrame, InEnd, InPKont,
   InAlt, InBind, InBindPair, InRhs, InValue,
-  InId, InKontId, InPKontId, InVar, InTyVar, InCoVar,
+  InId, InPKontId, InVar, InTyVar, InCoVar,
   OutCommand, OutTerm, OutArg, OutKont, OutFrame, OutEnd, OutPKont,
   OutAlt, OutBind, OutBindPair, OutRhs, OutValue,
-  OutId, OutKontId, OutPKontId, OutVar, OutTyVar, OutCoVar,
+  OutId, OutPKontId, OutVar, OutTyVar, OutCoVar,
   
   mkBoundTo, mkBoundToPKont, findDef, setDef,
-  initialEnv, getMode, activeRule, enterScope, enterScopes, mkFreshVar, mkFreshKontId,
+  initialEnv, getMode, activeRule, enterScope, enterKontScope, enterScopes, mkFreshVar,
   substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar,
   getTvSubst, getCvSubst,
   extendIdSubst, extendPvSubst, zapSubstEnvs, staticPart, setStaticPart, mkSuspension,
@@ -61,9 +61,8 @@ import Var
 import VarEnv
 import VarSet
 
-import Control.Applicative ( (<$>), (<|>) )
+import Control.Applicative ( (<|>) )
 import Control.Exception   ( assert )
-import Control.Monad       ( guard )
 
 infixl 1 `setStaticPart`
 
@@ -72,7 +71,7 @@ data SimplEnv
                 , se_pvSubst :: SimplPvSubst   -- InPKontId |--> PKontSubstAns (in/out)
                 , se_tvSubst :: TvSubstEnv     -- InTyVar   |--> OutType
                 , se_cvSubst :: CvSubstEnv     -- InCoVar   |--> OutCoercion
-                , se_retId   :: Maybe KontId
+                , se_retTy   :: Maybe Type
                 , se_retKont :: Maybe KontSubstAns
                 --  ^^^ static part ^^^  --
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
@@ -185,7 +184,6 @@ type InBindPair = SeqCoreBindPair
 type InRhs      = SeqCoreRhs
 type InValue    = SeqCoreValue
 type InId       = Id
-type InKontId   = KontId
 type InPKontId  = PKontId
 type InVar      = Var
 type InTyVar    = TyVar
@@ -205,7 +203,6 @@ type OutBindPair = SeqCoreBindPair
 type OutRhs     = SeqCoreRhs
 type OutValue   = SeqCoreValue
 type OutId      = Id
-type OutKontId  = KontId
 type OutPKontId = PKontId
 type OutVar     = Var
 type OutTyVar   = TyVar
@@ -217,7 +214,7 @@ initialEnv dflags mode
              , se_pvSubst = emptyVarEnv
              , se_tvSubst = emptyVarEnv
              , se_cvSubst = emptyVarEnv
-             , se_retId   = Nothing
+             , se_retTy   = Nothing
              , se_retKont = Nothing
              , se_inScope = emptyInScopeSet
              , se_defs    = emptyVarEnv
@@ -251,21 +248,23 @@ enterScope env x
     env'  | isTyVar x   = env { se_tvSubst = tvs', se_inScope = ins', se_defs = defs' }
           | isCoVar x   = env { se_cvSubst = cvs', se_inScope = ins', se_defs = defs' }
           | isPKontId x = env { se_pvSubst = pvs', se_inScope = ins', se_defs = defs' }
-          | isKontId x  = env { se_pvSubst = emptyVarEnv, se_retId = Just x
-                              , se_retKont = rk',  se_inScope = ins', se_defs = defs' }
           | otherwise   = env { se_idSubst = ids', se_inScope = ins', se_defs = defs' }
     ids'  | x' /= x     = extendVarEnv ids x (DoneId x')
           | otherwise   = delVarEnv ids x
     pvs'  | x' /= x     = extendVarEnv pvs x (DoneId x')
           | otherwise   = delVarEnv pvs x
-    rk'   | x' /= x     = Just (DoneId x')
-          | otherwise   = Nothing
     tvs'  | x' /= x     = extendVarEnv tvs x (Type.mkTyVarTy x')
           | otherwise   = delVarEnv tvs x
     cvs'  | x' /= x     = extendVarEnv cvs x (Coercion.mkCoVarCo x')
           | otherwise   = delVarEnv cvs x
     ins'  = extendInScopeSet ins x'
     defs' = delVarEnv defs x'
+
+enterKontScope :: SimplEnv -> Type -> (SimplEnv, Type)
+enterKontScope env ty
+  = (env { se_pvSubst = emptyVarEnv, se_retTy = Just ty', se_retKont = Nothing }, ty')
+  where
+    ty' = substTy env ty
 
 enterScopes :: SimplEnv -> [InVar] -> (SimplEnv, [OutVar])
 enterScopes env []
@@ -284,21 +283,6 @@ mkFreshVar env name ty
         env' = env { se_inScope = extendInScopeSet (se_inScope env) x' }
     return (env', x')
 
-mkFreshKontId :: MonadUnique m => SimplEnv -> FastString -> Type -> m (SimplEnv, KontId)
-mkFreshKontId env name inTy
-  = do
-    p <- mkSysLocalM name inTy
-    let occInfo = -- Assumes we're wrapping a term in a Compute or some such,
-                  -- so there's no branching
-                  OneOcc notInsideLam oneBranch False
-        p'      = asKontId p `setIdOccInfo` occInfo
-        p_final = uniqAway (se_inScope env) p'
-        env'    = env { se_inScope = extendInScopeSet (se_inScope env) p_final
-                      , se_pvSubst = emptyVarEnv
-                      , se_retId   = Just p_final
-                      , se_retKont = Nothing }
-    return (env', p_final)
-
 substId :: SimplEnv -> InId -> TermSubstAns
 substId (SimplEnv { se_idSubst = ids, se_inScope = ins }) x
   = case lookupVarEnv ids x of
@@ -315,17 +299,12 @@ substPv (SimplEnv { se_pvSubst = pvs, se_inScope = ins }) j
       Just (DoneId j')        -> DoneId (refine ins j')
       Just ans                -> ans
 
-substKv :: SimplEnv -> KontId -> KontSubstAns
-substKv (SimplEnv { se_retId = q, se_retKont = rk, se_inScope = ins }) p
-  = case guard (Just p == q) >> rk of
-      Nothing                 -> warnPprTrace True __FILE__ __LINE__
-                                 (text "Unexpected cotinuation variable:" <+> pprBndr LetBind p $$
-                                  text "Expected:" <+> ((pprBndr LetBind <$> q) `orElse` text "<nothing>"))
-                                 DoneId (refine ins p)
-      Just (DoneId p')        -> DoneId (refine ins p')
-      Just (Done (Kont [] (Return p')))
-                              -> DoneId (refine ins p')
-      Just ans                -> ans
+substKv :: SimplEnv -> KontSubstAns
+substKv (SimplEnv { se_retKont = rk, se_retTy = ty })
+  = rk `orElse` DoneId kontId
+  where
+    -- A fake id just so we have something to pass to DoneId
+    kontId = mkKontId (ty `orElse` pprPanic "substKv" (text "at top level"))
 
 refine :: InScopeSet -> OutVar -> OutVar
 refine ins x
@@ -382,10 +361,8 @@ zapSubstEnvs env
 
 retType :: SimplEnv -> Type
 retType env
-  | Just k <- se_retId env
-  = case isKontTy_maybe (idType k) of
-      Just argTy -> substTy env argTy
-      Nothing    -> pprPanic "retType" (pprBndr LetBind k)
+  | Just ty <- se_retTy env
+  = substTy env ty
   | otherwise
   = panic "retType at top level"
 
@@ -398,7 +375,7 @@ setStaticPart dest (StaticEnv src)
          , se_pvSubst = se_pvSubst src
          , se_tvSubst = se_tvSubst src
          , se_cvSubst = se_cvSubst src
-         , se_retId   = se_retId   src
+         , se_retTy   = se_retTy   src
          , se_retKont = se_retKont src }
 
 inDynamicScope :: StaticEnv -> SimplEnv -> SimplEnv
@@ -646,7 +623,7 @@ commandIsHNF _env (Eval (Var fid) kont)
   = True
 commandIsHNF _env (Eval (Compute {}) _)
   = False
-commandIsHNF env (Eval term (Kont [] (Return _)))
+commandIsHNF env (Eval term (Kont [] Return))
   = termIsHNF env term
 commandIsHNF _ _
   = False
@@ -694,7 +671,7 @@ instance Outputable SimplEnv where
     $$ text " PvSubst   =" <+> ppr (se_pvSubst env)
     $$ text " TvSubst   =" <+> ppr (se_tvSubst env)
     $$ text " CvSubst   =" <+> ppr (se_cvSubst env)
-    $$ text " RetId     =" <+> ppr (se_retId env)
+    $$ text " RetTy     =" <+> ppr (se_retTy env)
     $$ text " RetKont   =" <+> ppr (se_retKont env)
     $$ text " Floats    =" <+> ppr floatBndrs
      <> char '>'
@@ -707,7 +684,7 @@ instance Outputable StaticEnv where
     $$ text " KvSubst   =" <+> ppr (se_pvSubst env)
     $$ text " TvSubst   =" <+> ppr (se_tvSubst env)
     $$ text " CvSubst   =" <+> ppr (se_cvSubst env)
-    $$ text " RetId     =" <+> ppr (se_retId env)
+    $$ text " RetTy     =" <+> ppr (se_retTy env)
     $$ text " RetKont   =" <+> ppr (se_retKont env)
      <> char '>'
 

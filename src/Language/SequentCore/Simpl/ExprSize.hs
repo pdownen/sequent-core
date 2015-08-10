@@ -124,7 +124,7 @@ bodySize dflags cap topArgs expr
     sizeFrame (App arg)     = sizeArg arg
     sizeFrame _             = sizeZero
     
-    sizeEnd (Return _)      = sizeZero
+    sizeEnd Return          = sizeZero
     sizeEnd (Case _ alts)   = sizeAlts alts
     
     sizeCut :: SeqCoreTerm -> SeqCoreKont -> BodySize
@@ -228,7 +228,7 @@ bodySize dflags cap topArgs expr
 
     isPassThroughKont :: Kont b -> Bool
     isPassThroughKont (Kont _  (Case {}))  = False
-    isPassThroughKont (Kont fs (Return _)) = all passThrough fs
+    isPassThroughKont (Kont fs Return)     = all passThrough fs
       where
         passThrough f = case f of
                           Tick _  -> True

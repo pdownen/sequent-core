@@ -1226,12 +1226,9 @@ occAnalTerm env expr@(Lam _ _)
     (binders, body)      = lambdas expr
     (env_body, binders') = oneShotGroup env binders
 
-occAnalTerm env (Compute bndr comm)
+occAnalTerm env (Compute ty comm)
   = case occAnalCommand env comm of { ( comm_usage, comm' ) ->
-    let
-        (final_usage, tagged_bndr) = tagBinder comm_usage bndr
-    in
-    (final_usage, Compute tagged_bndr comm') }
+    (comm_usage, Compute ty comm') }
 
 occAnalKont :: OccEnv
             -> UsageDetails         -- ^ Usage details for the term
@@ -1278,8 +1275,8 @@ occAnalKont env usage (Kont (Cast co : frames) end)
       (usage3, Cast co `consFrame` kont')
     }
     
-occAnalKont env uds kont@(Kont [] (Return p))
-  = (mkOneOcc env p False +++ uds, kont)
+occAnalKont _env uds kont@(Kont [] Return)
+  = (uds, kont)
 
 occAnalPKont :: OccEnv
              -> SeqCorePKont
@@ -1849,12 +1846,12 @@ mkAltEnv :: OccEnv -> Maybe (Id, Maybe Coercion) -> Id -> (OccEnv, Maybe (Id, Se
 mkAltEnv env@(OccEnv { occ_gbl_scrut = pe }) scrut case_bndr
   = case scrut of
       Just (v, Nothing) -> add_scrut v case_bndr'
-      Just (v, Just co) -> add_scrut v (Compute p (Eval case_bndr' (Kont [Cast (mkSymCo co)] (Return p))))
+      Just (v, Just co) -> add_scrut v (Compute ty (Eval case_bndr' (Kont [Cast (mkSymCo co)] Return)))
                           -- See Note [Case of cast]
       _                 -> (env { occ_encl = OccVanilla }, Nothing)
 
   where
-    p = mkArgKontId (idType case_bndr)
+    ty = idType case_bndr
     add_scrut v rhs = ( env { occ_encl = OccVanilla, occ_gbl_scrut = pe `extendVarSet` v }
                       , Just (localise v, rhs) )
 

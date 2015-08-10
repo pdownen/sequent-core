@@ -100,12 +100,16 @@ runSimplifier iters mode guts
       putMsg  $ text "CORE RULES"
              $$ text "----------"
              $$ ppr rules
-    when linting $ whenIsJust (lintCoreBindings binds) $ \err ->
-      pprPgmError "Sequent Core Lint error (pre-simpl)"
-        (withPprStyle defaultUserStyle $ err
-                                      $$ pprTopLevelBinds binds 
-                                      $$ text "--- Original Core: ---"
-                                      $$ Core.pprCoreBindings coreBinds)
+    when linting $ do
+      when dumping $ putMsg  $ text "LINT"
+                            $$ text "----"
+      whenIsJust (lintCoreBindings binds) $ \err ->
+        pprPgmError "Sequent Core Lint error (pre-simpl)"
+          (withPprStyle defaultUserStyle $ err
+                                        $$ pprTopLevelBinds binds 
+                                        $$ text "--- Original Core: ---"
+                                        $$ Core.pprCoreBindings coreBinds)
+      when dumping $ putMsg $ text "LINT PASSED"
     binds' <- go 1 binds
     let coreBinds' = bindsToCore binds'
     when dumping $ putMsg  $ text "FINAL CORE"
@@ -196,11 +200,11 @@ simplCommand env (Jump args j)
   = simplJump env args j
 
 simplTermNoFloats :: SimplEnv -> InTerm -> SimplM OutTerm
-simplTermNoFloats env (Compute p comm)
+simplTermNoFloats env (Compute ty comm)
   = do
-    let (env', p') = enterScope env p
+    let (env', ty') = enterKontScope env ty
     comm' <- simplCommandNoFloats env' comm
-    return $ mkCompute p' comm'
+    return $ mkCompute ty' comm'
 simplTermNoFloats env term
   = do
     (env', term') <- simplTerm (zapFloats env) term
@@ -211,20 +215,20 @@ simplTerm env (Type ty)
   = return (env, Type (substTy env ty))
 simplTerm env (Coercion co)
   = return (env, Coercion (substCo env co))
-simplTerm env (Compute p comm)
+simplTerm env (Compute ty comm)
   = do
-    let (env', p') = enterScope env p
+    let (env', ty') = enterKontScope env ty
     -- Terms are closed with respect to continuation variables, so they can
     -- safely float past this binder. Continuations must *never* float past it,
     -- however, because they necessarily invoke the continuation bound here.
     (env'', comm') <- simplCommandNoKontFloats (zapFloats env') comm
-    return (env `addFloats` env'', mkCompute p' comm')
+    return (env `addFloats` env'', mkCompute ty' comm')
 simplTerm env v
   = do
-    (env', p) <- mkFreshKontId env (fsLit "*termk") ty
-    let env'' = zapFloats env'
-    (env''', comm) <- simplCut env'' v (staticPart env'') [] (Return p)
-    return (env, mkCompute p (wrapFloats env''' comm))
+    let (env', ty') = enterKontScope env ty
+        env'' = zapFloats env'
+    (env''', comm) <- simplCut env'' v (staticPart env'') [] Return
+    return (env, mkCompute ty' (wrapFloats env''' comm))
   where ty = substTy env (termType v)
 
 simplBinds :: SimplEnv -> [InBind] -> TopLevelFlag
@@ -297,37 +301,36 @@ prepareRhsTerm :: SimplEnv -> TopLevelFlag -> OutId -> OutTerm
 prepareRhsTerm env _ _ v
   | isTrivialTerm v
   = return (env, v)
-prepareRhsTerm env level x (Compute p comm)
+prepareRhsTerm env level x (Compute ty comm)
   = do
     (env', term') <- prepComm env comm
     return (env', term')
   where
-    prepComm env (Eval term (Kont fs (Return p')))
-      = assert (p == p') $ do
+    prepComm env (Eval term (Kont fs Return))
+      = do
         (_isExp, env', fs', co_maybe) <- go (0 :: Int) fs
         case co_maybe of
           Just co -> do
-                     let Pair fromTy _toTy = coercionKind co
+                     let Pair fromTy toTy = coercionKind co
                      -- Don't use mkFreshKontId here because it sets the current continuation
-                     (env'', q) <- mkFreshVar env' (fsLit "*castk") (mkKontTy fromTy)
-                     (env''', x') <- mkFreshVar env'' (fsLit "ca") (kontTyArg (idType q))
+                     (env'', x') <- mkFreshVar env' (fsLit "ca") fromTy
                      -- x' shares its strictness and demand info with x, since
                      -- x only adds a cast to x'
                      let info = idInfo x
                          sanitizedInfo = vanillaIdInfo `setStrictnessInfo` strictnessInfo info
                                                        `setDemandInfo` demandInfo info
                          x'_final = x' `setIdInfo` sanitizedInfo
-                         x'_rhs = Compute q (Eval term (Kont fs' (Return q)))
+                         x'_rhs = mkCompute fromTy (Eval term (Kont fs' Return))
                      if isTrivialTerm x'_rhs
                        then -- No sense turning one trivial term into two, as
                             -- the simplifier will just end up substituting one
                             -- into the other and keep on looping
-                            return (env', Compute p (Eval term (Kont fs' (Return p))))
+                            return (env', Compute toTy (Eval term (Kont (fs' ++ [Cast co]) Return)))
                        else do
-                            env'''' <- completeNonRecTerm env''' False x'_final x'_final x'_rhs level
-                            x'_final_value <- simplVar env'''' x'_final
-                            return (env'''', Compute p (Eval x'_final_value (Kont [Cast co] (Return p))))
-          Nothing -> return (env', Compute p (Eval term (Kont fs' (Return p))))
+                            env''' <- completeNonRecTerm env'' False x'_final x'_final x'_rhs level
+                            x'_final_value <- simplVar env''' x'_final
+                            return (env''', Compute toTy (Eval x'_final_value (Kont [Cast co] Return)))
+          Nothing -> return (env', Compute ty (Eval term (Kont fs' Return)))
       where
         -- The possibility of a coercion split makes all of this tricky. Suppose
         -- we have
@@ -391,7 +394,7 @@ prepareRhsTerm env level x (Compute p comm)
         prepending f m
           = do { (isExp, env', fs, split) <- m; return (isExp, env', f : fs, split) }
     prepComm env comm
-      = return (env, Compute p comm)
+      = return (env, Compute ty comm)
 prepareRhsTerm env _ _ term
   = return (env, term)
 
@@ -438,38 +441,21 @@ simplPKontBind env_j j j' env_pk pk _recFlag
         completeBind env_j' j j' (Right (PKont xs' comm')) NotTopLevel
 
 -- | Bind a continuation as the current one (as bound by a Compute). Unlike with
--- simplLazyBind and simplPKontBind, here we *have* to substitute (that is,
--- either pre-inline or post-inline) since we can't give a continuation a
--- let binding.
-simplKontBind :: SimplEnv -> InKontId -> StaticEnv -> InKont -> SimplM SimplEnv
-simplKontBind env_p p env_k k
+-- simplLazyBind and simplPKontBind, here we *have* to substitute since we can't
+-- give a continuation a let binding.
+simplKontBind :: SimplEnv -> Type -> StaticEnv -> InKont -> SimplM SimplEnv
+simplKontBind env ty env_k k
   | tracing
-  , pprTraceShort "simplKontBind" (pprBndr LetBind p $$ ppr k) False
+  , pprTraceShort "simplKontBind" (text "ret" <+> dcolon <+> ppr ty $$ ppr k) False
   = undefined
-  | preInline
-  = do
-    tick $ PreInlineUnconditionally p
-    return env_p' { se_retKont = Just (Susp env_k k) }
   | otherwise
   = do
-    tick $ PostInlineUnconditionally p
-    (env_k', k') <- mkDupableKont (zapFloats (env_k `inDynamicScope` env_p'))
-                                  (kontTyArg (substTy env_p (idType p)))
-                                  k
-    return (env_p' `addFloats` env_k') { se_retKont = Just (Done k') }
+    -- For now, we use Susp as if the id were definitely used only once. If we
+    -- go into a multi-branch case, we'll call mkDupableKont then.
+    tick $ PreInlineUnconditionally (mkKontId ty)
+    return env' { se_retKont = Just (Susp env_k k) }
   where
-    (env_p', _) = enterScope env_p p -- ignore cloned p because we're
-                                     -- substituting anyway
-    
-    -- Pre-inline (i.e. substitute whole rather than making it dupable first)
-    -- whenever 
-    preInline
-      = case idOccInfo p of
-          OneOcc _ notInBranch _ -> notInBranch
-          other                  -> warnPprTrace True __FILE__ __LINE__
-                                    (text "weird OccInfo for cont var"
-                                      <+> ppr p <> colon <+> ppr other)
-                                    False
+    (env', _) = enterKontScope env ty
 
 {-
 Note [Wrap around compute]
@@ -508,8 +494,7 @@ wrapFloatsAroundTerm env (Compute p comm)
 wrapFloatsAroundTerm env term
   = do
     let ty = termType term
-    (env', k) <- mkFreshKontId env (fsLit "*wrap") ty
-    return $ mkCompute k $ wrapFloats env' (mkCommand [] term (Kont [] (Return k)))
+    return $ mkCompute ty $ wrapFloats env (mkCommand [] term (Kont [] Return))
 
 completeNonRecTerm :: SimplEnv -> Bool -> InVar -> OutVar -> OutTerm
                -> TopLevelFlag -> SimplM SimplEnv
@@ -625,9 +610,9 @@ simplCut env_v v env_k fs end
       ppr env_v $$ ppr v $$ ppr env_k $$ ppr (Kont fs end)
     ) False
   = undefined
-simplCut env_v v env_k [] (Return p)
-  = case substKv (env_k `inDynamicScope` env_v) p of
-      DoneId p'      -> simplCut2 (p /= p') env_v v env_k [] (Return p')
+simplCut env_v v env_k [] Return
+  = case substKv (env_k `inDynamicScope` env_v) of
+      DoneId _       -> simplCut2 False env_v v env_k [] Return
       Done k'        -> simplCut2 True  env_v v (zapSubstEnvsStatic env_k) fs' end'
         where Kont fs' end' = k'
       Susp env_k' k' -> simplCut        env_v v env_k' fs' end'
@@ -853,17 +838,20 @@ simplKont env fs end
         go env fs end (Cast co' : fs')
     go env [] (Case x alts) fs'
       = do
-        let (env', x') = enterScope env x
+        env' <- if length alts > 1
+                  then ensureDupableKont env -- we're about to duplicate the context
+                  else return env
+        let (env_alts, x') = enterScope env' x
         -- FIXME The Nothing there could be the scrutinee, but we don't ever
         -- have access to it here.
-        alts' <- forM alts (simplAlt env' Nothing [] x')
-        done env fs' (Case x' alts')
+        alts' <- forM alts (simplAlt env_alts Nothing [] x')
+        done env' fs' (Case x' alts')
     go env (Tick ti : fs) end fs'
       = go env fs end (Tick ti : fs')
-    go env [] (Return x) fs'
-      = case substKv env x of
-          DoneId x'
-            -> done env fs' (Return x')
+    go env [] Return fs'
+      = case substKv env of
+          DoneId _
+            -> done env fs' Return
           Done (Kont fs end)
             -> go (zapSubstEnvs env) fs end fs'
           Susp stat (Kont fs end)
@@ -959,13 +947,13 @@ preInlineUnconditionally env_x _env_rhs pair level
           | not inLam = isNotTopLevel level || early_phase
           | BindTerm _ rhs <- pair = intCxt && canInlineTermInLam rhs
           | otherwise = False
-        canInlineInLam k c
-          | Just v <- asValueCommand k c = canInlineTermInLam v
+        canInlineInLam c
+          | Just v <- asValueCommand c   = canInlineTermInLam v
           | otherwise                    = False
         canInlineTermInLam (Lit _)       = True
         canInlineTermInLam (Lam x t)     = isRuntimeVar x
                                          || canInlineTermInLam t
-        canInlineTermInLam (Compute k c) = canInlineInLam k c
+        canInlineTermInLam (Compute _ c) = canInlineInLam c
         canInlineTermInLam _             = False
         early_phase = case sm_phase mode of
                         Phase 0 -> False
@@ -1081,7 +1069,7 @@ interestingArg e = goT e 0
     goC (Jump vs j)  _ = goT (Var j) (length (filter isValueArg vs))
     
     goK (Kont _ (Case {}))   _ = Nothing
-    goK (Kont fs (Return _)) n = Just $ length (filter realArg fs) + n
+    goK (Kont fs Return)     n = Just $ length (filter realArg fs) + n
     
     realArg (App (Type _))     = False
     realArg (App (Coercion _)) = False
@@ -1225,6 +1213,17 @@ tryUnfolding dflags id lone_variable
                    discount = computeDiscount dflags uf_arity arg_discounts 
                                               res_discount arg_infos cont_info'
 
+ensureDupableKont :: SimplEnv -> SimplM SimplEnv
+ensureDupableKont env
+  | Just (Susp stat kont) <- se_retKont env
+  = do
+    (env', kont') <- mkDupableKont (stat `inDynamicScope` env) ty kont
+    return (env `addFloats` env') { se_retKont = Just (Done kont') }
+  | otherwise
+  = return env
+  where
+    ty = se_retTy env `orElse` pprPanic "ensureDupableKont" (text "at top level")
+
 -- | Make a continuation into something we're okay with duplicating into each
 -- branch of a case (and each branch of those branches, ...), possibly
 -- generating a number of bound terms and join points in the process.
@@ -1235,7 +1234,7 @@ tryUnfolding dflags id lone_variable
 --   3. Don't duplicate ticks (because GHC doesn't).
 --   4. Duplicate applications, but ANF-ize them first to share the arguments.
 --   5. Don't duplicate single-branch cases.
---   5. Duplicate cases, but "ANF-ize" in a dual sense by creating a join point
+--   6. Duplicate cases, but "ANF-ize" in a dual sense by creating a join point
 --        for each branch.
 
 mkDupableKont :: SimplEnv -> Type -> InKont -> SimplM (SimplEnv, OutKont)
@@ -1251,9 +1250,9 @@ mkDupableKont env ty kont
     -- The OutKont -> OutKont is a continuation for the outer continuation (!!).
     go :: SimplEnv -> [OutFrame] -> Type -> [InFrame] -> InEnd
        -> SimplM (SimplEnv, OutKont)
-    go env fs' ty [] (Return kid)
-      = case substKv env kid of
-          DoneId kid'               -> done env fs' (Return kid')
+    go env fs' ty [] Return
+      = case substKv env of
+          DoneId _                  -> done env fs' Return
           Done (Kont fs end)        -> do
                                        let env' = zapSubstEnvs env
                                        go env' fs' ty fs end
@@ -1313,7 +1312,7 @@ mkDupableKont env ty kont
         -- continuations are strict contexts. If that changes, we'll need to
         -- revisit this.
       = do
-        let kontTy = mkKontTy (mkKontArgsTy (mkTupleTy UnboxedTuple [ty]))
+        let kontTy = mkKontTy (mkTupleTy UnboxedTuple [ty])
         (env', j) <- mkFreshVar env name kontTy
         let (env'', x) = enterScope env' (mkKontArgId ty)
             join_rhs  = PKont [x] (Eval (Var x) (Kont fs end))
@@ -1364,7 +1363,7 @@ mkDupableAlt env caseBndr alt@(Alt altCon bndrs rhs)
         
         let (tyBndrs, valBndrs) = span isTyVar used_bndrs
             bndrTys = map idType valBndrs
-            argTy   = mkKontArgsTy $ foldr mkUbxExistsTy (mkTupleTy UnboxedTuple bndrTys) tyBndrs
+            argTy   = foldr mkUbxExistsTy (mkTupleTy UnboxedTuple bndrTys) tyBndrs
         
         (_, join_bndr) <- mkFreshVar env (fsLit "*j") (mkKontTy argTy)
         
@@ -1392,7 +1391,7 @@ commandIsDupable dflags c
     go n (T (Var {}))      = decrement n
     go n (T (Lit lit))     | litIsDupable dflags lit = decrement n
     
-    go n (K (Kont fs (Return _))) = goF n fs
+    go n (K (Kont fs Return)) = goF n fs
     
     go _ _ = Nothing
     

@@ -43,19 +43,30 @@ it names.
 type LintM = Either SDoc
 type TermEnv = TvSubst
 type KontEnv = TvSubst
-type LintEnv = (TermEnv, KontEnv)
+type LintEnv = (TermEnv, KontEnv, Type)
 
 termEnv :: LintEnv -> TermEnv
-termEnv (env, _enk) = env
+termEnv (env, _enk, _retTy) = env
 
 kontEnv :: LintEnv -> KontEnv
-kontEnv (_env, enk) = enk
+kontEnv (_env, enk, _retTy) = enk
 
-mkLintEnv :: TermEnv -> KontEnv -> LintEnv
-mkLintEnv env enk = (env, enk)
+retTy :: LintEnv -> Type
+retTy (_env, _enk, retTy) = retTy
 
-emptyLintEnv :: LintEnv
-emptyLintEnv = mkLintEnv emptyTvSubst emptyTvSubst
+mkLintEnv :: TermEnv -> KontEnv -> Type -> LintEnv
+mkLintEnv env enk ty = (env, enk, ty)
+
+emptyTermEnv :: TermEnv
+emptyTermEnv = emptyTvSubst
+
+extendTermEnv :: TermEnv -> Var -> Term Var -> TermEnv
+extendTermEnv ent bndr _term
+  = extendTvInScope ent bndr
+
+extendTermEnvList :: TermEnv -> [BindPair Var] -> TermEnv
+extendTermEnvList ent pairs
+  = foldr (\(BindTerm x rhs) ent -> extendTermEnv ent x rhs) ent pairs
 
 extendLintEnv :: LintEnv -> BindPair Var -> LintEnv
 extendLintEnv env (BindTerm bndr _term)
@@ -67,20 +78,43 @@ extendLintEnvList :: LintEnv -> [BindPair Var] -> LintEnv
 extendLintEnvList = foldr (flip extendLintEnv)
 
 mapTermLintEnv :: (TermEnv -> TermEnv) -> LintEnv -> LintEnv
-mapTermLintEnv f env = mkLintEnv (f (termEnv env)) (kontEnv env)
+mapTermLintEnv f env = mkLintEnv (f (termEnv env)) (kontEnv env) (retTy env)
 
 mapKontLintEnv :: (KontEnv -> KontEnv) -> LintEnv -> LintEnv
-mapKontLintEnv f env = mkLintEnv (termEnv env) (f (kontEnv env))
+mapKontLintEnv f env = mkLintEnv (termEnv env) (f (kontEnv env)) (retTy env)
 
 eitherToMaybe :: Either a b -> Maybe a
 eitherToMaybe (Left a)  = Just a
 eitherToMaybe (Right _) = Nothing
 
 lintCoreBindings :: [SeqCoreBind] -> Maybe SDoc
-lintCoreBindings binds = eitherToMaybe $ foldM lintCoreBind emptyLintEnv binds
+lintCoreBindings binds = eitherToMaybe $ foldM lintCoreTopBind emptyTermEnv binds
 
 lintTerm :: TvSubst -> SeqCoreTerm -> Maybe SDoc
 lintTerm env term = eitherToMaybe $ lintCoreTerm env term 
+
+lintCoreTopBind :: TermEnv -> SeqCoreBind -> LintM TermEnv
+lintCoreTopBind ent (NonRec (BindTerm bndr rhs))
+  = do
+    termTy <- lintCoreTerm ent rhs
+    checkRhsType bndr (idType bndr) termTy
+    let bndrTy = substTy ent (idType bndr)
+        bndr'  = bndr `setIdType` bndrTy
+    return $ extendTermEnv ent bndr' rhs
+lintCoreTopBind ent (Rec pairs)
+  | all bindsTerm pairs
+  = do
+    let bndrs   = map binderOfPair pairs
+        bndrTys = map (substTy ent . idType) bndrs
+        bndrs'  = zipWith setIdType bndrs bndrTys
+        pairs'  = zipWith setPairBinder pairs bndrs'
+        ent'    = extendTermEnvList ent pairs'
+    forM_ pairs' $ \(BindTerm bndr rhs) -> do
+      termTy <- lintCoreTerm ent' rhs
+      checkRhsType bndr (idType bndr) termTy
+    return ent'
+lintCoreTopBind _ bind
+  = Left $ text "Continuation binding at top level:" <+> ppr bind
 
 lintCoreBind :: LintEnv -> SeqCoreBind -> LintM LintEnv
 lintCoreBind env (NonRec pair)
@@ -133,17 +167,13 @@ lintCoreBindPair env (BindPKont bndr (PKont xs comm))
   = do
     lintKontBndrTypes (termEnv env) bndr xs
     let (ent, _) = mapAccumL lintBindInTermEnv (termEnv env) xs
-    lintCoreCommand (mkLintEnv ent (kontEnv env)) comm
+    lintCoreCommand (mkLintEnv ent (kontEnv env) (retTy env)) comm
 
 lintKontBndrTypes :: TermEnv -> SeqCoreBndr -> [SeqCoreBndr] -> LintM ()
 lintKontBndrTypes env bndr argBndrs
   = do
     bndrTy <- kontIdTyOrError env bndr
-    argsTy <- case isKontArgsTy_maybe bndrTy of
-                Just argsTy -> return argsTy
-                Nothing     -> Left $ text "binder should have Cont# (ContArgs# _) type:" <+>
-                                      pprBndr LetBind bndr
-    go argsTy argBndrs
+    go bndrTy argBndrs
   where
     go ty bndrs
       | isUbxExistsTy ty
@@ -186,13 +216,10 @@ lintCoreTerm env (Lam x body)
     retTy <- lintCoreTerm env' body
     return $ mkPiType x' retTy
 
-lintCoreTerm env (Compute bndr comm)
+lintCoreTerm env (Compute ty comm)
   = do
-    ty <- kontIdTyOrError env bndr
-    lintCoreCommand (mkLintEnv env enk) comm
+    lintCoreCommand (mkLintEnv env emptyTvSubst ty) comm
     return ty
-  where
-    enk = extendTvInScope emptyTvSubst (substTyInId env bndr)
 
 lintCoreTerm _env (Lit lit)
   = return $ literalType lit
@@ -233,11 +260,7 @@ lintCoreJump :: LintEnv -> [SeqCoreArg] -> PKontId -> LintM ()
 lintCoreJump env args j
   = do
     ty <- kontIdTyOrError (termEnv env) j
-    argsTy <- case isKontArgsTy_maybe (substTy (termEnv env) ty) of
-                Just argsTy -> return argsTy
-                Nothing     -> Left $ text "target of jump should have type Cont# (ContArgs# _):" <+>
-                                      pprBndr LetBind j
-    go argsTy args
+    go ty args
   where
     topArgs = args
     
@@ -308,16 +331,10 @@ lintCoreFrame _ env ty (Tick _)
   = return (env, ty)
 
 lintCoreEnd :: SDoc -> LintEnv -> Type -> SeqCoreEnd -> LintM ()
-lintCoreEnd desc env ty (Return k)
-  | Just k' <- lookupInScope (getTvInScope (kontEnv env)) k
-  = if substTy (termEnv env) (idType k) `eqType` idType k'
-      then void $
-           checkingType (desc <> colon <+> text "cont variable" <+> ppr k) ty $
-           kontIdTyOrError (termEnv env) k
-      else Left $ desc <> colon <+> text "cont variable" <+> pprBndr LetBind k <+> text "bound as"
-                                                         <+> pprBndr LetBind k'
-  | otherwise
-  = Left $ desc <> colon <+> text "not found in context:" <+> pprBndr LetBind k
+lintCoreEnd desc env ty Return
+  = let expTy = substTy (termEnv env) (retTy env)
+    in unless (expTy `eqType` ty) $
+      mkError (desc <> colon <+> text "return type") (ppr expTy) (ppr ty)
 lintCoreEnd desc env ty (Case bndr alts)
   = do
     let env' = mapTermLintEnv (\ent -> extendTvInScopeSubsted ent bndr) env
@@ -356,7 +373,7 @@ checkingType desc ex go
     unless (ex `eqType` act) $ mkError desc (ppr ex) (ppr act)
     return act
 
-kontIdTyOrError :: TermEnv -> KontId -> LintM Type
+kontIdTyOrError :: TermEnv -> PKontId -> LintM Type
 kontIdTyOrError env k
   = case isKontTy_maybe (substTy env (idType k)) of
       Just arg -> return arg
