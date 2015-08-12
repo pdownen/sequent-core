@@ -91,14 +91,15 @@ ppr_term add_par (Compute ty comm)
         2 (pprCoreComm comm)
 
 ppr_kont_frames :: OutputableBndr b => [Frame b] -> [SDoc]
-ppr_kont_frames (App v : k)
-  = char '$' <+> ppr_term noParens v : ppr_kont_frames k
-ppr_kont_frames (Cast _ : k)
-  = text "cast ..." : ppr_kont_frames k
-ppr_kont_frames (Tick _ : k)
-  = text "tick ..." : ppr_kont_frames k
-ppr_kont_frames []
-  = []
+ppr_kont_frames = map ppr_frame
+
+ppr_frame :: OutputableBndr b => Frame b -> SDoc
+ppr_frame (App v)
+  = char '$' <+> ppr_term noParens v
+ppr_frame (Cast _)
+  = text "cast ..."
+ppr_frame (Tick _)
+  = text "tick ..."
 
 ppr_end :: OutputableBndr b => End b -> SDoc
 ppr_end Return
@@ -158,7 +159,13 @@ instance OutputableBndr b => Outputable (Command b) where
 
 instance OutputableBndr b => Outputable (Kont b) where
   ppr = ppr_kont noParens
-  
+
+instance OutputableBndr b => Outputable (Frame b) where
+  ppr = ppr_frame
+
+instance OutputableBndr b => Outputable (End b) where
+  ppr = ppr_end
+
 instance OutputableBndr b => Outputable (PKont b) where
   ppr = ppr_pkont noParens
 

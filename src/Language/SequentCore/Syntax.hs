@@ -15,8 +15,8 @@ module Language.SequentCore.Syntax (
     SeqCoreCommand, SeqCoreBind, SeqCoreBindPair, SeqCoreRhs, SeqCoreBndr,
     SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
-  mkCommand, mkVarTerm, mkLambdas, mkCompute, mkAppTerm, mkCast,
-  mkConstruction,
+  mkCommand, mkVarTerm, mkLambdas, mkCompute, mkComputeEval,
+  mkAppTerm, mkCast, mkCastMaybe, mkConstruction, mkImpossibleCommand,
   addLets, addLetsToTerm, addNonRec, consFrame, addFrames,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
@@ -50,7 +50,8 @@ module Language.SequentCore.Syntax (
 import {-# SOURCE #-} Language.SequentCore.Pretty ()
 import Language.SequentCore.WiredIn
 
-import Coercion  ( Coercion, coercionKind, coercionType, isCoVar, mkCoVarCo )
+import Coercion  ( Coercion, coercionKind, coercionType, isCoVar, isCoVarType
+                 , isReflCo, mkCoCast, mkCoVarCo, mkTransCo )
 import CoreSyn   ( AltCon(..), Tickish, tickishCounts, isRuntimeVar
                  , isEvaldUnfolding )
 import DataCon   ( DataCon, dataConTyCon, dataConRepArity
@@ -58,8 +59,9 @@ import DataCon   ( DataCon, dataConTyCon, dataConRepArity
 import Id        ( Id, isDataConWorkId, isDataConWorkId_maybe, isConLikeId
                  , idArity, idType, idDetails, idUnfolding, isBottomingId )
 import IdInfo    ( IdDetails(..) )
-import Literal   ( Literal, isZeroLit, litIsTrivial, literalType )
+import Literal   ( Literal, isZeroLit, litIsTrivial, literalType, mkMachString )
 import Maybes    ( orElse )
+import MkCore    ( rUNTIME_ERROR_ID )
 import Outputable
 import Pair      ( pSnd )
 import PrimOp    ( PrimOp(..), primOpOkForSpeculation, primOpOkForSideEffects
@@ -215,7 +217,7 @@ mkVarTerm x | Type.isTyVar x = Type (Type.mkTyVarTy x)
 mkLambdas :: [b] -> Term b -> Term b
 mkLambdas = flip (foldr Lam)
 
-mkCompute :: HasId b => Type -> Command b -> Term b
+mkCompute :: Type -> Command b -> Term b
 -- | Wraps a command that returns to the given continuation id in a term using
 -- 'Compute'. If the command is a value command (see 'asValueCommand'), unwraps
 -- it instead.
@@ -225,6 +227,9 @@ mkCompute ty comm
   | otherwise
   = Compute ty comm
   
+mkComputeEval :: HasId b => Term b -> Kont b -> Term b
+mkComputeEval v k = mkCompute (termType v) (Eval v k)
+
 mkAppTerm :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreTerm
 mkAppTerm fun args = mkCompute retTy (Eval fun (Kont (map App args) Return))
   where
@@ -232,13 +237,34 @@ mkAppTerm fun args = mkCompute retTy (Eval fun (Kont (map App args) Return))
     (_, retTy) = Type.splitFunTys $ Type.applyTys (termType fun) tyArgs
 
 mkCast :: SeqCoreTerm -> Coercion -> SeqCoreTerm
-mkCast term co = Compute ty $ Eval term (Kont [Cast co] Return)
+mkCast term co | isReflCo co = term
+mkCast (Coercion termCo) co | isCoVarType (pSnd (coercionKind co))
+                            = Coercion (mkCoCast termCo co)
+-- Unfortunately, our representation isn't good at finding casts at top level.
+-- We would need a deep search to find anything besides this very simple case.
+-- Fortunately, this should ensure that successive mkCasts accumulate nicely.
+mkCast (Compute _ (Eval term (Kont [Cast co1] Return))) co2
+  = Compute ty (Eval term (Kont [Cast (mkTransCo co1 co2)] Return))
+  where
+    ty = pSnd (coercionKind co2)
+mkCast term co
+  = Compute ty (Eval term (Kont [Cast co] Return))
   where
     ty = pSnd (coercionKind co)
+
+mkCastMaybe :: SeqCoreTerm -> Maybe Coercion -> SeqCoreTerm
+mkCastMaybe term Nothing   = term
+mkCastMaybe term (Just co) = mkCast term co
 
 mkConstruction :: DataCon -> [Type] -> [SeqCoreTerm] -> SeqCoreTerm
 mkConstruction dc tyArgs valArgs
   = mkAppTerm (Var (dataConWorkId dc)) (map Type tyArgs ++ valArgs)
+
+mkImpossibleCommand :: Type -> SeqCoreCommand
+mkImpossibleCommand ty
+  = Eval (Var rUNTIME_ERROR_ID) (Kont [App (Type ty), App errString] Return)
+  where
+    errString = Lit (mkMachString "Impossible case alternative")
 
 -- | Adds the given bindings outside those in the given command.
 addLets :: [Bind b] -> Command b -> Command b
