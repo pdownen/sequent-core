@@ -42,6 +42,7 @@ library
   other-modules:       Language.SequentCore.Simpl.Env
                        Language.SequentCore.Simpl.ExprSize
                        Language.SequentCore.Simpl.Monad
+                       Language.SequentCore.Simpl.Util
                        Language.SequentCore.Util
                        Language.SequentCore.WiredIn
   build-depends:       base >= 4 && < 5, ghc >= 7.8 && < 7.10, containers, transformers,

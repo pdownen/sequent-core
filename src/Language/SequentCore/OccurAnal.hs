@@ -18,7 +18,6 @@ module Language.SequentCore.OccurAnal (
     ) where
 
 import Language.SequentCore.Syntax
-import Language.SequentCore.WiredIn
 
 import Id
 import Name( localiseName )

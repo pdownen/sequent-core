@@ -794,8 +794,8 @@ commandToCoreExpr retTy comm
       Jump args j    -> Core.mkCoreApps (Core.Var (pKontIdToCore retTy j))
                                         (map termToCoreExpr args ++ extraArgs)
         where
-          extraArgs | all isTypeTerm args = [ Core.Var voidPrimId ]
-                    | otherwise           = []
+          extraArgs | all isTypeArg args = [ Core.Var voidPrimId ]
+                    | otherwise          = []
 
 -- | Translates a term into Core.
 termToCoreExpr :: SeqCoreTerm -> Core.CoreExpr

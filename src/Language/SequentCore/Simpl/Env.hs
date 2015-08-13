@@ -1,32 +1,39 @@
-{-# LANGUAGE ViewPatterns, CPP #-}
+{-# LANGUAGE ViewPatterns, BangPatterns, CPP #-}
 
 module Language.SequentCore.Simpl.Env (
-  SimplEnv(..), StaticEnv, SimplIdSubst, SubstAns(..), IdDefEnv, Definition(..),
-  Guidance(..),
-
+  SimplEnv,
+  initialEnv, getMode, dynFlags, getSimplRules,
+  getUnfoldingInRuleMatch, activeRule,
+  
+  SimplIdSubst, SubstAns(..),
+  substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar,
+  substTerm, substKont, substCommand,
+  retType,
+  extendIdSubst, extendPvSubst, extendTvSubst, extendCvSubst, setRetKont,
+  enterScope, enterKontScope, enterScopes, mkFreshVar,
+  getTvSubst, getCvSubst,
+  zapSubstEnvs,
+  
+  StaticEnv,
+  staticPart, setStaticPart, inDynamicScope,
+  zapSubstEnvsStatic,
+  
+  IdDefEnv, Definition(..), Guidance(..),
+  mkBoundTo, mkBoundToPKont, mkDef,
+  findDef, setDef, activeUnfolding,
+  
+  Floats,
+  emptyFloats, addNonRecFloat, addRecFloats, zapFloats, zapKontFloats,
+  mapFloats, extendFloats, addFloats, wrapFloats, wrapKontFloats, wrapFloatsAroundTerm,
+  isEmptyFloats, hasNoKontFloats,
+  doFloatFromRhs, getFloatBinds, getFloats,
+  
   InCommand, InTerm, InArg, InKont, InFrame, InEnd, InPKont,
   InAlt, InBind, InBndr, InBindPair, InRhs, InValue,
   InType, InCoercion, InId, InPKontId, InVar, InTyVar, InCoVar,
   OutCommand, OutTerm, OutArg, OutKont, OutFrame, OutEnd, OutPKont,
   OutAlt, OutBind, OutBndr, OutBindPair, OutRhs, OutValue,
   OutType, OutCoercion, OutId, OutPKontId, OutVar, OutTyVar, OutCoVar,
-  
-  mkBoundTo, mkBoundToPKont, findDef, setDef,
-  initialEnv, getMode, getUnfoldingInRuleMatch, activeRule, retType,
-  enterScope, enterKontScope, enterScopes, mkFreshVar,
-  substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar,
-  substTerm, substKont, substCommand,
-  getTvSubst, getCvSubst,
-  extendIdSubst, extendPvSubst, extendTvSubst, extendCvSubst, mkSuspension, 
-  staticPart, setStaticPart, inDynamicScope,
-  zapSubstEnvs, zapSubstEnvsStatic,
-  
-  Floats, emptyFloats, addNonRecFloat, addRecFloats, zapFloats, zapKontFloats,
-  mapFloats, extendFloats, addFloats, wrapFloats, wrapKontFloats,
-  isEmptyFloats, hasNoKontFloats,
-  doFloatFromRhs, getFloatBinds, getFloats,
-  
-  activeUnfolding,
   
   termIsHNF, termIsConLike, termIsConApp_maybe
 ) where
@@ -56,7 +63,7 @@ import CoreSyn    ( Tickish(Breakpoint)
                   , tickishCounts, tickishIsCode )
 import CoreUnfold ( mkCoreUnfolding, mkDFunUnfolding  )
 import DataCon
-import DynFlags   ( DynFlags, ufCreationThreshold )
+import DynFlags   ( DynFlags, HasDynFlags, getDynFlags, ufCreationThreshold )
 import FastString ( FastString )
 import Id
 import IdInfo
@@ -64,6 +71,7 @@ import Maybes
 import OrdList
 import Outputable
 import Pair
+import Rules      ( RuleBase )
 import TyCon
 import Type       ( Type, TvSubstEnv, TvSubst
                   , eqType, splitTyConApp_maybe, tyVarsOfType
@@ -79,7 +87,12 @@ import VarSet
 import Control.Applicative ( (<|>) )
 import Control.Exception   ( assert )
 
-infixl 1 `setStaticPart`
+infixl 1 `setStaticPart`, `inDynamicScope`, `setRetKont`
+
+data SimplGlobalEnv
+  = SimplGlobalEnv { sge_dflags   :: DynFlags
+                   , sge_mode     :: SimplifierMode
+                   , sge_ruleBase :: RuleBase }
 
 data SimplEnv
   = SimplEnv    { se_idSubst :: SimplIdSubst   -- InId      |--> TermSubstAns (in/out)
@@ -92,8 +105,7 @@ data SimplEnv
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
                 , se_defs    :: IdDefEnv       -- OutId     |--> Definition (out)
                 , se_floats  :: Floats
-                , se_dflags  :: DynFlags
-                , se_mode    :: SimplifierMode }
+                , se_global  :: SimplGlobalEnv }
 
 newtype StaticEnv = StaticEnv SimplEnv -- Ignore se_inScope, etc.
 
@@ -141,6 +153,16 @@ data Guidance
               
 always :: Guidance
 always = Usually { guEvenIfUnsat = True, guEvenIfBoring = True }
+
+mkDef :: (Monad m, HasDynFlags m)
+      => SimplEnv -> TopLevelFlag -> OutRhs -> m Definition
+mkDef env level rhs
+  = do
+    dflags <- getDynFlags
+    -- FIXME Make a BoundToDFun when possible
+    return $ case rhs of
+               Left term -> mkBoundTo env dflags term (termArity term) level
+               Right pkont -> mkBoundToPKont dflags pkont
 
 mkBoundTo :: SimplEnv -> DynFlags -> OutTerm -> Arity -> TopLevelFlag -> Definition
 mkBoundTo env dflags term arity level
@@ -229,8 +251,8 @@ type OutVar     = Var
 type OutTyVar   = TyVar
 type OutCoVar   = CoVar
 
-initialEnv :: DynFlags -> SimplifierMode -> SimplEnv
-initialEnv dflags mode
+initialEnv :: DynFlags -> SimplifierMode -> RuleBase -> SimplEnv
+initialEnv dflags mode rules
   = SimplEnv { se_idSubst = emptyVarEnv
              , se_pvSubst = emptyVarEnv
              , se_tvSubst = emptyVarEnv
@@ -240,11 +262,22 @@ initialEnv dflags mode
              , se_inScope = emptyInScopeSet
              , se_defs    = emptyVarEnv
              , se_floats  = emptyFloats
-             , se_dflags  = dflags
-             , se_mode    = mode }
+             , se_global  = initialGlobalEnv dflags mode rules }
+             
+initialGlobalEnv :: DynFlags -> SimplifierMode -> RuleBase -> SimplGlobalEnv
+initialGlobalEnv dflags mode rules
+  = SimplGlobalEnv { sge_dflags   = dflags
+                   , sge_mode     = mode
+                   , sge_ruleBase = rules }
 
 getMode :: SimplEnv -> SimplifierMode
-getMode = se_mode
+getMode = sge_mode . se_global
+
+dynFlags :: SimplEnv -> DynFlags
+dynFlags = sge_dflags . se_global
+
+getSimplRules :: SimplEnv -> RuleBase
+getSimplRules = sge_ruleBase . se_global
 
 activeRule :: SimplEnv -> Activation -> Bool
 -- Nothing => No rules at all
@@ -253,9 +286,6 @@ activeRule env
   | otherwise           = isActive (sm_phase mode)
   where
     mode = getMode env
-
-mkSuspension :: StaticEnv -> In a -> SubstAns a
-mkSuspension = Susp
 
 enterScope :: SimplEnv -> InVar -> (SimplEnv, OutVar)
 enterScope env x
@@ -474,6 +504,10 @@ extendCvSubst :: SimplEnv -> InCoVar -> OutCoercion -> SimplEnv
 extendCvSubst env@(SimplEnv { se_cvSubst = cvs }) coVar co
   = env { se_cvSubst = extendVarEnv cvs coVar co }
 
+setRetKont :: SimplEnv -> KontSubstAns -> SimplEnv
+setRetKont env ans
+  = env { se_retKont = Just ans }
+
 zapSubstEnvs :: SimplEnv -> SimplEnv
 zapSubstEnvs env
   = env { se_idSubst = emptyVarEnv
@@ -501,7 +535,7 @@ staticPart :: SimplEnv -> StaticEnv
 staticPart = StaticEnv
 
 setStaticPart :: SimplEnv -> StaticEnv -> SimplEnv
-setStaticPart dest (StaticEnv src)
+setStaticPart dest (StaticEnv !src)
   = dest { se_idSubst = se_idSubst src
          , se_pvSubst = se_pvSubst src
          , se_tvSubst = se_tvSubst src
@@ -512,7 +546,7 @@ setStaticPart dest (StaticEnv src)
 inDynamicScope :: StaticEnv -> SimplEnv -> SimplEnv
 inDynamicScope = flip setStaticPart
 
--- This effectively clears everything but the retId, since it's the only static
+-- This effectively clears everything but the retTy, since it's the only static
 -- part that won't get zapped
 zapSubstEnvsStatic :: StaticEnv -> StaticEnv
 zapSubstEnvsStatic (StaticEnv env)
@@ -598,8 +632,8 @@ extendFloats env bind
     bndrs = bindersOf bind
     defs = map asDef (flattenBind bind)
     -- FIXME The NotTopLevel flag might wind up being wrong!
-    asDef (BindTerm x term) = (x, mkBoundTo env (se_dflags env) term (termArity term) NotTopLevel)
-    asDef (BindPKont p pk)  = (p, mkBoundToPKont (se_dflags env) pk)
+    asDef (BindTerm x term) = (x, mkBoundTo env (dynFlags env) term (termArity term) NotTopLevel)
+    asDef (BindPKont p pk)  = (p, mkBoundToPKont (dynFlags env) pk)
 
 addFloats :: SimplEnv -> SimplEnv -> SimplEnv
 -- Add the floats for env2 to env1;
@@ -628,6 +662,44 @@ wrapKontFloats env cmd
                                  = Just (Rec pairs')
                                  | otherwise
                                  = Nothing
+
+
+{-
+Note [Wrap around compute]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Suppose we have floats F and we wrap around a term (compute p. c), that is, we
+calculate
+
+F[compute p. c].
+
+Remembering that terms are continuation-closed, we know two things:
+
+1. Any continuations let-bound in F will be dead bindings, and
+2. Any terms bound in F can float into c.
+
+We are safe, then, in saying
+
+F[compute p. c] = compute p. F'[c],
+
+where F' contains only the term bindings from F. Of course, if a binding *is*
+trying to float up past a compute, something has gone very wrong, so we check
+for this condition and warn.
+-}
+
+wrapFloatsAroundTerm :: SimplEnv -> OutTerm -> OutTerm
+wrapFloatsAroundTerm env term
+  | isEmptyFloats env
+  = term
+wrapFloatsAroundTerm env (Compute p comm)
+  -- See Note [Wrap around compute]
+  = warnPprTrace (not $ hasNoKontFloats env) __FILE__ __LINE__
+      (text "cont floats escaping body of command:" <+> ppr comm $$
+       text "floats:" <+> brackets (pprWithCommas (ppr . bindersOf)
+                                                  (getFloatBinds (getFloats env)))) $
+    Compute p (wrapFloats (zapKontFloats env) comm)
+wrapFloatsAroundTerm env term
+  = mkCompute (termType term) $ wrapFloats env (mkCommand [] term (Kont [] Return))
 
 addFlts :: Floats -> Floats -> Floats
 addFlts (Floats bs1 l1) (Floats bs2 l2)
@@ -978,7 +1050,7 @@ termIsConApp_maybe env id_unf term
         -- expanding ASSERT2
         if debugIsOn && not (
             eqType _from_ty (mkTyConApp to_tc (stripTypeArgs $ takeList dc_univ_tyvars args)) &&
-            all isTypeTerm ex_args &&
+            all isTypeArg ex_args &&
             equalLength val_args arg_tys)
           then assertPprPanic __FILE__ __LINE__ dump_doc
           else Just (dc, to_tc_arg_tys, ex_args ++ new_val_args)
@@ -987,7 +1059,7 @@ termIsConApp_maybe env id_unf term
       = Nothing
 
         
-    stripTypeArgs args = assert (all isTypeTerm args)
+    stripTypeArgs args = assert (all isTypeArg args)
                          [ ty | Type ty <- args ]
     
     -- cheating ...

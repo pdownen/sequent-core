@@ -132,7 +132,7 @@ bodySize dflags cap topArgs expr
     -- function and arguments at hand avoids some acrobatics
     sizeCut (Var f) kont@(Kont (App {} : _) _)
       = let (args, kont') = collectArgs kont
-            realArgs      = filter (not . isErasedTerm) args
+            realArgs      = filter (not . isTyCoArg) args
             voids         = count isRealWorldTerm realArgs
         in sizeArgs realArgs `addSizeNSD` sizeCall f realArgs voids
                              `addSizeOfKont` kont'
@@ -198,7 +198,7 @@ bodySize dflags cap topArgs expr
 
     sizeJump :: [SeqCoreArg] -> PKontId -> BodySize
     sizeJump args j
-      = let realArgs      = filter (not . isErasedTerm) args
+      = let realArgs      = filter (not . isTyCoArg) args
             voids         = count isRealWorldTerm realArgs
         in sizeArgs realArgs `addSizeNSD` sizeCall j realArgs voids
     
@@ -233,7 +233,7 @@ bodySize dflags cap topArgs expr
         passThrough f = case f of
                           Tick _  -> True
                           Cast _  -> True
-                          App arg -> isErasedTerm arg
+                          App arg -> isTyCoArg arg
 
     infixl 6 `addSizeN`, `addSizeNSD`, `addSizeOfKont`
 

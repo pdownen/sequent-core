@@ -16,13 +16,13 @@ module Language.SequentCore.Syntax (
     SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
   mkCommand, mkVarTerm, mkLambdas, mkCompute, mkComputeEval,
-  mkAppTerm, mkCast, mkCastMaybe, mkConstruction, mkImpossibleCommand,
+  mkAppTerm, mkCast, mkCastMaybe, castBottomTerm, mkConstruction, mkImpossibleCommand,
   addLets, addLetsToTerm, addNonRec, consFrame, addFrames,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
   partitionTypes,
   flattenCommand,
-  isValueArg, isTypeTerm, isCoTerm, isErasedTerm, isRuntimeTerm,
+  isValueArg, isTypeArg, isCoArg, isTyCoArg, isAppFrame, isValueAppFrame,
   isTrivial, isTrivialTerm, isTrivialKont, isTrivialPKont, isReturnKont, isReturn,
   isDefaultAlt,
   termIsConstruction, termAsConstruction, splitConstruction,
@@ -30,7 +30,7 @@ module Language.SequentCore.Syntax (
   binderOfPair, setPairBinder, rhsOfPair, mkBindPair, destBindPair,
   bindsTerm, bindsKont, flattenBind, flattenBinds, bindersOf, bindersOfBinds,
   -- * Calculations
-  termType, termIsBottom, commandIsBottom,
+  termType, frameType, termIsBottom, commandIsBottom,
   needsCaseBinding,
   termOkForSpeculation, commandOkForSpeculation, kontOkForSpeculation,
   termOkForSideEffects, commandOkForSideEffects, kontOkForSideEffects,
@@ -61,7 +61,7 @@ import Id        ( Id, isDataConWorkId, isDataConWorkId_maybe, isConLikeId
 import IdInfo    ( IdDetails(..) )
 import Literal   ( Literal, isZeroLit, litIsTrivial, literalType, mkMachString )
 import Maybes    ( orElse )
-import MkCore    ( rUNTIME_ERROR_ID )
+import MkCore    ( rUNTIME_ERROR_ID, mkWildValBinder )
 import Outputable
 import Pair      ( pSnd )
 import PrimOp    ( PrimOp(..), primOpOkForSpeculation, primOpOkForSideEffects
@@ -227,8 +227,10 @@ mkCompute ty comm
   | otherwise
   = Compute ty comm
   
-mkComputeEval :: HasId b => Term b -> Kont b -> Term b
-mkComputeEval v k = mkCompute (termType v) (Eval v k)
+mkComputeEval :: HasId b => Term b -> [Frame b] -> Term b
+mkComputeEval v fs = mkCompute ty (Eval v (Kont fs Return))
+  where
+    ty = foldl frameType (termType v) fs
 
 mkAppTerm :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreTerm
 mkAppTerm fun args = mkCompute retTy (Eval fun (Kont (map App args) Return))
@@ -255,6 +257,13 @@ mkCast term co
 mkCastMaybe :: SeqCoreTerm -> Maybe Coercion -> SeqCoreTerm
 mkCastMaybe term Nothing   = term
 mkCastMaybe term (Just co) = mkCast term co
+
+castBottomTerm :: SeqCoreTerm -> Type -> SeqCoreTerm
+castBottomTerm v ty | termTy `Type.eqType` ty = v
+                    | otherwise          = Compute ty (Eval v (Kont [] (Case wild [])))
+  where
+    termTy = termType v
+    wild = mkWildValBinder termTy
 
 mkConstruction :: DataCon -> [Type] -> [SeqCoreTerm] -> SeqCoreTerm
 mkConstruction dc tyArgs valArgs
@@ -370,25 +379,29 @@ isValueArg (Type _) = False
 isValueArg _ = True
 
 -- | True if the given term is a type. See 'Type'.
-isTypeTerm :: Term b -> Bool
-isTypeTerm (Type _) = True
-isTypeTerm _ = False
+isTypeArg :: Arg b -> Bool
+isTypeArg (Type _) = True
+isTypeArg _ = False
 
 -- | True if the given term is a coercion. See 'Coercion'.
-isCoTerm :: Term b -> Bool
-isCoTerm (Coercion _) = True
-isCoTerm _ = False
+isCoArg :: Arg b -> Bool
+isCoArg (Coercion _) = True
+isCoArg _ = False
 
--- | True if the given term is a type or coercion.
-isErasedTerm :: Term b -> Bool
-isErasedTerm (Type _) = True
-isErasedTerm (Coercion _) = True
-isErasedTerm _ = False
+-- | True if the given term is a type or a coercion.
+isTyCoArg :: Arg b -> Bool
+isTyCoArg arg = isTypeArg arg || isCoArg arg
 
--- | True if the given term appears at runtime, i.e. is neither a type nor a
--- coercion.
-isRuntimeTerm :: Term b -> Bool
-isRuntimeTerm v = not (isErasedTerm v)
+-- | True if the given frame is an argument.
+isAppFrame :: Frame b -> Bool
+isAppFrame (App {}) = True
+isAppFrame _        = False
+
+-- | True if the given frame applies a value argument.
+isValueAppFrame :: Frame b -> Bool
+isValueAppFrame (App (Type {})) = False
+isValueAppFrame (App {})        = True
+isValueAppFrame _               = False
 
 -- | True if the given command is so simple we can duplicate it freely. This
 -- means it has no bindings and its term and continuation are both trivial.
@@ -415,7 +428,7 @@ isTrivialKont (Kont fs Return) = all isTrivialFrame fs
 isTrivialKont _                = False
 
 isTrivialFrame :: HasId b => Frame b -> Bool
-isTrivialFrame (App v)  = isErasedTerm v
+isTrivialFrame (App v)  = isTyCoArg v
 isTrivialFrame (Cast _) = True
 isTrivialFrame (Tick _) = False
 
@@ -553,6 +566,15 @@ termType (Lam x t)      = Type.mkPiType (identifier x) (termType t)
 termType (Compute ty _) = ty
 -- see exprType in GHC CoreUtils
 termType _other         = alphaTy
+
+-- | Compute the type of a frame's input, given the type of its input. (The
+--   input type of a type application is not uniquely defined, so it must be
+--   specified.)
+frameType :: HasId b => Type -> Frame b -> Type
+frameType ty (App (Type argTy)) = ty `Type.applyTy` argTy
+frameType ty (App _)            = Type.funResultTy ty
+frameType _  (Cast co)          = pSnd (coercionKind co)
+frameType ty (Tick _)           = ty
 
 -- | Compute (a conservative estimate of) the arity of a term.
 termArity :: HasId b => Term b -> Int
@@ -703,7 +725,7 @@ kontCheap :: HasId b => CheapAppMeasure -> Kont b -> Bool
 kontCheap appCheap (Kont frames end) = all frameCheap frames && endCheap appCheap end
 
 frameCheap :: HasId b => Frame b -> Bool
-frameCheap (App arg) = isErasedTerm arg
+frameCheap (App arg) = isTyCoArg arg
 frameCheap (Cast _)  = True
 frameCheap (Tick ti) = not (tickishCounts ti)
 
