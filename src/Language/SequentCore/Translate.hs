@@ -781,10 +781,13 @@ fromCoreExprAsPKont env kont descs expr
       -- still be case x +# y of z -> void#, but then we can eliminate the case).
       -- So this is always correct.
       = (extendSubstWithVar subst bndr voidPrimId, Nothing)
-    doBndr subst (bndr, TyArg _tyVar)
-      = (subst', Just bndr')
+    doBndr subst (bndr, TyArg tyVar)
+      = (subst'', Just bndr')
       where
         (subst', bndr') = substBndr subst bndr
+        -- Further ArgInfos may refer to tyVar, so we need to substitute to get
+        -- the right types for generated arguments (when eta-expanding).
+        subst'' = CoreSubst.extendTvSubst subst' tyVar (mkTyVarTy bndr')
     doBndr subst (bndr, ValArg _)
       = (subst', Just bndr')
       where
