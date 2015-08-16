@@ -30,7 +30,6 @@ import Id
 import Maybes
 import qualified MkCore as Core
 import MkId
-import qualified Outputable as Out
 import Outputable  hiding ( (<>) )
 import Type        hiding ( substTy )
 import TysPrim
@@ -128,21 +127,28 @@ unclear how often this is a problem in practice.
 -- Bottom-up data --
 
 data EscapeAnalysis
-  = EA { ea_nonEsc  :: IdEnv (TotalArity, Call)
+  = EA { ea_nonEsc  :: IdEnv CallInfo
        , ea_allVars :: IdSet }
+
+data CallInfo
+  = CI { ci_arity   :: TotalArity  -- Counts *all* arguments, including types
+       , ci_args    :: Call        -- Invariant: Length is ci_arity
+       , ci_scope   :: ScopeType } -- Recursive call?
 
 type TotalArity = Arity -- Counts *all* arguments, including types
 type Call = [Core.CoreExpr]
-data Occs = Esc | NonEsc TotalArity Call -- ^ Invariant: The call has the given
-                                         -- length
+data Occs = Esc | NonEsc CallInfo
+data ScopeType = Inside | Outside -- In recursive RHS or not?
 
 emptyEscapeAnalysis :: EscapeAnalysis
 emptyEscapeAnalysis = EA { ea_nonEsc  = emptyVarEnv
                          , ea_allVars = emptyVarSet }
 
-unitCall :: Id -> Call -> EscapeAnalysis
-unitCall x call = EA { ea_nonEsc  = unitVarEnv x (length call, call)
-                     , ea_allVars = unitVarSet x }
+unitCall :: Id -> Call -> ScopeType -> EscapeAnalysis
+unitCall x call scope = EA { ea_nonEsc  = unitVarEnv x (CI { ci_arity = length call
+                                                           , ci_args  = call
+                                                           , ci_scope = scope })
+                           , ea_allVars = unitVarSet x }
 
 markAllAsEscaping :: EscapeAnalysis -> EscapeAnalysis
 markAllAsEscaping ea = ea { ea_nonEsc = emptyVarEnv }
@@ -173,8 +179,10 @@ combineEscapeAnalyses ea1 ea2
     nonEscBoth = intersectWithMaybeVarEnv combine (ea_nonEsc ea1) (ea_nonEsc ea2)
     
     -- Only need to keep one call made to each function
-    combine (n1, c1) (n2, _) | n1 == n2  = Just (n1, c1)
-                             | otherwise = Nothing
+    -- Prefer non-recursive calls (see Note [Determining fixed type values])
+    combine ci1 ci2 | ci_arity ci1 /= ci_arity ci2 = Nothing
+                    | Inside <- ci_scope ci1       = Just ci2
+                    | otherwise                    = Just ci1
 
 forgetVars :: EscapeAnalysis -> [Id] -> EscapeAnalysis
 forgetVars (EA { ea_nonEsc = nonEsc, ea_allVars = allVars }) xs
@@ -183,20 +191,20 @@ forgetVars (EA { ea_nonEsc = nonEsc, ea_allVars = allVars }) xs
 
 occurrences :: EscapeAnalysis -> Id -> Maybe Occs
 occurrences ea x
-  | Just (n, cs) <- lookupVarEnv (ea_nonEsc ea) x = Just (NonEsc n cs)
-  | x `elemVarEnv` ea_allVars ea                  = Just Esc
-  | otherwise                                     = Nothing
+  | Just ci <- lookupVarEnv (ea_nonEsc ea) x = Just (NonEsc ci)
+  | x `elemVarEnv` ea_allVars ea             = Just Esc
+  | otherwise                                = Nothing
 
 -- If none of the variables escape, return the list of variables that occur
 -- along with their apparent arities and call lists
-allOccurrences :: EscapeAnalysis -> [Id] -> Maybe [(Id, Maybe (Int, Call))]
+allOccurrences :: EscapeAnalysis -> [Id] -> Maybe [(Id, Maybe CallInfo)]
 allOccurrences _  []       = Just []
 allOccurrences ea (x : xs) = case occurrences ea x of
-                               Just (NonEsc n call) -> ((x, Just (n, call)) :) <$>
-                                                       allOccurrences ea xs
-                               Just Esc             -> Nothing
-                               Nothing              -> ((x, Nothing) :) <$>
-                                                       allOccurrences ea xs
+                               Just (NonEsc ci) -> ((x, Just ci) :) <$>
+                                                   allOccurrences ea xs
+                               Just Esc         -> Nothing
+                               Nothing          -> ((x, Nothing) :) <$>
+                                                   allOccurrences ea xs
 
 instance Monoid EscapeAnalysis where
   mempty = emptyEscapeAnalysis
@@ -204,19 +212,19 @@ instance Monoid EscapeAnalysis where
 
 -- Top-down data --
 
-type CandidateEnv = IdSet
+type CandidateEnv = IdEnv ScopeType
 
 emptyCandidateEnv :: CandidateEnv
-emptyCandidateEnv = emptyVarSet
+emptyCandidateEnv = emptyVarEnv
 
-plusCandidate :: CandidateEnv -> Id -> CandidateEnv
-plusCandidate = extendVarSet
+addCandidate :: CandidateEnv -> Id -> ScopeType -> CandidateEnv
+addCandidate = extendVarEnv
 
-plusCandidates :: CandidateEnv -> [Id] -> CandidateEnv
-plusCandidates = extendVarSetList
+addCandidates :: CandidateEnv -> [Id] -> ScopeType -> CandidateEnv
+addCandidates env ids sc = extendVarEnvList env [ (id, sc) | id <- ids ]
 
-isCandidateIn :: Id -> CandidateEnv -> Bool
-isCandidateIn = elemVarSet
+candidateScope :: CandidateEnv -> Id -> Maybe ScopeType
+candidateScope = lookupVarEnv
 
 -- Monad --
 
@@ -257,8 +265,9 @@ withoutCandidate x = alteringEnv (`delVarEnv` x)
 withoutCandidates :: [Id] -> EscM a -> EscM a
 withoutCandidates xs = alteringEnv (`delVarEnvList` xs)
 
-reportCall :: Id -> Call -> EscM ()
-reportCall x call = writeAnalysis (unitCall x call)
+reportCall :: Id -> Call -> ScopeType -> EscM ()
+reportCall x call scope = --pprTrace "reportCall" (ppr x <+> ppr call <+> ppr scope)
+                          writeAnalysis (unitCall x call scope)
 
 captureAnalysis, readAnalysis :: EscM a -> EscM (EscapeAnalysis, a)
 captureAnalysis m = EscM $ \env -> let (escs, ans) = unEscM m env
@@ -275,6 +284,58 @@ filterAnalysis f m = EscM $ \env -> let (escs, ans) = unEscM m env
 
 -- Result: Marked binders --
 
+{-
+Note [Fixing type arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Suppose we are contifying the polymorphic function:
+
+    k :: forall a b. Bool -> a -> b -> [b]
+
+Since we're contifying it, it is always tail-called from a particular context,
+and that context expects a result of type [T] for some particular T. Thus we
+cannot allow b to vary in the contified version of k: It must *always* return
+[T] (and its final argument must be a T). Hence we must eliminate the type
+parameter b and substitute T for b in the type and body of k. Supposing T is Int,
+the contified k looks like
+
+    k :: Cont# (exists a. (Bool, a, Int))
+
+(type simplified for clarity). Note that since a doesn't appear in the original
+function's return type, it is free to vary, and we construct the existential as
+usual. This is important for case analyses on existential types, which produce
+polymorphic join points.
+
+Note [Determining fixed type values]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The above discussion glossed over a detail: How did we determine T to be the
+constant value of b? It is true that k must always be invoked with the same
+value of b *but* recursive calls will pass on the constant value, so looking
+at them is unhelpful.
+
+For instance:
+
+    let rec { rep :: forall a. Int -> a -> [a] -> [a]
+              rep @a n x xs = case n <= 0 of True  -> xs
+                                             False -> rep @a (n-1) (x:xs) }
+    in case q of True  -> rep @Char 4 'a' []
+                 False -> rep @Char 3 'b' []
+
+The rep function is always tail-called with Char as the type argument, but in
+the recursive call this is not apparent from syntax alone: The recursive call
+passes a, not Char. Thus we need to differentiate between recursive calls and
+"outside" calls and we need to look at an outside call to determine a. If there
+are no outside calls, we would need either abstract interpretation or
+unification to find the correct type, so we punt and give up on contifying.
+
+(One is tempted to detect when a recursive call passes a tyvar that's equal to
+the corresponding binder. This could solve the above case - we would know not
+to use a because a is itself the binder. However, this does not cover mutual
+recursion or other cases where a is passed indirectly just as the actual type
+is.)
+-}
+
 data KontOrFunc = MakeKont [ArgDesc] | MakeFunc
 data ArgDesc    = FixedType Type | FixedVoidArg | TyArg TyVar | ValArg Type
 data MarkedVar  = Marked Var KontOrFunc
@@ -282,27 +343,33 @@ data MarkedVar  = Marked Var KontOrFunc
 unmark :: MarkedVar -> Var
 unmark (Marked var _) = var
 
-markVar :: Id -> Core.CoreExpr -> TotalArity -> Call -> MarkedVar
-markVar x _rhs arity call
-  = Marked x ans
+markVar :: Id -> Core.CoreExpr -> CallInfo -> Maybe MarkedVar
+markVar x _rhs ci
+  = Marked x <$> mark
   where
-    ans | idHasRules x = MakeFunc -- unlikely but possible, and contification
-                                  -- would likely get in the way of rule firings
-        | otherwise    = MakeKont (mkArgDescs (idType x) arity call)
+    mark | idHasRules x = return MakeFunc -- unlikely but possible, and contification
+                                          -- would likely get in the way of rule firings
+         | otherwise    = MakeKont <$> mkArgDescs x (idType x) ci
 
 -- | Return a constant value for each argument that needs one, given the type
 -- and total arity of a function to be contified and a call made to it. Any
 -- type parameters binding variables appearing in the return type must be made
 -- constant, since the contified function will return to a fixed continuation in
--- which those parameters are not bound.
+-- which those parameters are not bound. (See Note [Determining fixed type
+-- values].)
+-- 
+-- Returns Nothing if a type parameter needs to be fixed but the scope of the
+-- given call is Inside, meaning only recursive calls were made to the function.
+-- In this case, we give up on contification. (TODO: A more sophisticated
+-- analysis could still find the correct type to use.)
 --
 -- It's possible the total arity is greater than the number of arrows and foralls
 -- in the type, but only if the return type of the function is a type variable
 -- bound in an outer scope. This is fine, because the extra arguments cannot
 -- change the actual return type, so we don't need to fix (mask out) the extra
 -- arguments. TODO Be more sure about this.
-mkArgDescs :: Type -> TotalArity -> Call -> [ArgDesc]
-mkArgDescs ty arity call
+mkArgDescs :: Var -> Type -> CallInfo -> Maybe [ArgDesc]
+mkArgDescs _x ty (CI { ci_arity = arity, ci_args = call, ci_scope = scope })
   = go ty call
   where
     (_tyVars, retTy) = splitPiTyN ty arity
@@ -310,24 +377,29 @@ mkArgDescs ty arity call
     
     go ty (Core.Type tyArg : call)
       | tyVar `elemVarSet` freeInRetTy
-      = FixedType tyArg : mkArgDescs (substTyWith [tyVar] [tyArg] bodyTy)
-                                     (length call) call -- start over with
-                                                        -- new return type
+      = case scope of
+          Outside ->
+            -- Start over with new return type
+            (FixedType tyArg :) <$> mkArgDescs _x (substTyWith [tyVar] [tyArg] bodyTy) 
+                                               (CI { ci_arity = length call
+                                                   , ci_args  = call
+                                                   , ci_scope = scope })
+          Inside -> Nothing
       | otherwise
-      = TyArg tyVar : go bodyTy call
+      = (TyArg tyVar :) <$> go bodyTy call
       where
         (tyVar, bodyTy) = splitForAllTy_maybe ty `orElse`
                             pprPanic "mkArgDescs" (ppr ty <+> ppr tyArg)
     go ty (arg : call)
       | argTy `eqType` voidPrimTy
-      = FixedVoidArg : go retTy call
+      = (FixedVoidArg :) <$> go retTy call
       | otherwise
-      = ValArg argTy : go retTy call
+      = (ValArg argTy :) <$> go retTy call
       where
         (argTy, retTy) = splitFunTy_maybe ty `orElse`
                            pprPanic "mkArgDescs" (ppr ty <+> ppr arg)
                            
-    go _ _ = []
+    go _ [] = Just []
     
 splitPiTyN :: Type -> TotalArity -> ([Maybe TyVar], Type)
 splitPiTyN ty n
@@ -362,39 +434,44 @@ escAnalBind lvl (Core.NonRec bndr rhs) escs_body
     (escs_rhs, rhs') <- captureAnalysis $ escAnalRhs rhs
     let (marked, escs_rhs')
           | isNotTopLevel lvl
-          , Just (NonEsc arity call) <- occurrences escs_body bndr
-          = (markVar bndr rhs arity call, escs_rhs)
+          , Just (NonEsc ci) <- occurrences escs_body bndr
+          , Just bndr'       <- markVar bndr rhs ci
+          = (bndr', escs_rhs)
           | otherwise
           = (Marked bndr MakeFunc, markAllAsEscaping escs_rhs)
     writeAnalysis escs_rhs'
     escAnalId bndr
     
     env <- getCandidates
-    return (env `plusCandidate` bndr, Core.NonRec marked rhs')
+    return (addCandidate env bndr Outside, Core.NonRec marked rhs')
 
 escAnalBind lvl (Core.Rec pairs) escs_body
   = do
     env <- getCandidates
     let (bndrs, rhss) = unzip pairs
-        env' = env `plusCandidates` bndrs
-    (escs_rhss, rhss') <- captureAnalysis $ withEnv env' $ do
+        env_rhs = addCandidates env bndrs Inside
+    (escs_rhss, rhss') <- captureAnalysis $ withEnv env_rhs $ do
                             mapM_ escAnalId bndrs
                             mapM escAnalRhs rhss
     let escs = escs_rhss <> escs_body
-        occsList_maybe = allOccurrences escs bndrs
-        kontify = isNotTopLevel lvl && isJust occsList_maybe
-        pairs' | isNotTopLevel lvl
-               , Just occsList <- occsList_maybe
-               = [ (markVar bndr rhs arity calls, rhs')
-                 | ((bndr, Just (arity, calls)), rhs, rhs') <-
-                     zip3 occsList rhss rhss']
-               | otherwise
-               = [ (Marked bndr MakeFunc, rhs')
-                 | (bndr, rhs') <- zip bndrs rhss']
-        escs_rhss' | not kontify = markAllAsEscaping escs_rhss
-                   | otherwise   = escs_rhss
+    
+        kontifiedPairs :: Maybe [(MarkedVar, Core.Expr MarkedVar)]
+        kontifiedPairs = do
+                         guard (isNotTopLevel lvl)
+                         occsList <- allOccurrences escs bndrs
+                         sequence [ (, rhs') <$> markVar bndr rhs ci
+                                  | ((bndr, Just ci), rhs, rhs') <-
+                                      zip3 occsList rhss rhss' ]
+
+        pairs' = kontifiedPairs `orElse` [ (Marked bndr MakeFunc, rhs')
+                                         | (bndr, rhs') <- zip bndrs rhss']
+        
+        -- If we're not contifying, all calls escape from the RHSes
+        escs_rhss' | Nothing <- kontifiedPairs = markAllAsEscaping escs_rhss
+                   | otherwise                 = escs_rhss
     writeAnalysis (escs_rhss' `forgetVars` bndrs)
-    return (env', Core.Rec pairs')
+    let env_body = addCandidates env bndrs Outside
+    return (env_body, Core.Rec pairs')
 
 -- | Analyse an expression, but ignore its top-level lambdas
 escAnalRhs :: Core.CoreExpr -> EscM (Core.Expr MarkedVar)
@@ -456,7 +533,8 @@ escAnalApp :: Id -> [Core.CoreExpr] -> EscM (Core.Expr MarkedVar)
 escAnalApp fid args
   = do
     env <- getCandidates
-    when (fid `isCandidateIn` env) $ reportCall fid args
+    let candidacy = candidateScope env fid
+    whenIsJust candidacy $ \scope -> reportCall fid args scope
     args' <- filterAnalysis markAllAsEscaping $ mapM escAnalExpr args
     return $ Core.mkApps (Core.Var fid) args'
 
@@ -663,7 +741,8 @@ fromCoreExprAsPKont :: FromCoreEnv -> SeqCoreKont -> [ArgDesc]
                     -> Core.Expr MarkedVar
                     -> SeqCorePKont
 fromCoreExprAsPKont env kont descs expr
-  = result
+  = --pprTrace "fromCoreExprAsPKont" (ppr descs $$ ppr bndrs $$ ppr bndrs_final)
+    result
   where
     subst = fce_subst env
     
@@ -679,8 +758,8 @@ fromCoreExprAsPKont env kont descs expr
     (etaBndr_maybes, etaArgs) = unzip etaBndr_maybes_args
     etaBndrs = catMaybes etaBndr_maybes
     
-    -- Eta-expand the body *before* translating to Sequent Core. This is easier
-    -- than dealing with the 
+    -- Eta-expand the body *before* translating to Sequent Core so that the
+    -- parameterized continuation has all the arguments it should get
     etaBody | null extraArgs = body
             | otherwise      = Core.mkApps body etaArgs
     
@@ -899,13 +978,16 @@ onSequentCoreTerm f = termFromCoreExpr . f . termToCoreExpr
 
 instance Outputable EscapeAnalysis where
   ppr (EA { ea_nonEsc = nonEsc, ea_allVars = allVars })
-    = text "non-escaping:" <+> ppr (mapVarEnv fst nonEsc) $$
+    = text "non-escaping:" <+> ppr (mapVarEnv ci_arity nonEsc) $$
       text "    escaping:" <+> ppr (allVars `minusVarEnv` nonEsc)
+
+instance Outputable ScopeType where
+  ppr Inside = text "inside scope"
+  ppr Outside = text "outside scope"
   
 instance Outputable Occs where
   ppr Esc = text "esc"
-  ppr (NonEsc arity calls) = text "arity" <+> int arity Out.<> comma <+>
-                             speakNOf (length calls) (text "call")
+  ppr (NonEsc ci) = text "arity" <+> int (ci_arity ci)
 
 instance Outputable KontOrFunc where
   ppr MakeFunc = text "func"

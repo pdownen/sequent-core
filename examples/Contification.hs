@@ -109,5 +109,28 @@ case9_yes b z
       False -> j True
       True  -> j False
 
+-- Can't contify only one among mutually recursive functions
+case10_no :: Int# -> Int#
+case10_no x =
+  let {-# NOINLINE k #-}
+      k y = if tagToEnum# (y <# 0#) then 0# else y +# f (y -# 1#)
+      {-# NOINLINE f #-}
+      f y = k (y -# 1#)
+  in f x
+
+-- We would like to handle this case, but seems to require abstract
+-- interpretation: We need to fix the type argument to h but it's only ever
+-- called with an inner-bound tyvar as the type.
+case11_yes_someday :: [Bool] -> [Bool]
+case11_yes_someday bs
+  = let k, h :: [a] -> [a] -> [a]
+        {-# NOINLINE k #-}
+        k xs acc = case xs of []      -> acc
+                              _ : xs' -> h xs' acc
+        {-# NOINLINE h #-}
+        h xs acc = case xs of []      -> acc
+                              x : xs' -> k xs' (x : x : acc)
+    in k bs []
+
 main :: IO ()
 main = return ()
