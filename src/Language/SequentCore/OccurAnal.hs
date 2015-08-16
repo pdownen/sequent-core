@@ -1330,13 +1330,13 @@ occAnalCut env (Var x) (Kont [] (Case bndr alts@(alt1 : otherAlts)))
 -- for itself, but we usually just hand occAnalCase the continuation, so we
 -- have to look for those special cases here.
 occAnalCut env (Var x) kont
-  | Just (co_maybe, bndr, alts) <- match kont
+  | Just (co_maybe, fs, bndr, alts) <- match kont
   = case occAnalCase env (Just (x, co_maybe)) bndr alts of { ( kont_usage, end') ->
-    (kont_usage +++ mkOneOcc env x False, Eval (Var x) (Kont [] end')) }
+    (kont_usage +++ mkOneOcc env x False, Eval (Var x) (Kont fs end')) }
   where
-    match (Kont [Cast co] (Case bndr alts)) = Just (Just co, bndr, alts)
-    match (Kont []        (Case bndr alts)) = Just (Nothing, bndr, alts)
-    match _                                 = Nothing
+    match (Kont fs@[Cast co] (Case bndr alts)) = Just (Just co, fs, bndr, alts)
+    match (Kont []           (Case bndr alts)) = Just (Nothing, [], bndr, alts)
+    match _                                    = Nothing
 
 occAnalCut env fun kont@(Kont (App {} : _) _)
   = let (args, kont') = collectArgs kont
