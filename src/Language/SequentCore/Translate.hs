@@ -431,7 +431,8 @@ escAnalBind :: TopLevelFlag -> Core.CoreBind -> EscapeAnalysis
             -> EscM (CandidateEnv, Core.Bind MarkedVar)
 escAnalBind lvl (Core.NonRec bndr rhs) escs_body
   = do
-    (escs_rhs, rhs') <- captureAnalysis $ escAnalRhs rhs
+    (escs_rhs, rhs') <- captureAnalysis $ escAnalId bndr >> escAnalRhs rhs
+      -- escAnalId looks at rules and unfoldings, which act as alternate RHSes
     let (marked, escs_rhs')
           | isNotTopLevel lvl
           , Just (NonEsc ci) <- occurrences escs_body bndr
@@ -440,7 +441,6 @@ escAnalBind lvl (Core.NonRec bndr rhs) escs_body
           | otherwise
           = (Marked bndr MakeFunc, markAllAsEscaping escs_rhs)
     writeAnalysis escs_rhs'
-    escAnalId bndr
     
     env <- getCandidates
     return (addCandidate env bndr Outside, Core.NonRec marked rhs')
