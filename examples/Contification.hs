@@ -132,5 +132,20 @@ case11_yes_someday bs
                               x : xs' -> k xs' (x : x : acc)
     in k bs []
 
+-- If a contified function is unsaturated, its free variables *do* escape
+case12_mixed :: Int# -> Int#
+case12_mixed
+  = let f :: Int# -> Int# -> Int#
+        {-# NOINLINE f #-}
+        f x y = x +# y
+        
+        k, h :: Int# -> Int#
+        {-# NOINLINE k #-}
+        k = f 5#
+        
+        {-# NOINLINE h #-}
+        h = \x -> k (x +# 1#) -- Not a tail call! Outer context wants Int# -> Int#
+    in h
+
 main :: IO ()
 main = return ()

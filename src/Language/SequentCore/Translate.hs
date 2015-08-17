@@ -1,4 +1,4 @@
-{-# LANGUAGE ParallelListComp, TupleSections, MultiWayIf #-}
+{-# LANGUAGE ParallelListComp, TupleSections, MultiWayIf, ViewPatterns #-}
 
 -- | 
 -- Module      : Language.SequentCore.Translate
@@ -343,13 +343,22 @@ data MarkedVar  = Marked Var KontOrFunc
 unmark :: MarkedVar -> Var
 unmark (Marked var _) = var
 
-markVar :: Id -> Core.CoreExpr -> CallInfo -> Maybe MarkedVar
-markVar x _rhs ci
-  = Marked x <$> mark
-  where
-    mark | idHasRules x = return MakeFunc -- unlikely but possible, and contification
-                                          -- would likely get in the way of rule firings
-         | otherwise    = MakeKont <$> mkArgDescs x (idType x) ci
+-- | Decide whether a variable should be contified, returning the marked
+-- variable and a flag (True if contifying).
+markVar :: Id -> CallInfo -> (MarkedVar, Bool)
+markVar x ci
+  = case mkArgDescs x (idType x) ci of
+      Just descs -> (Marked x (MakeKont descs), True)
+      Nothing    -> (Marked x MakeFunc,         False)
+
+-- | Decide whether a group of mutually recursive variables should be contified,
+-- returning the marked variables and a flag. Either all of the variables will
+-- be contified (in which case the flag is True) or none of them will.
+markVars :: [Id] -> [CallInfo] -> ([MarkedVar], Bool)
+markVars xs cis
+  = case zipWithM (\x ci -> mkArgDescs x (idType x) ci) xs cis of
+      Just descss -> ([ Marked x (MakeKont descs) | x <- xs | descs <- descss ], True)
+      Nothing     -> ([ Marked x MakeFunc         | x <- xs ]                  , False)
 
 -- | Return a constant value for each argument that needs one, given the type
 -- and total arity of a function to be contified and a call made to it. Any
@@ -363,13 +372,19 @@ markVar x _rhs ci
 -- In this case, we give up on contification. (TODO: A more sophisticated
 -- analysis could still find the correct type to use.)
 --
+-- We also don't contify if the id has rules; this is uncommon, but it does
+-- happen (often due to SpecConstr), and we don't want to stop rules from firing.
+--
 -- It's possible the total arity is greater than the number of arrows and foralls
 -- in the type, but only if the return type of the function is a type variable
 -- bound in an outer scope. This is fine, because the extra arguments cannot
 -- change the actual return type, so we don't need to fix (mask out) the extra
 -- arguments. TODO Be more sure about this.
 mkArgDescs :: Var -> Type -> CallInfo -> Maybe [ArgDesc]
-mkArgDescs _x ty (CI { ci_arity = arity, ci_args = call, ci_scope = scope })
+mkArgDescs x _ _
+  | idHasRules x = Nothing -- unlikely but possible, and contification
+                           -- would likely get in the way of rule firings
+mkArgDescs x ty (CI { ci_arity = arity, ci_args = call, ci_scope = scope })
   = go ty call
   where
     (_tyVars, retTy) = splitPiTyN ty arity
@@ -380,7 +395,7 @@ mkArgDescs _x ty (CI { ci_arity = arity, ci_args = call, ci_scope = scope })
       = case scope of
           Outside ->
             -- Start over with new return type
-            (FixedType tyArg :) <$> mkArgDescs _x (substTyWith [tyVar] [tyArg] bodyTy) 
+            (FixedType tyArg :) <$> mkArgDescs x (substTyWith [tyVar] [tyArg] bodyTy) 
                                                (CI { ci_arity = length call
                                                    , ci_args  = call
                                                    , ci_scope = scope })
@@ -431,15 +446,18 @@ escAnalBind :: TopLevelFlag -> Core.CoreBind -> EscapeAnalysis
             -> EscM (CandidateEnv, Core.Bind MarkedVar)
 escAnalBind lvl (Core.NonRec bndr rhs) escs_body
   = do
-    (escs_rhs, rhs') <- captureAnalysis $ escAnalId bndr >> escAnalRhs rhs
+    (escs_rhs, (rhs', lamCount)) <-
+      captureAnalysis $ escAnalId bndr >> escAnalRhs rhs
       -- escAnalId looks at rules and unfoldings, which act as alternate RHSes
-    let (marked, escs_rhs')
+    let (marked, kontifying, unsat)
           | isNotTopLevel lvl
           , Just (NonEsc ci) <- occurrences escs_body bndr
-          , Just bndr'       <- markVar bndr rhs ci
-          = (bndr', escs_rhs)
+          = let (marked, kontifying) = markVar bndr ci
+            in (marked, kontifying, ci_arity ci < lamCount)
           | otherwise
-          = (Marked bndr MakeFunc, markAllAsEscaping escs_rhs)
+          = (Marked bndr MakeFunc, False, False)
+        escs_rhs' | not kontifying || unsat = markAllAsEscaping escs_rhs
+                  | otherwise               = escs_rhs
     writeAnalysis escs_rhs'
     
     env <- getCandidates
@@ -448,38 +466,45 @@ escAnalBind lvl (Core.NonRec bndr rhs) escs_body
 escAnalBind lvl (Core.Rec pairs) escs_body
   = do
     env <- getCandidates
-    let (bndrs, rhss) = unzip pairs
+    let bndrs = map fst pairs
         env_rhs = addCandidates env bndrs Inside
-    (escs_rhss, rhss') <- captureAnalysis $ withEnv env_rhs $ do
-                            mapM_ escAnalId bndrs
-                            mapM escAnalRhs rhss
-    let escs = escs_rhss <> escs_body
-    
-        kontifiedPairs :: Maybe [(MarkedVar, Core.Expr MarkedVar)]
-        kontifiedPairs = do
-                         guard (isNotTopLevel lvl)
-                         occsList <- allOccurrences escs bndrs
-                         sequence [ (, rhs') <$> markVar bndr rhs ci
-                                  | ((bndr, Just ci), rhs, rhs') <-
-                                      zip3 occsList rhss rhss' ]
-
-        pairs' = kontifiedPairs `orElse` [ (Marked bndr MakeFunc, rhs')
-                                         | (bndr, rhs') <- zip bndrs rhss']
+    (unzip -> (escs_rhss, unzip -> (rhss', lamCounts)))
+      <- withEnv env_rhs $ forM pairs $ \(bndr, rhs) ->
+           captureAnalysis $ escAnalId bndr >> escAnalRhs rhs
+    let escs = mconcat escs_rhss <> escs_body
+        (pairs', kontifying, unsats)
+          | isNotTopLevel lvl
+          , Just occsList <- allOccurrences escs bndrs
+          = let (bndrs_live, cis, rhss'_live, lamCounts_live)
+                  = unzip4 [ (bndr, ci, rhs', lamCount)
+                           | ((bndr, Just ci), rhs', lamCount) <-
+                               zip3 occsList rhss' lamCounts ]
+                (bndrs_marked, kontifying) = markVars bndrs_live cis
+                isUnsat ci lamCount = ci_arity ci < lamCount
+            in ( zip bndrs_marked rhss'_live, kontifying
+               , zipWith isUnsat cis lamCounts_live )
+          | otherwise
+          = ([ (Marked bndr MakeFunc, rhs') | (bndr, rhs') <- zip bndrs rhss' ], False, repeat False)
         
-        -- If we're not contifying, all calls escape from the RHSes
-        escs_rhss' | Nothing <- kontifiedPairs = markAllAsEscaping escs_rhss
-                   | otherwise                 = escs_rhss
-    writeAnalysis (escs_rhss' `forgetVars` bndrs)
+        escs_rhss' | not kontifying = map markAllAsEscaping escs_rhss
+                   | otherwise      = [ if unsat then markAllAsEscaping escs else escs
+                                      | escs <- escs_rhss
+                                      | unsat <- unsats ]
+
+    writeAnalysis (mconcat escs_rhss' `forgetVars` bndrs)
     let env_body = addCandidates env bndrs Outside
     return (env_body, Core.Rec pairs')
 
--- | Analyse an expression, but ignore its top-level lambdas
-escAnalRhs :: Core.CoreExpr -> EscM (Core.Expr MarkedVar)
+-- | Analyse an expression, but don't let its top-level lambdas cause calls to
+-- escape. Returns the number of lambdas ignored; if the function is partially
+-- invoked, the calls escape after all.
+escAnalRhs :: Core.CoreExpr -> EscM (Core.Expr MarkedVar, Int)
 escAnalRhs expr
   = do
     let (bndrs, body) = Core.collectBinders expr
     body' <- withoutCandidates bndrs $ escAnalExpr body
-    return $ Core.mkLams [ Marked bndr MakeFunc | bndr <- bndrs ] body'
+    return $ ( Core.mkLams [ Marked bndr MakeFunc | bndr <- bndrs ] body'
+             , length bndrs )
 
 escAnalExpr :: Core.CoreExpr -> EscM (Core.Expr MarkedVar)
 escAnalExpr (Core.Var x)
