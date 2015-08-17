@@ -26,7 +26,7 @@ import Language.SequentCore.Util
 import Language.SequentCore.WiredIn
 
 import BasicTypes
-import Coercion    ( coercionKind, isCoVar )
+import Coercion    ( coercionKind, isCoVar, mkCoCast )
 import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      CoreM, defaultPlugin, reinitializeGlobals,
                      isZeroSimplCount, pprSimplCount, putMsg, errorMsg,
@@ -599,9 +599,7 @@ simplTermInCommand env_v v env_k co_m fs end
     showCo co = text "coercing:" <+> ppr fromTy <+> darrow <+> ppr toTy
       where Pair fromTy toTy = coercionKind co
 simplTermInCommand _ (Type ty) _ _ _ _
-  = pprPanic "simplCut" (ppr ty)
-simplTermInCommand _ (Coercion co) _ _ _ _
-  = pprPanic "simplCut" (ppr co)
+  = pprPanic "simplTermInCommand" (ppr ty)
 simplTermInCommand env_v (Var x) env_k co_m fs end
   = case substId env_v x of
       DoneId x'
@@ -629,7 +627,12 @@ simplTermInCommand env_v (Compute ty c) env_k co_m fs end
     simplCommand env_v' c
 simplTermInCommand env_v v env_k co_m (Cast co' : fs) end
   = simplTermInCommand env_v v env_k (combineCo co_m co') fs end
-
+simplTermInCommand env_v v@(Coercion co) env_k co_m fs end
+  = simplTermInCommandDone env_v v' env_k Nothing fs end
+  where
+    v' = case co_m of
+           Just co' -> Coercion (mkCoCast co co')
+           Nothing  -> v
 -- discard a non-counting tick on a lambda.  This may change the
 -- cost attribution slightly (moving the allocation of the
 -- lambda elsewhere), but we don't care: optimisation changes
