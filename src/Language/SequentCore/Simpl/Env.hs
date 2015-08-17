@@ -18,6 +18,9 @@ module Language.SequentCore.Simpl.Env (
   staticPart, setStaticPart, inDynamicScope,
   zapSubstEnvsStatic,
   
+  MetaKont(..), KontState(..),
+  canDupMetaKont, setStaticPartFrom,
+  
   IdDefEnv, Definition(..), Guidance(..),
   mkBoundTo, mkBoundToPKont, mkDef,
   findDef, setDef, activeUnfolding,
@@ -41,10 +44,10 @@ module Language.SequentCore.Simpl.Env (
 import Language.SequentCore.Arity
 import Language.SequentCore.OccurAnal
 import Language.SequentCore.Simpl.ExprSize
+import Language.SequentCore.Simpl.Monad
+import {-# SOURCE #-} Language.SequentCore.Simpl.Util
 import Language.SequentCore.Syntax
 import Language.SequentCore.Translate
-import Language.SequentCore.Util
-import Language.SequentCore.WiredIn
 
 import BasicTypes ( Activation, Arity, CompilerPhase(..), PhaseNum
                   , TopLevelFlag(..), RecFlag(..)
@@ -63,7 +66,7 @@ import CoreSyn    ( Tickish(Breakpoint)
                   , tickishCounts, tickishIsCode )
 import CoreUnfold ( mkCoreUnfolding, mkDFunUnfolding  )
 import DataCon
-import DynFlags   ( DynFlags, HasDynFlags, getDynFlags, ufCreationThreshold )
+import DynFlags   ( DynFlags, HasDynFlags, ufCreationThreshold )
 import FastString ( FastString )
 import Id
 import IdInfo
@@ -100,7 +103,7 @@ data SimplEnv
                 , se_tvSubst :: TvSubstEnv     -- InTyVar   |--> OutType
                 , se_cvSubst :: CvSubstEnv     -- InCoVar   |--> OutCoercion
                 , se_retTy   :: Maybe Type
-                , se_retKont :: Maybe KontSubstAns
+                , se_retKont :: Maybe MetaKont
                 --  ^^^ static part ^^^  --
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
                 , se_defs    :: IdDefEnv       -- OutId     |--> Definition (out)
@@ -119,7 +122,23 @@ type SimplIdSubst  = SimplSubst SeqCoreTerm
 type SimplPvSubst  = SimplSubst SeqCorePKont
 type TermSubstAns  = SubstAns SeqCoreTerm
 type PKontSubstAns = SubstAns SeqCorePKont
-type KontSubstAns  = SubstAns SeqCoreKont
+
+data MetaKont = SynKont  { mk_state   :: KontState, mk_kont :: SeqCoreKont }
+              | MetaKont { mk_state   :: KontState
+                         , mk_argInfo :: ArgInfo
+                         , mk_frames  :: [InFrame] -- or OutFrame if dupable
+                         , mk_end     :: InEnd }   -- or OutEnd if dupable
+
+data KontState = DupableKont (Maybe MetaKont) -- Invariant: contained MetaKont is dupable
+               | SuspKont StaticEnv
+
+canDupMetaKont :: MetaKont -> Bool
+canDupMetaKont mk = case mk_state mk of { DupableKont _ -> True; _ -> False }
+
+setStaticPartFrom :: SimplEnv -> MetaKont -> SimplEnv
+setStaticPartFrom env mk
+  = case mk_state mk of DupableKont mk_m -> (zapSubstEnvs env) { se_retKont = mk_m }
+                        SuspKont stat    -> env `setStaticPart` stat
 
 -- The original simplifier uses the IdDetails stored in a Var to store unfolding
 -- info. We store similar data externally instead. (This is based on the Secrets
@@ -356,12 +375,8 @@ substPv (SimplEnv { se_pvSubst = pvs, se_inScope = ins }) j
       Just (DoneId j')        -> DoneId (refine ins j')
       Just ans                -> ans
 
-substKv :: SimplEnv -> KontSubstAns
-substKv (SimplEnv { se_retKont = rk, se_retTy = ty })
-  = rk `orElse` DoneId kontId
-  where
-    -- A fake id just so we have something to pass to DoneId
-    kontId = mkKontId (ty `orElse` pprPanic "substKv" (text "at top level"))
+substKv :: SimplEnv -> Maybe MetaKont
+substKv = se_retKont
 
 refine :: InScopeSet -> OutVar -> OutVar
 refine ins x
@@ -504,9 +519,9 @@ extendCvSubst :: SimplEnv -> InCoVar -> OutCoercion -> SimplEnv
 extendCvSubst env@(SimplEnv { se_cvSubst = cvs }) coVar co
   = env { se_cvSubst = extendVarEnv cvs coVar co }
 
-setRetKont :: SimplEnv -> KontSubstAns -> SimplEnv
-setRetKont env ans
-  = env { se_retKont = Just ans }
+setRetKont :: SimplEnv -> MetaKont -> SimplEnv
+setRetKont env mk
+  = env { se_retKont = Just mk }
 
 zapSubstEnvs :: SimplEnv -> SimplEnv
 zapSubstEnvs env
@@ -1102,6 +1117,27 @@ instance Outputable a => Outputable (SubstAns a) where
   ppr (Susp {}) = text "Suspended"
 --  ppr (Susp _env v)
 --    = brackets $ hang (text "Suspended:") 2 (ppr v)
+
+instance Outputable KontState where
+  ppr (DupableKont mk_m) = text "ok to dup" <+> ppWhen (isJust mk_m) (text "(cascades)")
+  ppr (SuspKont {})      = text "suspended"
+
+pprOkDup :: Maybe MetaKont -> SDoc
+pprOkDup mk_m = parens (text "ok to dup" <> ppWhen (isJust mk_m)
+                                     (comma <+> text "cascades"))
+
+instance Outputable MetaKont where
+  ppr (SynKont { mk_state = DupableKont mk_m, mk_kont = kont })
+    = pprOkDup mk_m <+> ppr kont
+  ppr (SynKont {})
+    = text "<suspended syntax>"
+  ppr (MetaKont { mk_state = DupableKont mk_m
+                , mk_argInfo = ai
+                , mk_frames = fs
+                , mk_end = end })
+    = hang (text "metacont" <+> pprOkDup mk_m) 2 (ppr ai $$ ppr (Kont fs end))
+  ppr (MetaKont {})
+    = text "<suspended metacont>"
 
 instance Outputable Definition where
   ppr (BoundTo { def_term = term, def_level = level, def_guidance = guid,

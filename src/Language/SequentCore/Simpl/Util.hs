@@ -266,3 +266,12 @@ matchCase env_v value (_ : alts)
   = matchCase env_v value alts
 matchCase _ _ []
   = Nothing
+
+instance Outputable ArgInfo where
+  ppr (ArgInfo { ai_term = term
+               , ai_frames = fs
+               , ai_co = co_m })
+    = hang (text "ArgInfo") 8 $ vcat [ text "Term:" <+> ppr term
+                                     , text "Prev. Frames:" <+> pprWithCommas ppr fs
+                                     , case co_m of Just co -> text "Coercion:" <+> ppr co
+                                                    Nothing -> empty ]
