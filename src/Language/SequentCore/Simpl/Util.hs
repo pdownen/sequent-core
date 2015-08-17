@@ -270,8 +270,14 @@ matchCase _ _ []
 instance Outputable ArgInfo where
   ppr (ArgInfo { ai_term = term
                , ai_frames = fs
-               , ai_co = co_m })
+               , ai_co = co_m
+               , ai_strs = strs })
     = hang (text "ArgInfo") 8 $ vcat [ text "Term:" <+> ppr term
                                      , text "Prev. Frames:" <+> pprWithCommas ppr fs
                                      , case co_m of Just co -> text "Coercion:" <+> ppr co
-                                                    Nothing -> empty ]
+                                                    Nothing -> empty
+                                     , strictDoc ]
+    where
+      strictDoc = case strs of []        -> text "Expression is bottom"
+                               True  : _ -> text "Next argument strict"
+                               False : _ -> text "Next argument lazy"
