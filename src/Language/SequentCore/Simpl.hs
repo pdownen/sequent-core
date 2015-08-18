@@ -325,7 +325,7 @@ completeNonRecOut :: SimplEnv -> TopLevelFlag -> Bool -> InId -> OutId
                   -> OutTerm -> SimplM SimplEnv
 completeNonRecOut env level isStrict bndr bndr' rhs
   = do
-    (env', rhs')   <- prepareRhsTerm env level bndr' rhs
+    (env', rhs')   <- prepareRhsTerm (zapFloats env) level bndr' rhs
     (env'', rhs'') <-
       if doFloatFromRhs level NonRecursive isStrict rhs' env'
         then do
@@ -1166,7 +1166,7 @@ ensureDupableKont env
   | Just kont <- substKv env
   , SuspKont stat <- mk_state kont
   = do
-    (env', kont') <- mkDupableKont (stat `inDynamicScope` env) ty kont
+    (env', kont') <- mkDupableKont (stat `inDynamicScope` zapFloats env) ty kont
     return $ (env `addFloats` env') `setRetKont` kont'
   | otherwise
   = return env
