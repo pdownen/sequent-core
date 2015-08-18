@@ -23,24 +23,25 @@ import Data.List
 
 ppr_bind :: OutputableBndr b => Bind b -> SDoc
 ppr_bind (NonRec pair) = ppr_binding pair
-ppr_bind (Rec binds)   = hang (text "rec") 2 (vcat $ intersperse space $ ppr_block "{" ";" "}" (map ppr_binding binds))
+ppr_bind (Rec binds)   = hang (text "rec") 2 (vcat $ intersperse space $
+                                                ppr_block (char '{') (char ';') (char '}') (map ppr_binding binds))
 
 ppr_binds_top :: OutputableBndr b => [Bind b] -> SDoc
-ppr_binds_top binds = ppr_binds_with "" "" "" binds
+ppr_binds_top binds = ppr_binds_with empty empty empty binds
 
 -- | Print the given bindings as a sequence of top-level bindings.
 pprTopLevelBinds :: OutputableBndr b => [Bind b] -> SDoc
 pprTopLevelBinds = ppr_binds_top
 
-ppr_block :: String -> String -> String -> [SDoc] -> [SDoc]
-ppr_block open _ close [] = [text open <> text close]
+ppr_block :: SDoc -> SDoc -> SDoc -> [SDoc] -> [SDoc]
+ppr_block open _ close [] = [open <> close]
 ppr_block open mid close (first : rest)
-  = text open <+> first : map (text mid <+>) rest ++ [text close]
+  = open <+> first : map (mid <+>) rest ++ [close]
 
 ppr_binds :: OutputableBndr b => [Bind b] -> SDoc
-ppr_binds binds = ppr_binds_with "{" ";" "}" binds
+ppr_binds binds = ppr_binds_with (char '{') (char ';') (char '}') binds
 
-ppr_binds_with :: OutputableBndr b => String -> String -> String -> [Bind b] -> SDoc
+ppr_binds_with :: OutputableBndr b => SDoc -> SDoc -> SDoc -> [Bind b] -> SDoc
 ppr_binds_with open mid close binds = vcat $ intersperse space $ ppr_block open mid close (map ppr_bind binds)
 
 ppr_binding :: OutputableBndr b => BindPair b -> SDoc
@@ -63,8 +64,8 @@ ppr_comm add_par comm
     ppr_cut
       = case cut of
           Left (term, Kont fs end) 
-            -> sep [text "<" <> pprCoreTerm term,
-                    cat $ ppr_block "|" ";" ">" $ (ppr_kont_frames fs ++ [ppr_end end])]
+            -> sep [char '<' <> pprCoreTerm term,
+                    cat $ ppr_block (char '|') (char ';') (char '>') $ (ppr_kont_frames fs ++ [ppr_end end])]
           Right (args, j)
             -> text "jump" <+> ppr j <+> parens (pprWithCommas pprCoreTerm args)
 
@@ -106,7 +107,7 @@ ppr_end Return
   = text "ret"
 ppr_end (Case var alts)
   = hang (text "case as" <+> pprBndr LetBind var <+> text "of") 2 $
-      vcat $ ppr_block "{" ";" "}" (map pprCoreAlt alts)
+      vcat $ ppr_block (char '{') (char ';') (char '}') (map pprCoreAlt alts)
 
 ppr_kont :: OutputableBndr b => (SDoc -> SDoc) -> Kont b -> SDoc
 ppr_kont add_par (Kont frames end)
