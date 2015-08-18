@@ -74,6 +74,7 @@ tick t
 
 freeTick t
   = SimplM $ do
+      when traceTicks $ putMsg (text "TICK (free):" <+> ppr t)
       dflags <- getDynFlags
       let count = doFreeSimplTick t (zeroSimplCount dflags)
       return ((), count)

@@ -29,7 +29,8 @@ import BasicTypes
 import Coercion    ( coercionKind, isCoVar, mkCoCast )
 import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      CoreM, defaultPlugin, reinitializeGlobals,
-                     isZeroSimplCount, pprSimplCount, putMsg, errorMsg,
+                     isZeroSimplCount, pprSimplCount, simplCountN,
+                     putMsg, errorMsg,
                      getRuleBase
                    )
 import CoreSubst   ( deShadowBinds )
@@ -58,6 +59,7 @@ import Type        ( Type, applyTy, funResultTy, splitFunTy_maybe, splitForAllTy
                    , mkTyVarTy )
 import TysWiredIn  ( mkTupleTy )
 import UniqSupply
+import Util        ( debugIsOn )
 import Var
 import VarEnv
 import VarSet
@@ -115,7 +117,7 @@ runSimplifier iters mode guts
       runLint "pre-simpl" binds (text "--- Original Core: ---"
                                  $$ Core.pprCoreBindings coreBinds)
       when dumping $ putMsg $ text "LINT PASSED"
-    binds' <- go 1 binds
+    binds' <- go 1 [] binds
     let coreBinds' = bindsToCore binds'
     when dumping $ putMsg  $ text "FINAL CORE"
                           $$ text "----------"
@@ -124,12 +126,13 @@ runSimplifier iters mode guts
   where
     rules = mg_rules guts
     
-    go n binds
+    go n prevCounts binds
       | n > iters
-      = do
-        errorMsg  $  text "Ran out of gas after"
-                 <+> int iters
-                 <+> text "iterations."
+      = (warnPprTrace (debugIsOn && iters > 2) __FILE__ __LINE__ $
+          text "Simplifier bailing out after" <+> int iters
+            <+> text "iterations"
+            <+> (brackets $ hsep $ punctuate comma $
+                 map (int . simplCountN) (reverse prevCounts)))
         return binds
       | otherwise
       = do
@@ -159,21 +162,20 @@ runSimplifier iters mode guts
           pprPanic "Sequent Core Lint error (in occurrence analysis)"
             (withPprStyle defaultUserStyle $ err)
         (binds', count) <- runSimplM $ simplModule env occBinds
-        when linting $ whenIsJust (lintCoreBindings binds') $ \err ->
-          pprPanic "Sequent Core Lint error"
-            (withPprStyle defaultUserStyle $ err $$ pprTopLevelBinds binds')
         when dumping $ putMsg  $ text "SUMMARY" <+> int n
                               $$ text "---------"
                               $$ pprSimplCount count
                               $$ text "AFTER" <+> int n
                               $$ text "-------"
                               $$ pprTopLevelBinds binds'
+        runLint "post-simpl" binds' (text "--- Original Sequent Core: ---"
+                                     $$ pprTopLevelBinds occBinds)
         if isZeroSimplCount count
           then do
             when tracing $ putMsg  $  text "Done after"
                                   <+> int n <+> text "iterations"
             return binds'
-          else go (n+1) binds'
+          else go (n+1) (count:prevCounts) binds'
     
     runOccurAnal env mod vects vectVars binds
       = let isRuleActive = activeRule env
@@ -365,7 +367,7 @@ prepareRhsTerm env level x (Compute ty comm)
                             -- into the other and keep on looping
                             return (env', Compute toTy (Eval term (Kont (fs' ++ [Cast co]) Return)))
                        else do
-                            env''' <- completeNonRecTerm env'' False x'_final x'_final x'_rhs level
+                            env''' <- completeNonRecOut env'' level False x'_final x'_final x'_rhs
                             x'_final_value <- simplVar env''' x'_final
                             return (env''', Compute toTy (Eval x'_final_value (Kont [Cast co] Return)))
           Nothing -> return (env', Compute ty (Eval term (Kont fs' Return)))
@@ -492,17 +494,6 @@ simplKontBind env ty env_k k
     return $ env' `setRetKont` SynKont { mk_state = SuspKont env_k, mk_kont = k }
   where
     (env', _) = enterKontScope env ty
-
-completeNonRecTerm :: SimplEnv -> Bool -> InVar -> OutVar -> OutTerm
-               -> TopLevelFlag -> SimplM SimplEnv
-completeNonRecTerm env is_strict old_bndr new_bndr new_rhs top_lvl
- = do  { (env1, rhs1) <- prepareRhsTerm (zapFloats env) top_lvl new_bndr new_rhs
-       ; (env2, rhs2) <-
-               if doFloatFromRhs NotTopLevel NonRecursive is_strict rhs1 env1
-               then do { tick LetFloatFromLet
-                       ; return (addFloats env env1, rhs1) }          -- Add the floats to the main env
-               else      return (env, wrapFloatsAroundTerm env1 rhs1) -- Wrap the floats around the RHS
-       ; completeBind env2 old_bndr new_bndr (Left rhs2) NotTopLevel }
 
 completeBind :: SimplEnv -> InVar -> OutVar -> OutRhs
              -> TopLevelFlag -> SimplM SimplEnv
@@ -752,7 +743,7 @@ simplKont env ai@(ArgInfo { ai_co = Nothing }) [] (Case case_bndr [Alt _ bndrs r
           --                            ppr ok_for_spec,
           --                            ppr scrut]) $
           tick (CaseElim case_bndr)
-        ; env' <- simplNonRecOut env case_bndr (argInfoToTerm env ai)
+        ; env' <- simplNonRecOut env case_bndr scrut
         ; simplCommand env' rhs }
   where
     elim_lifted   -- See Note [Case elimination: lifted case]
@@ -1189,17 +1180,19 @@ ensureDupableKont env
 mkDupableKont :: SimplEnv -> Type -> MetaKont -> SimplM (SimplEnv, MetaKont)
 mkDupableKont env ty kont
   = do
-    when tracing $ liftCoreM $ putMsg $ hang (text "mkDupableKont") 4 (ppr env $$ ppr ty $$ ppr kont)
+    let env_noFloats = zapFloats env
+    when tracing $ liftCoreM $ putMsg $
+      hang (text "mkDupableKont") 4 (ppr env_noFloats $$ ppr ty $$ ppr kont)
     (env', ans) <- case kont of
       SynKont { mk_kont = Kont fs end }
         -> do
-           (env', kont', mk_m) <- go env [] ty fs end
+           (env', kont', mk_m) <- go env_noFloats [] ty fs end
            return (env', SynKont { mk_state = DupableKont mk_m, mk_kont = kont' })
       MetaKont { mk_argInfo = ai
                , mk_frames  = fs
                , mk_end     = end }
         -> do
-           (env', Kont fs' end', mk_m) <- go env [] ty fs end
+           (env', Kont fs' end', mk_m) <- go env_noFloats [] ty fs end
            (env'', outFrames) <- mapAccumLM (makeTrivialFrame NotTopLevel) env' (ai_frames ai)
            return (env'', kont { mk_state   = DupableKont mk_m
                                , mk_argInfo = ai { ai_frames = outFrames }
@@ -1207,7 +1200,7 @@ mkDupableKont env ty kont
                                , mk_end     = end' })
     when tracing $ liftCoreM $ putMsg $ hang (text "mkDupableKont DONE") 4 $
       ppr ans $$ vcat (map ppr (getFloatBinds (getFloats env')))
-    return (env', ans)
+    return (env `addFloats` env', ans)
   where
     go :: SimplEnv -> [OutFrame] -> Type -> [InFrame] -> InEnd
        -> SimplM (SimplEnv, OutKont, Maybe MetaKont)
@@ -1395,7 +1388,7 @@ makeTrivialWithInfo top_lvl env info term
   = do  { uniq <- getUniqueM
         ; let name = mkSystemVarName uniq (fsLit "a")
               var = mkLocalIdWithInfo name term_ty info
-        ; env'  <- completeNonRecTerm env False var var term top_lvl
+        ; env'  <- completeNonRecOut env top_lvl False var var term
         ; expr' <- simplVar env' var
         ; return (env', expr') }
         -- The simplVar is needed becase we're constructing a new binding
