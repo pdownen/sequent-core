@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- | 
 -- Module      : Language.SequentCore.Syntax
 -- Description : Sequent Core syntax
@@ -20,7 +22,7 @@ module Language.SequentCore.Syntax (
   addLets, addLetsToTerm, addNonRec, consFrame, addFrames,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
-  partitionTypes,
+  spanTypes, spanTypeArgs,
   flattenCommand,
   isValueArg, isTypeArg, isCoArg, isTyCoArg, isAppFrame, isValueAppFrame,
   isTrivial, isTrivialTerm, isTrivialKont, isTrivialPKont, isReturnKont, isReturn,
@@ -30,7 +32,8 @@ module Language.SequentCore.Syntax (
   binderOfPair, setPairBinder, rhsOfPair, mkBindPair, destBindPair,
   bindsTerm, bindsKont, flattenBind, flattenBinds, bindersOf, bindersOfBinds,
   -- * Calculations
-  termType, frameType, termIsBottom, commandIsBottom,
+  termType, frameType, applyTypeToArg, applyTypeToArgs, applyTypeToFrames,
+  termIsBottom, commandIsBottom,
   needsCaseBinding,
   termOkForSpeculation, commandOkForSpeculation, kontOkForSpeculation,
   termOkForSideEffects, commandOkForSideEffects, kontOkForSideEffects,
@@ -38,7 +41,6 @@ module Language.SequentCore.Syntax (
   termIsExpandable, kontIsExpandable, commandIsExpandable, rhsIsExpandable,
   CheapAppMeasure, isCheapApp, isExpandableApp,
   termIsCheapBy, kontIsCheapBy, commandIsCheapBy, rhsIsCheapBy,
-  applyTypeToArg,
   -- * Continuation ids
   isPKontId, Language.SequentCore.WiredIn.mkKontTy, kontTyArg,
   -- * Values
@@ -48,6 +50,7 @@ module Language.SequentCore.Syntax (
 ) where
 
 import {-# SOURCE #-} Language.SequentCore.Pretty ()
+import Language.SequentCore.Util
 import Language.SequentCore.WiredIn
 
 import Coercion  ( Coercion, coercionKind, coercionType, isCoVar, isCoVarType
@@ -60,7 +63,6 @@ import Id        ( Id, isDataConWorkId, isDataConWorkId_maybe, isConLikeId
                  , idArity, idType, idDetails, idUnfolding, isBottomingId )
 import IdInfo    ( IdDetails(..) )
 import Literal   ( Literal, isZeroLit, litIsTrivial, literalType, mkMachString )
-import Maybes    ( orElse )
 import MkCore    ( rUNTIME_ERROR_ID, mkWildValBinder )
 import Outputable
 import Pair      ( pSnd )
@@ -235,7 +237,7 @@ mkComputeEval v fs = mkCompute ty (Eval v (Kont fs Return))
 mkAppTerm :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreTerm
 mkAppTerm fun args = mkCompute retTy (Eval fun (Kont (map App args) Return))
   where
-    (tyArgs, _) = partitionTypes args
+    (tyArgs, _) = spanTypes args
     (_, retTy) = Type.splitFunTys $ Type.applyTys (termType fun) tyArgs
 
 mkCast :: SeqCoreTerm -> Coercion -> SeqCoreTerm
@@ -360,10 +362,11 @@ collectArgsUpTo n (Kont frames end)
 
 -- | Divide a list of terms into an initial sublist of types and the remaining
 -- terms.
-partitionTypes :: [Term b] -> ([KindOrType], [Term b])
-partitionTypes (Type ty : vs) = (ty : tys, vs')
-  where (tys, vs') = partitionTypes vs
-partitionTypes vs = ([], vs)
+spanTypes :: [Arg b] -> ([KindOrType], [Arg b])
+spanTypes = mapWhileJust $ \case { Type ty -> Just ty; _ -> Nothing }
+
+spanTypeArgs :: [Frame b] -> ([KindOrType], [Frame b])
+spanTypeArgs = mapWhileJust $ \case { App (Type ty) -> Just ty; _ -> Nothing }
 
 flattenCommand :: Command b -> ([Bind b], Either (Term b, Kont b) ([Arg b], PKontId))
 flattenCommand = go []
@@ -567,7 +570,7 @@ termType (Compute ty _) = ty
 -- see exprType in GHC CoreUtils
 termType _other         = alphaTy
 
--- | Compute the type of a frame's input, given the type of its input. (The
+-- | Compute the type of a frame's output, given the type of its input. (The
 --   input type of a type application is not uniquely defined, so it must be
 --   specified.)
 frameType :: HasId b => Type -> Frame b -> Type
@@ -575,6 +578,32 @@ frameType ty (App (Type argTy)) = ty `Type.applyTy` argTy
 frameType ty (App _)            = Type.funResultTy ty
 frameType _  (Cast co)          = pSnd (coercionKind co)
 frameType ty (Tick _)           = ty
+
+applyTypeToArg :: Type -> Arg b -> Type
+applyTypeToArg ty (Type tyArg) = ty `Type.applyTy` tyArg
+applyTypeToArg ty _            = Type.funResultTy ty
+
+applyTypeToArgs :: Type -> [Arg b] -> Type
+applyTypeToArgs ty [] = ty
+applyTypeToArgs ty args@(Type _ : _)
+  = applyTypeToArgs (ty `Type.applyTys` tyArgs) args'
+  where
+    (tyArgs, args') = spanTypes args
+applyTypeToArgs ty (_ : args)
+  = applyTypeToArgs (Type.funResultTy ty) args
+  
+applyTypeToFrames :: Type -> [Frame b] -> Type
+applyTypeToFrames ty [] = ty
+applyTypeToFrames ty fs@(App (Type _) : _)
+  = applyTypeToFrames (ty `Type.applyTys` tyArgs) fs'
+  where
+    (tyArgs, fs') = spanTypeArgs fs
+applyTypeToFrames ty (App _ : fs)
+  = applyTypeToFrames (Type.funResultTy ty) fs
+applyTypeToFrames _  (Cast co : fs)
+  = applyTypeToFrames (pSnd (coercionKind co)) fs
+applyTypeToFrames ty (Tick _ : fs)
+  = applyTypeToFrames ty fs
 
 -- | Compute (a conservative estimate of) the arity of a term.
 termArity :: HasId b => Term b -> Int
@@ -797,10 +826,6 @@ termIsCheapBy    = termCheap
 kontIsCheapBy    = kontCheap
 commandIsCheapBy = commCheap
 rhsIsCheapBy     = rhsCheap
-
-applyTypeToArg :: Type -> Arg b -> Type
-applyTypeToArg ty (Type tyArg) = Type.applyTy ty tyArg
-applyTypeToArg ty _            = Type.funResultTy ty
 
 --------------------------------------------------------------------------------
 -- Continuation ids

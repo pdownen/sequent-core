@@ -1,9 +1,10 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE LambdaCase, CPP #-}
 
 module Language.SequentCore.Simpl.Util (
   -- * State of argument processing
   RevList, ArgInfo(..),
-  mkArgInfo, argInfoToTerm, addFrame, swallowCoercion,
+  mkArgInfo, addFrameToArgInfo, addFramesToArgInfo, swallowCoercion,
+  argInfoToTerm, argInfoSpanArgs,
   
   -- * Summary of arguments
   ArgSummary(..),
@@ -18,13 +19,13 @@ module Language.SequentCore.Simpl.Util (
 
 import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Syntax
+import Language.SequentCore.Util
 
 import Coercion
 import CoreSyn     ( CoreRule, isConLikeUnfolding )
 import Demand
 import FastString
 import Id
-import Maybes      ( orElse )
 import OptCoercion
 import Outputable
 import Pair
@@ -137,17 +138,24 @@ argInfoToTerm :: SimplEnv -> ArgInfo -> OutTerm
 argInfoToTerm env ai = mkComputeEval (ai_term ai') (reverse (ai_frames ai'))
   where ai' = swallowCoercion env ai
 
--- Add a frame to the ArgInfo. Don't try anything clever like pushing casts
--- past arguments (simplKont will do this itself), but do simplify the coercion
--- before adding it to the frames.
-addFrame :: SimplEnv -> ArgInfo -> OutFrame -> ArgInfo
-addFrame env ai f
-  = case f of
-      Cast co -> ai { ai_co = ai_co ai `combineCo` co }
-      App _   -> ai' { ai_frames = f : ai_frames ai' }
-        where ai' = swallowCoercion env ai
-      Tick _  -> ai { ai_frames = f : ai_frames ai }
+-- Add a frame to the ArgInfo. Don't try anything clever like combining casts or
+-- pushing them past arguments (the argument is an OutFrame; too late to
+-- simplify), but do swallow any coercion first. (We might leave two casts in a
+-- row, but there's always next iteration. Well, usually.)
+addFrameToArgInfo :: SimplEnv -> ArgInfo -> OutFrame -> ArgInfo
+addFrameToArgInfo env ai f
+  = ai' { ai_frames = f : ai_frames ai' }
+  where ai' = swallowCoercion env ai
 
+addFramesToArgInfo :: SimplEnv -> ArgInfo -> [OutFrame] -> ArgInfo
+addFramesToArgInfo env ai fs
+  = ai' { ai_frames = reverse fs ++ ai_frames ai' }
+  where ai' = swallowCoercion env ai
+
+argInfoSpanArgs :: ArgInfo -> ([OutArg], [OutFrame])
+argInfoSpanArgs (ArgInfo { ai_frames = rev_fs })
+  = mapWhileJust (\case { App arg -> Just arg; _ -> Nothing }) (reverse rev_fs)
+      
 -- Clear the coercion, if there is one, by adding it to the frames after
 -- simplifying it.
 swallowCoercion :: SimplEnv -> ArgInfo -> ArgInfo

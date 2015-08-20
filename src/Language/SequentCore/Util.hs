@@ -5,7 +5,7 @@
 -- Stability   : experimental
 
 module Language.SequentCore.Util (
-  Maybes.orElse, consMaybe, pprTraceShort
+  Maybes.orElse, consMaybe, mapWhileJust, pprTraceShort
 ) where
 
 import DynFlags
@@ -18,6 +18,11 @@ infixr 5 `consMaybe`
 consMaybe :: Maybe a -> [a] -> [a]
 Just x  `consMaybe` xs = x : xs
 Nothing `consMaybe` xs = xs
+
+mapWhileJust :: (a -> Maybe b) -> [a] -> ([b], [a])
+mapWhileJust f (x : xs) | Just y <- f x = (y : ys, xs')
+  where (ys, xs') = mapWhileJust f xs
+mapWhileJust _ xs = ([], xs)
 
 pprTraceShort :: String -> SDoc -> a -> a
 -- ^ If debug output is on, show some 'SDoc' on the screen

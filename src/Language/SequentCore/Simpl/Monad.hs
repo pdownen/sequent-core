@@ -1,6 +1,6 @@
 module Language.SequentCore.Simpl.Monad (
   SimplM, runSimplM, liftCoreM,
-  getDynFlags, tick, freeTick
+  getDynFlags, tick, freeTick, checkedTick
 ) where
 
 import CoreMonad
@@ -64,7 +64,7 @@ instance MonadUnique SimplM where
   getUniqueM = liftCoreM getUniqueM
   getUniquesM = liftCoreM getUniquesM
 
-tick, freeTick :: Tick -> SimplM ()
+tick, freeTick, checkedTick :: Tick -> SimplM ()
 tick t
   = SimplM $ do
       when traceTicks $ putMsg (text "TICK:" <+> ppr t)
@@ -78,6 +78,9 @@ freeTick t
       dflags <- getDynFlags
       let count = doFreeSimplTick t (zeroSimplCount dflags)
       return ((), count)
+
+-- TODO Implement tick limit
+checkedTick = tick
 
 withZeroCount :: CoreM a -> CoreM (a, SimplCount)
 withZeroCount m = do

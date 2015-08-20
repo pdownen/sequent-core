@@ -3,16 +3,17 @@
 module Language.SequentCore.Simpl.Env (
   SimplEnv,
   initialEnv, getMode, dynFlags, getSimplRules,
-  getUnfoldingInRuleMatch, activeRule,
+  getUnfoldingInRuleMatch, activeRule, getInScopeSet,
   
   SimplIdSubst, SubstAns(..),
   substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar,
   substTerm, substKont, substCommand,
   retType,
-  extendIdSubst, extendPvSubst, extendTvSubst, extendCvSubst, setRetKont,
+  extendIdSubst, extendPvSubst, extendTvSubst, extendCvSubst,
+  setRetKont, pushKont,
   enterScope, enterKontScope, enterScopes, mkFreshVar,
   getTvSubst, getCvSubst,
-  zapSubstEnvs,
+  zapSubstEnvs, zapTermSubstEnvs,
   
   StaticEnv,
   staticPart, setStaticPart, inDynamicScope,
@@ -123,11 +124,19 @@ type SimplPvSubst  = SimplSubst SeqCorePKont
 type TermSubstAns  = SubstAns SeqCoreTerm
 type PKontSubstAns = SubstAns SeqCorePKont
 
-data MetaKont = SynKont  { mk_state   :: KontState, mk_kont :: SeqCoreKont }
-              | MetaKont { mk_state   :: KontState
-                         , mk_argInfo :: ArgInfo
-                         , mk_frames  :: [InFrame] -- or OutFrame if dupable
-                         , mk_end     :: InEnd }   -- or OutEnd if dupable
+-- The MetaKont type is intimately connected with Simpl.simplKont; a MetaKont
+-- is, to a first approximation, a defunctionalized continuation that will be
+-- "invoked" by simplKont when it hits a Return. The other consumer is
+-- mkDupableKont, which (among other things) picks through the terms in the
+-- MetaKont and runs makeTrivial on each of them.
+data MetaKont = SynKont  { mk_state :: KontState
+                         , mk_kont  :: InKont } -- or OutKont if dupable
+              | StrictArg { mk_state   :: KontState
+                          , mk_argInfo :: ArgInfo
+                          , mk_frames  :: [InFrame] -- or OutFrame if dupable
+                          , mk_end     :: InEnd }   -- or OutEnd if dupable
+              | AppendOutFrames { mk_state     :: KontState -- not necessarily dupable
+                                , mk_outFrames :: [OutFrame] } 
 
 data KontState = DupableKont (Maybe MetaKont) -- Invariant: contained MetaKont is dupable
                | SuspKont StaticEnv
@@ -305,6 +314,9 @@ activeRule env
   | otherwise           = isActive (sm_phase mode)
   where
     mode = getMode env
+
+getInScopeSet :: SimplEnv -> InScopeSet
+getInScopeSet = se_inScope
 
 enterScope :: SimplEnv -> InVar -> (SimplEnv, OutVar)
 enterScope env x
@@ -523,6 +535,13 @@ setRetKont :: SimplEnv -> MetaKont -> SimplEnv
 setRetKont env mk
   = env { se_retKont = Just mk }
 
+pushKont :: SimplEnv -> InKont -> SimplEnv
+pushKont env kont
+  -- Since invoking this metacontinuation will restore the current environment,
+  -- the original metacontinuation will run after this one.
+  = env `setRetKont` SynKont { mk_state = SuspKont (staticPart env)
+                             , mk_kont  = kont }
+
 zapSubstEnvs :: SimplEnv -> SimplEnv
 zapSubstEnvs env
   = env { se_idSubst = emptyVarEnv
@@ -530,6 +549,13 @@ zapSubstEnvs env
         , se_tvSubst = emptyVarEnv
         , se_cvSubst = emptyVarEnv
         , se_retKont = Nothing }
+
+zapTermSubstEnvs :: SimplEnv -> SimplEnv
+zapTermSubstEnvs env
+  = env { se_idSubst = emptyVarEnv
+        , se_pvSubst = emptyVarEnv
+        , se_tvSubst = emptyVarEnv
+        , se_cvSubst = emptyVarEnv }
 
 setSubstEnvs :: SimplEnv -> [OutBindPair] -> SimplEnv
 setSubstEnvs env pairs
@@ -1131,13 +1157,18 @@ instance Outputable MetaKont where
     = pprOkDup mk_m <+> ppr kont
   ppr (SynKont {})
     = text "<suspended syntax>"
-  ppr (MetaKont { mk_state = DupableKont mk_m
-                , mk_argInfo = ai
-                , mk_frames = fs
-                , mk_end = end })
-    = hang (text "metacont" <+> pprOkDup mk_m) 2 (ppr ai $$ ppr (Kont fs end))
-  ppr (MetaKont {})
-    = text "<suspended metacont>"
+  ppr (StrictArg { mk_state = DupableKont mk_m
+                 , mk_argInfo = ai
+                 , mk_frames = fs
+                 , mk_end = end })
+    = hang (text "Strict argument to:" <+> pprOkDup mk_m) 2 (ppr ai $$ ppr (Kont fs end))
+  ppr (StrictArg {})
+    = text "<strict argument>"
+  ppr (AppendOutFrames { mk_state = DupableKont mk_m
+                       , mk_outFrames = frames })
+    = hang (text "Append simplified frames:" <+> pprOkDup mk_m) 2 (ppr frames)
+  ppr (AppendOutFrames {})
+    = text "<append simplified frames>"
 
 instance Outputable Definition where
   ppr (BoundTo { def_term = term, def_level = level, def_guidance = guid,
