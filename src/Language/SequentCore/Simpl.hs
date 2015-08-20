@@ -494,7 +494,6 @@ simplKontBind env ty env_k k
   = do
     -- For now, we use Susp as if the id were definitely used only once. If we
     -- go into a multi-branch case, we'll call mkDupableKont then.
-    tick $ PreInlineUnconditionally (mkKontId ty)
     return $ env' `setRetKont` SynKont { mk_state = SuspKont env_k, mk_kont = k }
   where
     (env', _) = enterKontScope env ty
