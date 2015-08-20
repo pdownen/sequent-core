@@ -679,8 +679,9 @@ simplKont env ai (App arg@(Type tyArg) : fs) end
         ty' = substTy env tyArg
     simplKont env (ai { ai_frames = App (Type ty') : ai_frames ai
                       , ai_co = co_m' }) fs end
-simplKont env (ai@ArgInfo { ai_strs = [] }) (App {} : _fs) _end
+simplKont env (ai@ArgInfo { ai_strs = [] }) fs end
   -- We've run out of strictness arguments, meaning the call is definitely bottom
+  | not (null fs && isReturn end) -- Don't bother throwing away a trivial continuation
   = simplKontDone env ai (Case (mkWildValBinder ty) [])
   where
     ty = termType (argInfoToTerm env ai)
