@@ -676,8 +676,6 @@ fromCoreExpr :: FromCoreEnv -> Core.Expr MarkedVar -> SeqCoreKont
                             -> SeqCoreCommand
 fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
   where
-    subst = fce_subst env
-  
     go :: [SeqCoreBind] -> FromCoreEnv -> Core.Expr MarkedVar
        -> [SeqCoreFrame] -> SeqCoreEnd -> SeqCoreCommand
     go binds env expr fs end = case expr of
@@ -707,6 +705,7 @@ fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
       Core.Tick ti e     -> go binds env e (Tick (substTickish subst ti) : fs) end
       Core.Type t        -> done $ Type (substTy subst t)
       where
+        subst = fce_subst env
         done term = mkCommand (reverse binds) term (Kont fs end)
         
         goApp x args = case conv_maybe of
