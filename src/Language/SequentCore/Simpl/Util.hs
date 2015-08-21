@@ -11,7 +11,7 @@ module Language.SequentCore.Simpl.Util (
   interestingArg, nonTriv,
   
   -- * Coercion management
-  castApp, combineCo, consCastMaybe, simplCoercion,
+  castApp, combineCo, consCastMaybe, simplCoercion, simplOutCoercion,
   
   -- * Miscellany
   matchCase
@@ -135,29 +135,29 @@ mkArgInfo _env term co_m _fs
                                      -- isn't bottom, it's ill-defined!
             , ai_discs = repeat 0 }
 
-argInfoToTerm :: SimplEnv -> ArgInfo -> OutTerm
-argInfoToTerm env ai = mkComputeEval (ai_term ai') (reverse (ai_frames ai'))
-  where ai' = swallowCoercion env ai
+argInfoToTerm :: ArgInfo -> OutTerm
+argInfoToTerm ai = mkComputeEval (ai_term ai') (reverse (ai_frames ai'))
+  where ai' = swallowCoercion ai
 
 -- Add a frame to the ArgInfo. If it is an argument and the ArgInfo has a
 -- coercion pending, this will call 'castApp' to push the coercion past the
 -- argument. If it is a cast and the ArgInfo has a coercion pending, this will
 -- call 'combineCo'.
-addFrameToArgInfo :: SimplEnv -> ArgInfo -> OutFrame -> ArgInfo
-addFrameToArgInfo env ai f
+addFrameToArgInfo :: ArgInfo -> OutFrame -> ArgInfo
+addFrameToArgInfo ai f
   = case f of
       App arg  | Just co <- ai_co ai
               -> case castApp arg co of
                    Just (arg', co') -> ai { ai_frames = App arg' : ai_frames ai
                                           , ai_co     = Just co' }
                    Nothing          -> ai' { ai_frames = App arg : ai_frames ai' }
-                     where ai' = swallowCoercion env ai
+                     where ai' = swallowCoercion ai
       Cast co -> ai { ai_co = ai_co ai `combineCo` co }
       _       -> ai { ai_frames = f : ai_frames ai }
 
-addFramesToArgInfo :: SimplEnv -> ArgInfo -> [OutFrame] -> ArgInfo
-addFramesToArgInfo env ai fs
-  = foldl (addFrameToArgInfo env) ai fs
+addFramesToArgInfo :: ArgInfo -> [OutFrame] -> ArgInfo
+addFramesToArgInfo ai fs
+  = foldl addFrameToArgInfo ai fs
 
 argInfoSpanArgs :: ArgInfo -> ([OutArg], [OutFrame])
 argInfoSpanArgs (ArgInfo { ai_frames = rev_fs })
@@ -165,13 +165,13 @@ argInfoSpanArgs (ArgInfo { ai_frames = rev_fs })
 
 -- Clear the coercion, if there is one, by adding it to the frames after
 -- simplifying it.
-swallowCoercion :: SimplEnv -> ArgInfo -> ArgInfo
-swallowCoercion env ai@(ArgInfo { ai_co = Just co, ai_frames = fs })
+swallowCoercion :: ArgInfo -> ArgInfo
+swallowCoercion ai@(ArgInfo { ai_co = Just co, ai_frames = fs })
   = ai { ai_co     = Nothing
        , ai_frames = Cast co' : fs }
   where
-    co' = simplCoercion (zapSubstEnvs env) co -- Zap because it's an OutCoercion
-swallowCoercion _ ai = ai
+    co' = simplOutCoercion co
+swallowCoercion ai = ai
 
 ----------------
 -- ArgSummary --
@@ -233,8 +233,11 @@ instance Outputable ArgSummary where
 -- Coercion handling --
 -----------------------
 
-simplCoercion :: SimplEnv -> Coercion -> Coercion
+simplCoercion :: SimplEnv -> InCoercion -> OutCoercion
 simplCoercion env co = optCoercion (getCvSubst env) co
+
+simplOutCoercion :: OutCoercion -> OutCoercion
+simplOutCoercion co = optCoercion emptyCvSubst co
 
 combineCo :: Maybe OutCoercion -> OutCoercion -> Maybe OutCoercion
 combineCo co_m co'

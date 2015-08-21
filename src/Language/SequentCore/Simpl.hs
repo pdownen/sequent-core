@@ -676,17 +676,17 @@ simplKont env ai fs@(App _ : _) end
   , Nothing <- splitFunTy_maybe fromTy
   , Nothing <- splitForAllTy_maybe fromTy
   -- Can't push the cast after the arguments, so eat it
-  = simplKont env (swallowCoercion env ai) fs end
+  = simplKont env (swallowCoercion ai) fs end
 simplKont env ai (App (Type tyArg) : fs) end
   = do
     let ty' = substTy env tyArg
-    simplKont env (addFrameToArgInfo env ai (App (Type ty'))) fs end
+    simplKont env (addFrameToArgInfo ai (App (Type ty'))) fs end
 simplKont env (ai@ArgInfo { ai_strs = [] }) fs end
   -- We've run out of strictness arguments, meaning the call is definitely bottom
   | not (null fs && isReturn end) -- Don't bother throwing away a trivial continuation
   = simplKontDone env ai (Case (mkWildValBinder ty) [])
   where
-    ty = termType (argInfoToTerm env ai)
+    ty = termType (argInfoToTerm ai)
 simplKont _ (ArgInfo { ai_discs = [] }) _ _
   = pprPanic "simplKont" (text "out of discounts??")
 simplKont env ai@(ArgInfo { ai_strs = str:strs
@@ -708,20 +708,20 @@ simplKont env ai@(ArgInfo { ai_strs = str:strs
   = do
     -- Don't float out of lazy arguments (see Simplify.rebuildCall)
     arg_final <- simplTermNoFloats env arg
-    simplKont env (addFrameToArgInfo env ai' (App arg_final)) fs end
+    simplKont env (addFrameToArgInfo ai' (App arg_final)) fs end
   where
     ai' = ai { ai_strs = strs, ai_discs = discs }
 simplKont env ai (f@(Tick _) : fs) end
   -- FIXME Tick handling is actually rather delicate! In fact, we should
   -- (somehow) be putting a float barrier here (see Simplify.simplTick).
-  = simplKont env (addFrameToArgInfo env ai f) fs end
+  = simplKont env (addFrameToArgInfo ai f) fs end
 simplKont env ai [] Return
   -- If the metacontinuation will only provide more arguments, then we should run
   -- it immediately rather than swallowing the coercion and applying rules now.
   | Just (SynKont {}) <- substKv env
   = invokeMetaKont env ai
 simplKont env ai@(ArgInfo { ai_co = Just _ }) [] end
-  = simplKont env (swallowCoercion env ai) [] end
+  = simplKont env (swallowCoercion ai) [] end
 -- From now on, no coercion
 simplKont env ai@(ArgInfo { ai_term = Var fun, ai_rules = rules }) [] end
   | not (null rules)
@@ -759,7 +759,7 @@ simplKontAfterRules env ai (Case x alts)
       Just (Alt DEFAULT binds rhs) -> bindCaseBndr binds rhs
       Just (Alt _       binds rhs) -> knownCon env scrut dc tyArgs valArgs x binds rhs 
   where
-    scrut = argInfoToTerm env ai
+    scrut = argInfoToTerm ai
     bindCaseBndr binds rhs
       = assert (null binds) $ do
         env' <- simplNonRecOut env x scrut
@@ -802,15 +802,15 @@ simplKontAfterRules env ai (Case case_bndr [Alt _ bndrs rhs])
       -- Could allow for let bindings,
       -- but the original code in Simplify suggests doing so would be expensive
       
-    scrut = argInfoToTerm env ai
+    scrut = argInfoToTerm ai
 simplKontAfterRules env ai (Case x alts)
   = do
     env' <- if length alts > 1
               then ensureDupableKont env -- we're about to duplicate the context
               else return env
     let (env_alts, x') = enterScope env' x
-        ai' = swallowCoercion env ai
-        scrut = argInfoToTerm env ai'
+        ai' = swallowCoercion ai
+        scrut = argInfoToTerm ai'
     
     alts' <- forM alts (simplAlt env_alts (Just scrut) [] x')
     simplKontDone env' ai' (Case x' alts')
@@ -827,13 +827,12 @@ invokeMetaKont env ai
       Just mk@(StrictArg { mk_argInfo = ai'
                          , mk_frames = fs
                          , mk_end = end })
-        -> let arg  = argInfoToTerm env ai
+        -> let arg  = argInfoToTerm ai
                env' = envFrom mk
-           in simplKont env' (addFrameToArgInfo env' ai' (App arg)) fs end
+           in simplKont env' (addFrameToArgInfo ai' (App arg)) fs end
       Just mk@(AppendOutFrames { mk_outFrames = fs, mk_end = end })
         -> let env' = envFrom mk
-           in simplKont env' (addFramesToArgInfo env ai fs) [] end
-             -- Pass old environment because that's the environment of ai's coercion
+           in simplKont env' (addFramesToArgInfo ai fs) [] end
   where
     envFrom mk = env `setStaticPartFrom` mk
 
@@ -844,7 +843,7 @@ simplKontDone env ai end
   = undefined
   | otherwise
   = return (env, Eval term (Kont (reverse fs) end))
-  where ArgInfo { ai_term = term, ai_frames = fs } = swallowCoercion env ai
+  where ArgInfo { ai_term = term, ai_frames = fs } = swallowCoercion ai
 
 simplAlt :: SimplEnv -> Maybe OutTerm -> [AltCon] -> OutId -> InAlt -> SimplM OutAlt
 simplAlt env _scrut_maybe _notAmong _caseBndr (Alt con xs c)
@@ -1326,7 +1325,7 @@ mkDupableKont env ty kont
                                     go env' fs' ty fs end
           Just (mk@StrictArg { mk_argInfo = ai }) -> do
                                     let env' = env `setStaticPartFrom` mk
-                                        ty'  = funResultTy (termType (argInfoToTerm env' ai))
+                                        ty'  = funResultTy (termType (argInfoToTerm ai))
                                     (env'', mk') <- mkDupableKont env' ty' mk
                                     done env'' fs' Return (Just mk')
           Just (mk@AppendOutFrames { mk_outFrames = frames, mk_end = end }) -> do
