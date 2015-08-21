@@ -744,11 +744,12 @@ fromCoreCaseAsTerm env scrut bndr ty alts
   --
   -- The basic plan of action (taken together with the Case clause in fromCoreExpr):
   --   [[ case e of alts ]]_k = < compute p. [[e]]_(case of [[alts]]_p) | k >
-  = Compute ty body
+  = Compute ty' body
   where
     subst   = fce_subst env
+    ty'     = substTy subst ty
     (subst_rhs, bndr') = substBndr subst bndr
-    env_rhs = bindCurrentKontTy (env { fce_subst = subst_rhs }) ty
+    env_rhs = bindCurrentKontTy (env { fce_subst = subst_rhs }) ty'
     alts'   = map (fromCoreAlt env_rhs (Kont [] Return)) alts
     body    = fromCoreExpr env scrut (Kont [] (Case bndr' alts'))
 
@@ -778,8 +779,8 @@ fromCoreExprAsPKont env kont descs expr
 
     -- Calculate eta-expanding binders and arguments
     extraArgs = drop (length bndrs) descs -- will need to eta-expand with these
-    (subst'', etaBndr_maybes_args) = mapAccumL mkEtaBndr subst' (zip [1..] extraArgs)
-    (etaBndr_maybes, etaArgs) = unzip etaBndr_maybes_args
+    (subst'', unzip -> (etaBndr_maybes, etaArgs))
+      = mapAccumL mkEtaBndr subst' (zip [1..] extraArgs)
     etaBndrs = catMaybes etaBndr_maybes
     
     -- Eta-expand the body *before* translating to Sequent Core so that the
@@ -863,12 +864,12 @@ fromCoreBind (env@FCE { fce_subst = subst }) kont_maybe bind =
 
     Core.Rec pairs -> (env_final, Rec pairs_final)
       where
-        (subst', xs') = substRecBndrs subst (map (unmark . fst) pairs)
+        xs = map (unmark . fst) pairs
+        (subst', xs') = assert (all isId xs) $ substRecBndrs subst xs
         env' = env { fce_subst = subst' }
-        pairs_substed = [ (Marked x' mark, rhs) | (Marked _ mark, rhs) <- pairs 
-                                                | x' <- xs' ]
         pairs' = [ fromCoreBindPair env_final kont_maybe x' mark rhs
-                 | (Marked x' mark, rhs) <- pairs_substed ]
+                 | (Marked _ mark, rhs) <- pairs
+                 | x' <- xs' ]
         env_final = bindAsPKonts env' [ (binderOfPair pair, conv)
                                       | (Just conv, pair) <- pairs' ]
         pairs_final = map snd pairs'
