@@ -33,7 +33,6 @@ import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      putMsg,
                      getRuleBase
                    )
-import CoreSubst   ( deShadowBinds )
 import CoreSyn     ( CoreVect(..), CoreRule(..)
                    , isRuntimeVar, isCheapUnfolding
                    , tickishCounts
@@ -98,15 +97,14 @@ plugin = defaultPlugin {
     = []
 
   newPass max mode
-    = CoreDoPluginPass "SeqSimpl" (runSimplifier max mode)
+    = CoreDoPluginPass "SeqSimpl" (runSimplifier (max*2) mode)
 
 runSimplifier :: Int -> SimplifierMode -> ModGuts -> CoreM ModGuts
 runSimplifier iters mode guts
   = do
     when (tracing || dumping) $ putMsg  $ text "RUNNING SEQUENT CORE SIMPLIFIER"
                                        $$ text "Mode:" <+> ppr mode
-    -- FIXME deShadowBinds is a crutch - type variable shadowing causes bugs
-    let coreBinds = deShadowBinds (mg_binds guts)
+    let coreBinds = mg_binds guts
         binds = fromCoreModule coreBinds
     when dumping $ putMsg  $ text "INITIAL CORE"
                           $$ text "------------"
@@ -842,7 +840,7 @@ invokeMetaKont env ai
 simplKontDone :: SimplEnv -> ArgInfo -> OutEnd -> SimplM (SimplEnv, OutCommand)
 simplKontDone env ai end
   | tracing
-  , pprTrace "simplKontDone" (ppr env $$ ppr ai $$ ppr end) False
+  , pprTraceShort "simplKontDone" (ppr env $$ ppr ai $$ ppr end) False
   = undefined
   | otherwise
   = return (env, Eval term (Kont (reverse fs) end))
@@ -871,7 +869,7 @@ simplVar env x
 simplJump :: SimplEnv -> [InArg] -> InPKontId -> SimplM (SimplEnv, OutCommand)
 simplJump env args j
   | tracing
-  , pprTrace "simplJump" (ppr env $$ parens (pprWithCommas ppr args) $$ ppr j)
+  , pprTraceShort "simplJump" (ppr env $$ parens (pprWithCommas ppr args) $$ ppr j)
     False
   = undefined
 simplJump env args j
