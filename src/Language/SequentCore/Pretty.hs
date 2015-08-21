@@ -10,7 +10,7 @@
 -- built-in pretty printer.
   
 module Language.SequentCore.Pretty (
-  pprTopLevelBinds
+  pprTopLevelBinds, pprParendTerm
 ) where
 
 import Language.SequentCore.Syntax
@@ -97,8 +97,8 @@ ppr_kont_frames = map ppr_frame
 ppr_frame :: OutputableBndr b => Frame b -> SDoc
 ppr_frame (App v)
   = char '$' <+> ppr_term noParens v
-ppr_frame (Cast _)
-  = text "cast ..."
+ppr_frame (Cast co)
+  = text "cast" <+> ppr co
 ppr_frame (Tick _)
   = text "tick ..."
 
@@ -142,6 +142,9 @@ pprCoreTerm val = ppr_term noParens val
 
 pprCorePKont :: OutputableBndr b => PKont b -> SDoc
 pprCorePKont pkont = ppr_pkont noParens pkont
+
+pprParendTerm :: OutputableBndr b => Term b -> SDoc
+pprParendTerm term = ppr_term parens term
 
 noParens :: SDoc -> SDoc
 noParens pp = pp
