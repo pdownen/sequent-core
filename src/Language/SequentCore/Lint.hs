@@ -43,7 +43,9 @@ it names.
 type LintM = Either SDoc
 type TermEnv = TvSubst
 type KontEnv = TvSubst
-type LintEnv = (TermEnv, KontEnv, Type)
+type LintEnv = (TermEnv, KontEnv, OutType)
+
+type OutType = Type
 
 termEnv :: LintEnv -> TermEnv
 termEnv (env, _enk, _retTy) = env
@@ -51,10 +53,10 @@ termEnv (env, _enk, _retTy) = env
 kontEnv :: LintEnv -> KontEnv
 kontEnv (_env, enk, _retTy) = enk
 
-retTy :: LintEnv -> Type
+retTy :: LintEnv -> OutType
 retTy (_env, _enk, retTy) = retTy
 
-mkLintEnv :: TermEnv -> KontEnv -> Type -> LintEnv
+mkLintEnv :: TermEnv -> KontEnv -> OutType -> LintEnv
 mkLintEnv env enk ty = (env, enk, ty)
 
 emptyTermEnv :: TermEnv
@@ -198,7 +200,7 @@ lintKontBndrTypes env bndr argBndrs
       = Left $ text "wrong binder types for continuation binder:" <+> pprBndr LetBind bndr
             $$ text "binders:" <+> sep (map (pprBndr LambdaBind) argBndrs)
 
-lintCoreTerm :: TermEnv -> SeqCoreTerm -> LintM Type
+lintCoreTerm :: TermEnv -> SeqCoreTerm -> LintM OutType
 lintCoreTerm env (Var x)
   | not (isLocalId x)
   = return (idType x)
@@ -218,8 +220,9 @@ lintCoreTerm env (Lam x body)
 
 lintCoreTerm env (Compute ty comm)
   = do
-    lintCoreCommand (mkLintEnv env emptyTvSubst ty) comm
-    return ty
+    let ty' = substTy env ty
+    lintCoreCommand (mkLintEnv env emptyTvSubst ty') comm
+    return ty'
 
 lintCoreTerm _env (Lit lit)
   = return $ literalType lit
@@ -292,22 +295,21 @@ lintCoreJump env args j
       = Left $ text "bad parameterized continuation type in binder:" <+> pprBndr LetBind j
             $$ text "for args:" <+> ppr topArgs
 
-lintCoreKont :: SDoc -> LintEnv -> Type -> SeqCoreKont -> LintM ()
+lintCoreKont :: SDoc -> LintEnv -> OutType -> SeqCoreKont -> LintM ()
 lintCoreKont desc env ty (Kont frames end)
   = do
     (env', ty') <- foldM (uncurry (lintCoreFrame desc)) (env, ty) frames
     lintCoreEnd desc env' ty' end
 
-lintCoreFrame :: SDoc -> LintEnv -> Type -> SeqCoreFrame -> LintM (LintEnv, Type)
+lintCoreFrame :: SDoc -> LintEnv -> OutType -> SeqCoreFrame -> LintM (LintEnv, OutType)
 lintCoreFrame desc env ty (App (Type tyArg))
-  | Just (tyVar, resTy) <- splitForAllTy_maybe (substTy (termEnv env) ty)
+  | Just (tyVar, resTy) <- splitForAllTy_maybe ty
   = do
     let tyArg' = substTy (termEnv env) tyArg
     if typeKind tyArg' `isSubKind` idType tyVar
       then do
            let env' = mapTermLintEnv (\ent -> extendTvSubst ent tyVar tyArg') env
-               -- Don't reapply the rest of the substitution; just apply the new thing
-               resTy' = substTy (extendTvSubst emptyTvSubst tyVar tyArg') resTy
+               resTy' = substTyWith [tyVar] [tyArg'] resTy
            return (env', resTy')
       else mkError (desc <> colon <+> text "type argument" <+> ppr tyArg)
              (ppr (typeKind tyArg')) (ppr (idType tyVar))
@@ -330,9 +332,9 @@ lintCoreFrame desc env ty (Cast co)
 lintCoreFrame _ env ty (Tick _)
   = return (env, ty)
 
-lintCoreEnd :: SDoc -> LintEnv -> Type -> SeqCoreEnd -> LintM ()
+lintCoreEnd :: SDoc -> LintEnv -> OutType -> SeqCoreEnd -> LintM ()
 lintCoreEnd desc env ty Return
-  = let expTy = substTy (termEnv env) (retTy env)
+  = let expTy = retTy env
     in unless (expTy `eqType` ty) $
       mkError (desc <> colon <+> text "return type") (ppr expTy) (ppr ty)
 lintCoreEnd desc env ty (Case bndr alts)
@@ -358,7 +360,7 @@ mkError :: SDoc -> SDoc -> SDoc -> LintM a
 mkError desc ex act = Left (desc $$ text "expected:" <+> ex
                                  $$ text "actual:" <+> act)
   
-checkRhsType :: Var -> Type -> Type -> LintM ()
+checkRhsType :: Var -> OutType -> OutType -> LintM ()
 checkRhsType bndr bndrTy rhsTy
   = do unless (bndrTy `eqType` rhsTy) $
          mkError (text "type of RHS of" <+> ppr bndr) (ppr bndrTy) (ppr rhsTy)
@@ -366,14 +368,14 @@ checkRhsType bndr bndrTy rhsTy
        unless (isSubOpenTypeKind bndrKi) $
          mkError (text "kind of RHS of" <+> ppr bndr) (ppr openTypeKind) (ppr bndrKi)
 
-checkingType :: SDoc -> Type -> LintM Type -> LintM Type
+checkingType :: SDoc -> OutType -> LintM OutType -> LintM OutType
 checkingType desc ex go
   = do
     act <- go
     unless (ex `eqType` act) $ mkError desc (ppr ex) (ppr act)
     return act
 
-kontIdTyOrError :: TermEnv -> PKontId -> LintM Type
+kontIdTyOrError :: TermEnv -> PKontId -> LintM OutType
 kontIdTyOrError env k
   = case isKontTy_maybe (substTy env (idType k)) of
       Just arg -> return arg
