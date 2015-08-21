@@ -1324,9 +1324,10 @@ mkDupableKont env ty kont
                                     let env' = env `setStaticPartFrom` mk
                                         Kont fs end = mk_kont mk
                                     go env' fs' ty fs end
-          Just (mk@StrictArg {}) -> do
+          Just (mk@StrictArg { mk_argInfo = ai }) -> do
                                     let env' = env `setStaticPartFrom` mk
-                                    (env'', mk') <- mkDupableKont env' ty mk
+                                        ty'  = funResultTy (termType (argInfoToTerm env' ai))
+                                    (env'', mk') <- mkDupableKont env' ty' mk
                                     done env'' fs' Return (Just mk')
           Just (mk@AppendOutFrames { mk_outFrames = frames, mk_end = end }) -> do
                                     let env' = env `setStaticPartFrom` mk
