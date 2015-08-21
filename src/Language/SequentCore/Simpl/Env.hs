@@ -103,7 +103,7 @@ data SimplEnv
                 , se_pvSubst :: SimplPvSubst   -- InPKontId |--> PKontSubstAns (in/out)
                 , se_tvSubst :: TvSubstEnv     -- InTyVar   |--> OutType
                 , se_cvSubst :: CvSubstEnv     -- InCoVar   |--> OutCoercion
-                , se_retTy   :: Maybe Type
+                , se_retTy   :: Maybe OutType
                 , se_retKont :: Maybe MetaKont
                 --  ^^^ static part ^^^  --
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
@@ -343,7 +343,7 @@ enterScope env x
     ins'  = extendInScopeSet ins x'
     defs' = delVarEnv defs x'
 
-enterKontScope :: SimplEnv -> Type -> (SimplEnv, Type)
+enterKontScope :: SimplEnv -> InType -> (SimplEnv, OutType)
 enterKontScope env ty
   = (env { se_pvSubst = emptyVarEnv, se_retTy = Just ty', se_retKont = Nothing }, ty')
   where
