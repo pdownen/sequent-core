@@ -45,7 +45,8 @@ data ArgInfo
   = ArgInfo {
         ai_term   :: OutTerm,    -- The function (or possibly a literal)
         ai_frames :: RevList OutFrame, -- ...applied to these args/casts (which are in *reverse* order)
-        ai_co     :: Maybe InCoercion, -- Last coercion applied; not yet added to ai_frames
+        ai_co     :: Maybe OutCoercion, -- Last coercion applied; not yet added to ai_frames
+                                        -- Coercion is substed but *not* optimized yet
         ai_rules  :: [CoreRule], -- Rules for this function
         ai_encl   :: Bool,       -- Flag saying whether this function
                                  -- or an enclosing one has rules (recursively)
@@ -138,30 +139,38 @@ argInfoToTerm :: SimplEnv -> ArgInfo -> OutTerm
 argInfoToTerm env ai = mkComputeEval (ai_term ai') (reverse (ai_frames ai'))
   where ai' = swallowCoercion env ai
 
--- Add a frame to the ArgInfo. Don't try anything clever like combining casts or
--- pushing them past arguments (the argument is an OutFrame; too late to
--- simplify), but do swallow any coercion first. (We might leave two casts in a
--- row, but there's always next iteration. Well, usually.)
+-- Add a frame to the ArgInfo. If it is an argument and the ArgInfo has a
+-- coercion pending, this will call 'castApp' to push the coercion past the
+-- argument. If it is a cast and the ArgInfo has a coercion pending, this will
+-- call 'combineCo'.
 addFrameToArgInfo :: SimplEnv -> ArgInfo -> OutFrame -> ArgInfo
 addFrameToArgInfo env ai f
-  = ai' { ai_frames = f : ai_frames ai' }
-  where ai' = swallowCoercion env ai
+  = case f of
+      App arg  | Just co <- ai_co ai
+              -> case castApp arg co of
+                   Just (arg', co') -> ai { ai_frames = App arg' : ai_frames ai
+                                          , ai_co     = Just co' }
+                   Nothing          -> ai' { ai_frames = App arg : ai_frames ai' }
+                     where ai' = swallowCoercion env ai
+      Cast co -> ai { ai_co = ai_co ai `combineCo` co }
+      _       -> ai { ai_frames = f : ai_frames ai }
 
 addFramesToArgInfo :: SimplEnv -> ArgInfo -> [OutFrame] -> ArgInfo
 addFramesToArgInfo env ai fs
-  = ai' { ai_frames = reverse fs ++ ai_frames ai' }
-  where ai' = swallowCoercion env ai
+  = foldl (addFrameToArgInfo env) ai fs
 
 argInfoSpanArgs :: ArgInfo -> ([OutArg], [OutFrame])
 argInfoSpanArgs (ArgInfo { ai_frames = rev_fs })
   = mapWhileJust (\case { App arg -> Just arg; _ -> Nothing }) (reverse rev_fs)
-      
+
 -- Clear the coercion, if there is one, by adding it to the frames after
 -- simplifying it.
 swallowCoercion :: SimplEnv -> ArgInfo -> ArgInfo
 swallowCoercion env ai@(ArgInfo { ai_co = Just co, ai_frames = fs })
   = ai { ai_co     = Nothing
-       , ai_frames = Cast (simplCoercion env co) : fs }
+       , ai_frames = Cast co' : fs }
+  where
+    co' = simplCoercion (zapSubstEnvs env) co -- Zap because it's an OutCoercion
 swallowCoercion _ ai = ai
 
 ----------------
@@ -227,7 +236,7 @@ instance Outputable ArgSummary where
 simplCoercion :: SimplEnv -> Coercion -> Coercion
 simplCoercion env co = optCoercion (getCvSubst env) co
 
-combineCo :: Maybe InCoercion -> InCoercion -> Maybe InCoercion
+combineCo :: Maybe OutCoercion -> OutCoercion -> Maybe OutCoercion
 combineCo co_m co'
   -- Skip reflexive coercion
   | fromTy2 `eqType` toTy2
@@ -244,11 +253,25 @@ combineCo co_m co'
               -> Just (mkTransCo co co')
   where Pair fromTy2 toTy2 = coercionKind co'
 
-castApp :: InArg -> Maybe InCoercion -> (InArg, Maybe InCoercion)
-castApp arg              Nothing   = (arg, Nothing)
-castApp arg@(Type argTy) (Just co) = (arg, Just (mkInstCo co argTy))
-castApp arg              (Just co) = (mkCast arg (mkSymCo argCo), Just bodyCo)
-  where [argCo, bodyCo]            = decomposeCo 2 co
+-- | Given a simplified argument and a coercion for a function taking that
+-- argument, return the argument with the coercion applied and the coercion for
+-- the return type. Note that this creates a redex in the output, but a very
+-- boring one that we'll sort out next iteration. (If there's no next iteration,
+-- the cast will be erased anyway.)
+--
+-- Returns Nothing if the original coercion is not a function or forall type.
+-- (For instance, it could be IO a, which coerces to a function type but isn't
+-- one.)
+castApp :: SeqCoreArg -> Coercion -> Maybe (SeqCoreArg, Coercion)
+  -- Either InArg  -> InCoercion  -> Maybe (InArg,  InCoercion)
+  --     or OutArg -> OutCoercion -> Maybe (OutArg, OutCoercion)
+castApp _                co | let Pair fromTy _toTy = coercionKind co
+                            , Nothing <- splitFunTy_maybe fromTy
+                            , Nothing <- splitForAllTy_maybe fromTy
+                            = Nothing
+castApp arg@(Type argTy) co = Just (arg, mkInstCo co argTy)
+castApp arg              co = Just (mkCast arg (mkSymCo argCo), bodyCo)
+  where [argCo, bodyCo]     = decomposeCo 2 co
 
 consCastMaybe :: Maybe InCoercion -> [InFrame] -> [InFrame]
 Nothing `consCastMaybe` fs = fs

@@ -135,8 +135,9 @@ data MetaKont = SynKont  { mk_state :: KontState
                           , mk_argInfo :: ArgInfo
                           , mk_frames  :: [InFrame] -- or OutFrame if dupable
                           , mk_end     :: InEnd }   -- or OutEnd if dupable
-              | AppendOutFrames { mk_state     :: KontState -- not necessarily dupable
-                                , mk_outFrames :: [OutFrame] } 
+              | AppendOutFrames { mk_state     :: KontState
+                                , mk_outFrames :: [OutFrame] -- not necessarily dupable
+                                , mk_end       :: InEnd }    -- or OutEnd if dupable
 
 data KontState = DupableKont (Maybe MetaKont) -- Invariant: contained MetaKont is dupable
                | SuspKont StaticEnv
@@ -1165,8 +1166,9 @@ instance Outputable MetaKont where
   ppr (StrictArg {})
     = text "<strict argument>"
   ppr (AppendOutFrames { mk_state = DupableKont mk_m
-                       , mk_outFrames = frames })
-    = hang (text "Append simplified frames:" <+> pprOkDup mk_m) 2 (ppr frames)
+                       , mk_outFrames = fs
+                       , mk_end = end })
+    = hang (text "Append simplified frames:" <+> pprOkDup mk_m) 2 (ppr (Kont fs end))
   ppr (AppendOutFrames {})
     = text "<append simplified frames>"
 
