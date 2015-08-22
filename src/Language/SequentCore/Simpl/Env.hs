@@ -7,7 +7,7 @@ module Language.SequentCore.Simpl.Env (
   
   SimplIdSubst, SubstAns(..),
   substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar,
-  substTerm, substKont, substCommand,
+  substTerm, substKont, substFrame, substEnd, substCommand,
   retType,
   extendIdSubst, extendPvSubst, extendTvSubst, extendCvSubst,
   setRetKont, pushKont,
@@ -430,11 +430,15 @@ substCoVar env co = Coercion.substCoVar (getCvSubst env) co
 
 substTerm    :: SDoc -> SimplEnv -> SeqCoreTerm    -> SeqCoreTerm
 substKont    :: SDoc -> SimplEnv -> SeqCoreKont    -> SeqCoreKont
+substFrame   :: SDoc -> SimplEnv -> SeqCoreFrame   -> SeqCoreFrame
+substEnd     :: SDoc -> SimplEnv -> SeqCoreEnd     -> SeqCoreEnd
 substCommand :: SDoc -> SimplEnv -> SeqCoreCommand -> SeqCoreCommand
 
-substTerm _doc env term = doSubstT env term
-substKont _doc env kont = doSubstK env kont
-substCommand _doc env command = doSubstC env command
+substTerm _doc env term    = doSubstT env term
+substKont _doc env kont    = doSubstK env kont
+substFrame _doc env frame  = doSubstF env frame
+substEnd _doc env end      = doSubstE env end
+substCommand _doc env comm = doSubstC env comm
 
 doSubstT :: SimplEnv -> SeqCoreTerm -> SeqCoreTerm
 doSubstT env (Var x)
@@ -458,27 +462,29 @@ doSubstT env (Compute ty comm)
 
 doSubstK :: SimplEnv -> SeqCoreKont -> SeqCoreKont
 doSubstK env (Kont fs end)
-  = Kont (map doFrame fs) end'
+  = Kont (map (doSubstF env) fs) (doSubstE env end)
+
+doSubstF :: SimplEnv -> SeqCoreFrame -> SeqCoreFrame
+doSubstF env (App arg)
+  = App (doSubstT env arg)
+doSubstF env (Cast co)
+  = Cast (substCo env co)
+doSubstF env (Tick (Breakpoint n ids))
+  = Tick (Breakpoint n (map (substIdForId env) ids))
+doSubstF _ (Tick ti)
+  = Tick ti
+
+doSubstE :: SimplEnv -> SeqCoreEnd -> SeqCoreEnd
+doSubstE _ Return = Return
+doSubstE env (Case x alts)
+  = Case x' alts'
   where
-    doFrame (App arg)
-      = App (doSubstT env arg)
-    doFrame (Cast co)
-      = Cast (substCo env co)
-    doFrame (Tick (Breakpoint n ids))
-      = Tick (Breakpoint n (map (substIdForId env) ids))
-    doFrame (Tick ti)
-      = Tick ti
-    
-    end' = case end of
-             Return -> Return
-             Case x alts -> Case x' alts'
-               where
-                 (env', x') = enterScope env x
-                 alts' = map doAlt alts
-                 doAlt (Alt ac bndrs rhs)
-                   = let (env'', bndrs') = enterScopes env' bndrs
-                         rhs' = doSubstC env'' rhs
-                     in Alt ac bndrs' rhs'
+    (env', x') = enterScope env x
+    alts' = map doAlt alts
+    doAlt (Alt ac bndrs rhs)
+      = let (env'', bndrs') = enterScopes env' bndrs
+            rhs' = doSubstC env'' rhs
+        in Alt ac bndrs' rhs'
 
 doSubstC :: SimplEnv -> SeqCoreCommand -> SeqCoreCommand
 doSubstC env (Let bind body)
@@ -956,22 +962,22 @@ termIsConApp_maybe env id_unf term
   -- have a Subst for sequent core
   = goT (Left (se_inScope env)) term
   where
-    goT :: Either InScopeSet SimplEnv -> SeqCoreTerm
-        -> Maybe (DataCon, [Type], [SeqCoreTerm])
+    goT :: Either InScopeSet SimplEnv -> OutTerm
+        -> Maybe (DataCon, [OutType], [OutTerm])
     goT subst (Compute _ (Eval v (Kont fs Return))) = go subst v fs Nothing
     goT _     (Compute _ _) = Nothing
     goT subst v             = go subst v [] Nothing
     
-    go :: Either InScopeSet SimplEnv -> SeqCoreTerm -> [SeqCoreFrame]
-       -> Maybe Coercion
-       -> Maybe (DataCon, [Type], [SeqCoreTerm])
+    go :: Either InScopeSet SimplEnv -> OutTerm -> [OutFrame]
+       -> Maybe OutCoercion
+       -> Maybe (DataCon, [Type], [OutTerm])
     go subst term@(Lam {}) fs co_m
       | Just (args, co_m') <- extractArgs subst fs
       , let (bndrs, body) = lambdas term
       , Compute _ (Eval term' (Kont fs' Return)) <- body
       = let subst' = foldl2 extend subst bndrs args
             co_m'' = mkTransCoMaybe co_m co_m'
-        in go subst' term' fs' co_m''
+        in go subst' term' (map (subst_frame subst') fs') co_m''
     
     go subst (Compute _ (Eval term (Kont fs' Return))) fs co_m
       = go subst term (fs' ++ fs) co_m
@@ -1008,12 +1014,13 @@ termIsConApp_maybe env id_unf term
         
     go _ _ _ _ = Nothing
     
-    extractArgs :: Either InScopeSet SimplEnv -> [SeqCoreFrame] -> Maybe ([SeqCoreTerm], Maybe Coercion)
+    extractArgs :: Either InScopeSet SimplEnv -> [OutFrame] -> Maybe ([OutTerm], Maybe OutCoercion)
     extractArgs = goF [] Nothing
       where
         -- Like exprIsConApp_maybe, we expect all arguments to come before any
         -- casts. So only accept an argument when the coercion is Nothing.
         goF args Nothing subst (App arg : fs)
+          | isTrivialTerm arg
           = goF (subst_arg subst arg : args) Nothing subst fs
         goF args co_m subst (Cast co : fs)
           = goF args (Just co'') subst fs
@@ -1036,13 +1043,16 @@ termIsConApp_maybe env id_unf term
     subst_arg (Left {})   v = v
     subst_arg (Right env) v = substTerm (text "termIsConApp::subst_arg") env v
     
+    subst_frame (Left {})   f = f
+    subst_frame (Right env) f = substFrame (text "termIsConApp::subst_frame") env f
+    
     extend (Left ins) x v   = Right (extendIdSubst (env0 { se_inScope = ins })
                                                    x (Done v))
     extend (Right env) x v  = Right (extendIdSubst env x (Done v))
     
     -- Largely C&P'd from Simplify.dealWithCoercion
-    dealWithCoercion :: Maybe Coercion -> DataCon -> [SeqCoreTerm]
-                     -> Maybe (DataCon, [Type], [SeqCoreTerm])
+    dealWithCoercion :: Maybe OutCoercion -> DataCon -> [OutTerm]
+                     -> Maybe (DataCon, [OutType], [OutTerm])
     dealWithCoercion co_m dc args
       | maybe True isReflCo co_m -- either Nothing or reflexive
       = let (univ_ty_args, rest_args) = splitAtList (dataConUnivTyVars dc) args
