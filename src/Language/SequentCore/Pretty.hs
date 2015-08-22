@@ -50,7 +50,7 @@ ppr_binding pair
     hang (ppr val_bdr <+> equals) 2 body
   where
     val_bdr = binderOfPair pair
-    body = either pprCoreTerm pprCorePKont (rhsOfPair pair)
+    body = pprDeeper $ either pprCoreTerm pprCorePKont (rhsOfPair pair)
 
 ppr_comm :: OutputableBndr b => (SDoc -> SDoc) -> Command b -> SDoc
 ppr_comm add_par comm
@@ -67,46 +67,48 @@ ppr_comm add_par comm
             -> sep [char '<' <> pprCoreTerm term,
                     cat $ ppr_block (char '|') (char ';') (char '>') $ (ppr_kont_frames fs ++ [ppr_end end])]
           Right (args, j)
-            -> text "jump" <+> ppr j <+> parens (pprWithCommas pprCoreTerm args)
+            -> text "jump" <+> ppr j <+> parens (pprDeeper $ pprWithCommas pprCoreTerm args)
 
 ppr_term :: OutputableBndr b => (SDoc -> SDoc) -> Term b -> SDoc
 ppr_term _ (Var name) = ppr name
-ppr_term add_par (Type ty) = add_par $ char '@' <+> ppr ty
-ppr_term _ (Coercion _) = text "CO ..."
+ppr_term add_par (Type ty) = add_par $ text "TYPE" <+> ppr ty
+ppr_term add_par (Coercion co) = add_par $ text "CO" <+> ppr co
 ppr_term add_par (Lit lit) = GHC.pprLiteral add_par lit
 ppr_term add_par term@(Lam {})
   | Compute ty comm <- body
   = add_par $
       hang (char '\\' <+> fsep (map (pprBndr LambdaBind) bndrs ++
-                                [char '|', parens (text "ret" <+> dcolon <+> ppr ty)]) <+> arrow)
-        2 (pprCoreComm comm)
+                                [char '|', parens (ppr_kont_bndr ty)]) <+> arrow)
+        2 (pprDeeper $ pprCoreComm comm)
   | otherwise
   = add_par $
       hang (char '\\' <+> fsep (map (pprBndr LambdaBind) bndrs) <+> arrow)
-        2 (pprCoreTerm body)
+        2 (pprDeeper $ pprCoreTerm body)
   where
     (bndrs, body) = lambdas term
 ppr_term add_par (Compute ty comm)
   = add_par $
-      hang (text "compute" <+> parens (text "ret" <+> dcolon <+> ppr ty))
+      hang (text "compute" <+> parens (ppr_kont_bndr ty))
         2 (pprCoreComm comm)
 
 ppr_kont_frames :: OutputableBndr b => [Frame b] -> [SDoc]
 ppr_kont_frames = map ppr_frame
 
 ppr_frame :: OutputableBndr b => Frame b -> SDoc
+ppr_frame (App (Type ty))
+  = char '@' <+> ppr ty
 ppr_frame (App v)
-  = char '$' <+> ppr_term noParens v
+  = char '$' <+> pprDeeper (ppr_term noParens v)
 ppr_frame (Cast co)
-  = text "cast" <+> ppr co
+  = text "cast" <+> pprDeeper (ppr co)
 ppr_frame (Tick _)
-  = text "tick ..."
+  = text "tick" <+> text "..."
 
 ppr_end :: OutputableBndr b => End b -> SDoc
 ppr_end Return
   = text "ret"
 ppr_end (Case var alts)
-  = hang (text "case as" <+> pprBndr LetBind var <+> text "of") 2 $
+  = hang (text "case as" <+> pprBndr LetBind var <+> text "of") 2 $ pprDeeper $
       vcat $ ppr_block (char '{') (char ';') (char '}') (map pprCoreAlt alts)
 
 ppr_kont :: OutputableBndr b => (SDoc -> SDoc) -> Kont b -> SDoc
@@ -123,6 +125,10 @@ ppr_pkont add_par (PKont bndrs body)
       = case bndrs of
           [bndr] -> pprBndr LambdaBind bndr
           _      -> parens (pprWithCommas (pprBndr LambdaBind) bndrs)
+
+ppr_kont_bndr :: GHC.Type -> SDoc
+ppr_kont_bndr ty =
+  text "ret" <+> dcolon <+> ppr ty
 
 pprCoreAlt :: OutputableBndr b => Alt b -> SDoc
 pprCoreAlt (Alt con args rhs)

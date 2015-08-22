@@ -28,7 +28,10 @@ pprTraceShort :: String -> SDoc -> a -> a
 -- ^ If debug output is on, show some 'SDoc' on the screen
 pprTraceShort str doc x
    | opt_NoDebugOutput = x
-   | otherwise         = pprAndThen unsafeGlobalDynFlags trace str doc x
+   | otherwise         = pprAndThen unsafeGlobalDynFlags trace str
+                          (withPprStyle shortStyle doc) x
+   where
+     shortStyle = mkUserStyle neverQualify (PartWay 3)
    
 pprAndThen :: DynFlags -> (String -> a) -> String -> SDoc -> a
 pprAndThen dflags kont heading pretty_msg
