@@ -70,7 +70,8 @@ ppr_comm add_par comm
             -> text "jump" <+> ppr j <+> parens (pprDeeper $ pprWithCommas pprCoreTerm args)
 
 ppr_term :: OutputableBndr b => (SDoc -> SDoc) -> Term b -> SDoc
-ppr_term _ (Var name) = ppr name
+ppr_term _ (Var name) = ppUnless (GHC.isId name) (text "TYVAR") <+> ppr name
+  -- Something is quite wrong if it's a type variable!
 ppr_term add_par (Type ty) = add_par $ text "TYPE" <+> ppr ty
 ppr_term add_par (Coercion co) = add_par $ text "CO" <+> ppr co
 ppr_term add_par (Lit lit) = GHC.pprLiteral add_par lit

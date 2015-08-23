@@ -908,7 +908,7 @@ etaInfoApp :: SeqCoreTerm -> [EtaInfo] -> Type -> SeqCoreTerm
 etaInfoApp v eis ty
   = mkCompute ty (Eval v (Kont (map frame eis) Return))
   where
-    frame (EtaVar v) = App (Var v)
+    frame (EtaVar v) = App (mkVarArg v)
     frame (EtaCo co) = Cast co
 
 --------------

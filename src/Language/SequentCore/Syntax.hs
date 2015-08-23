@@ -17,7 +17,7 @@ module Language.SequentCore.Syntax (
     SeqCoreCommand, SeqCoreBind, SeqCoreBindPair, SeqCoreRhs, SeqCoreBndr,
     SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
-  mkCommand, mkVarTerm, mkLambdas, mkCompute, mkComputeEval,
+  mkCommand, mkVarArg, mkLambdas, mkCompute, mkComputeEval,
   mkAppTerm, mkCast, mkCastMaybe, castBottomTerm, mkConstruction, mkImpossibleCommand,
   addLets, addLetsToTerm, addNonRec, consFrame, addFrames,
   -- * Deconstructors
@@ -211,10 +211,10 @@ mkCommand binds (Compute _ comm) kont
 mkCommand binds term kont
   = foldr Let (Eval term kont) binds
 
-mkVarTerm :: Var -> SeqCoreTerm
-mkVarTerm x | Type.isTyVar x = Type (Type.mkTyVarTy x)
-            | Coercion.isCoVar x = Coercion (mkCoVarCo x)
-            | otherwise = Var x
+mkVarArg :: Var -> Arg b
+mkVarArg x | Type.isTyVar x = Type (Type.mkTyVarTy x)
+           | Coercion.isCoVar x = Coercion (mkCoVarCo x)
+           | otherwise = Var x
 
 mkLambdas :: [b] -> Term b -> Term b
 mkLambdas = flip (foldr Lam)
