@@ -1845,12 +1845,11 @@ mkAltEnv :: OccEnv -> Maybe (Id, Maybe Coercion) -> Id -> (OccEnv, Maybe (Id, Se
 mkAltEnv env@(OccEnv { occ_gbl_scrut = pe }) scrut case_bndr
   = case scrut of
       Just (v, Nothing) -> add_scrut v case_bndr'
-      Just (v, Just co) -> add_scrut v (Compute ty (Eval case_bndr' (Kont [Cast (mkSymCo co)] Return)))
+      Just (v, Just co) -> add_scrut v (mkCast case_bndr' (mkSymCo co))
                           -- See Note [Case of cast]
       _                 -> (env { occ_encl = OccVanilla }, Nothing)
 
   where
-    ty = idType case_bndr
     add_scrut v rhs = ( env { occ_encl = OccVanilla, occ_gbl_scrut = pe `extendVarSet` v }
                       , Just (localise v, rhs) )
 
