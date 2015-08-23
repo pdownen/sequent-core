@@ -110,6 +110,7 @@ termArity e = goT e
                            = (goF v fs e - 1) `max` 0
         -- See Note [termArity for applications]
         -- NB: coercions count as a value argument
+    goF v [] Return        = goT v
     goF _ _ _              = 0
 
     trim_arity :: Arity -> Type -> Arity
