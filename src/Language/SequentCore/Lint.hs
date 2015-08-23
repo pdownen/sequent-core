@@ -90,7 +90,10 @@ eitherToMaybe (Left a)  = Just a
 eitherToMaybe (Right _) = Nothing
 
 lintCoreBindings :: [SeqCoreBind] -> Maybe SDoc
-lintCoreBindings binds = eitherToMaybe $ foldM lintCoreTopBind emptyTermEnv binds
+lintCoreBindings binds = eitherToMaybe $ foldM lintCoreTopBind initEnv binds
+  where
+    -- All top-level bindings are considered visible (see CoreLint.lintCoreBindings)
+    initEnv = extendTermEnvList emptyTermEnv (flattenBinds binds)
 
 lintTerm :: TvSubst -> SeqCoreTerm -> Maybe SDoc
 lintTerm env term = eitherToMaybe $ lintCoreTerm env term 
