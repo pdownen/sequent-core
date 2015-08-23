@@ -353,25 +353,25 @@ prepareRhsTerm env level x (Compute ty comm)
         (_isExp, env', fs', co_maybe) <- go (0 :: Int) fs
         case co_maybe of
           Just co -> do
-                     let Pair fromTy toTy = coercionKind co
-                     -- Don't use mkFreshKontId here because it sets the current continuation
-                     (env'', x') <- mkFreshVar env' (fsLit "ca") fromTy
-                     -- x' shares its strictness and demand info with x, since
-                     -- x only adds a cast to x'
-                     let info = idInfo x
+                     -- The situation: We have
+                     --     x = compute < term | fs; cast co; ret >
+                     -- We will call makeTrivial on < term | fs; ret >. Typically
+                     -- this will generate
+                     --     x' = compute < term | fs; ret >
+                     -- thus giving us
+                     --     compute < x' | cast co; ret >
+                     -- as the new RHS for x.
+                     --
+                     -- Note that we already know what the strictness and demand
+                     -- of x' should be - namely those of x. So we propagate
+                     -- some of the idInfo over.
+                     let Pair fromTy _toTy = coercionKind co
+                         rhs' = mkCompute fromTy (Eval term (Kont fs' Return))
+                         info = idInfo x
                          sanitizedInfo = vanillaIdInfo `setStrictnessInfo` strictnessInfo info
                                                        `setDemandInfo` demandInfo info
-                         x'_final = x' `setIdInfo` sanitizedInfo
-                         x'_rhs = mkCompute fromTy (Eval term (Kont fs' Return))
-                     if isTrivialTerm x'_rhs
-                       then -- No sense turning one trivial term into two, as
-                            -- the simplifier will just end up substituting one
-                            -- into the other and keep on looping
-                            return (env', Compute toTy (Eval term (Kont (fs' ++ [Cast co]) Return)))
-                       else do
-                            env''' <- completeNonRecOut env'' level False x'_final x'_final x'_rhs
-                            x'_final_value <- simplVar env''' x'_final
-                            return (env''', Compute toTy (Eval x'_final_value (Kont [Cast co] Return)))
+                     (env'', rhs'') <- makeTrivialWithInfo level env' sanitizedInfo rhs'
+                     return (env'', mkCast rhs'' co)
           Nothing -> return (env', Compute ty (Eval term (Kont fs' Return)))
       where
         -- The possibility of a coercion split makes all of this tricky. Suppose
@@ -1179,7 +1179,7 @@ tryUnfolding dflags id lone_variable
              is_wf is_exp uf_arity guidance
                         -- uf_arity will typically be equal to (idArity id), 
                         -- but may be less for InlineRules
- | tracing
+ | tracing || dopt Opt_D_dump_inlinings dflags && dopt Opt_D_verbose_core2core dflags
  = pprTrace ("Considering inlining: " ++ showSDocDump dflags (ppr id))
                  (vcat [text "arg infos" <+> ppr arg_infos,
                         text "uf arity" <+> ppr uf_arity,
