@@ -520,6 +520,7 @@ tryEtaExpandRhs env x (Left v)
        return (arity, Left v')
 tryEtaExpandRhs _ _ (Right pk@(PKont xs _))
   = return (length (filter isId xs), Right pk)
+      -- TODO Somehow take into account the arity of the outer context
 
 tryEtaExpandRhsTerm :: SimplEnv -> OutId -> OutTerm -> SimplM (Arity, OutTerm)
 -- See Note [Eta-expanding at let bindings]

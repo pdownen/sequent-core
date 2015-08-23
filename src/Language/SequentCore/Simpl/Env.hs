@@ -190,32 +190,34 @@ mkDef env level rhs
     dflags <- getDynFlags
     -- FIXME Make a BoundToDFun when possible
     return $ case rhs of
-               Left term -> mkBoundTo env dflags term (termArity term) level
+               Left term -> mkBoundTo env dflags term level
                Right pkont -> mkBoundToPKont dflags pkont
 
-mkBoundTo :: SimplEnv -> DynFlags -> OutTerm -> Arity -> TopLevelFlag -> Definition
-mkBoundTo env dflags term arity level
+mkBoundTo :: SimplEnv -> DynFlags -> OutTerm -> TopLevelFlag -> Definition
+mkBoundTo env dflags term level
   = BoundTo { def_term         = occurAnalyseTerm term
             , def_level        = level
-            , def_guidance     = mkGuidance dflags term
+            , def_guidance     = guid
             , def_arity        = arity
             , def_isExpandable = termIsExpandable term
             , def_isValue      = termIsHNF env term
             , def_isWorkFree   = termIsCheap term
             , def_isConLike    = termIsConLike env term
             }
+  where (arity, guid) = mkGuidance dflags term
 
 mkBoundToPKont :: DynFlags -> OutPKont -> Definition
 mkBoundToPKont dflags pkont = BoundToPKont pkont (mkPKontGuidance dflags pkont)
 
-mkGuidance :: DynFlags -> OutTerm -> Guidance
+mkGuidance :: DynFlags -> OutTerm -> (Arity, Guidance)
 mkGuidance dflags term
   = let cap = ufCreationThreshold dflags
-    in case termSize dflags cap term of
-       Nothing -> Never
-       Just (ExprSize base args res)
-         | uncondInline term nValBinds base -> always
-         | otherwise                        -> Sometimes base args res
+        guid = case termSize dflags cap term of
+                 Nothing -> Never
+                 Just (ExprSize base args res)
+                   | uncondInline term nValBinds base -> always
+                   | otherwise                        -> Sometimes base args res
+    in (nValBinds, guid)
   where
     (bndrs, _) = lambdas term
     nValBinds = length (filter isId bndrs)
@@ -680,7 +682,7 @@ extendFloats env bind
     bndrs = bindersOf bind
     defs = map asDef (flattenBind bind)
     -- FIXME The NotTopLevel flag might wind up being wrong!
-    asDef (BindTerm x term) = (x, mkBoundTo env (dynFlags env) term (termArity term) NotTopLevel)
+    asDef (BindTerm x term) = (x, mkBoundTo env (dynFlags env) term NotTopLevel)
     asDef (BindPKont p pk)  = (p, mkBoundToPKont (dynFlags env) pk)
 
 addFloats :: SimplEnv -> SimplEnv -> SimplEnv
