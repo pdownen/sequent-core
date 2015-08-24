@@ -35,7 +35,7 @@
 
 \newcommand{\typecmd}[3]{#1; #2 \vdash_{cmd} #3 \Ok}
 \newcommand{\typetm}[3]{#1 \vdash_{tm} #2 : #3}
-\newcommand{\typejmptm}[3]{#1 \vdash_{jtm} \Jump #2 : #3}
+\newcommand{\typejmptm}[3]{#1 \vdash_{jtm} #2 : #3}
 \newcommand{\typeko}[4]{#1; #2 \vdash_{ko} #3 : #4}
 \newcommand{\typejmpko}[4]{#1; #2 \vdash_{jko} #3 : #4}
 \newcommand{\typefrm}[4]{#1 \vdash_{frm} #2 : #3 \Rightarrow #4}
@@ -105,7 +105,8 @@
 \newcommand{\packs}[3][]{\packrets[#1]{\pack{#2}{#3}}}
 \newcommand{\fnk}{\fn}
 
-\newcommand{\jump}[2]{\cut{\Jump #1}{#2}}
+%\newcommand{\jump}[2]{\cut{\Jump #1}{#2}}
+\newcommand{\jump}[2]{\Jump #2 ~ #1}
 \newcommand{\unitjmpty}{Unit\hash}
 \newcommand{\prodjmptyop}{\times_\hash}
 \newcommand{\prodjmpty}[2]{#1 \prodjmptyop #2}
@@ -117,14 +118,16 @@
 \newcommand{\cut}[2]{\left\langle{#1}\middle|\!\middle|{#2}\right\rangle}
 \newcommand{\mcut}[3]{\Let #3 \In \cut{#1}{#2}}
 
-\newcommand{\compute}[1]{\mu{#1}.}
+%\newcommand{\compute}[1]{\mu{#1}.}
+\newcommand{\compute}[1]{\mu}  % swallow the return co-variable
 \newcommand{\comp}{\compute}
 \newcommand{\fn}[1]{\lambda{#1}.}
 \newcommand{\coerce}[2]{{#1}\triangleright{#2}}
 
-\newcommand{\ret}[1]{\Ret #1}
+%\newcommand{\ret}[1]{\Ret #1}
+\newcommand{\ret}[1]{\Ret}  % swallow the return co-variable
 \newcommand{\caseas}[2]{\Case\As{#1}\Of{#2}}
-\newcommand{\letin}{\compute}
+\newcommand{\letin}[1]{\tilde{\mu}{#1}.}
 \newcommand{\app}[2]{\appto{#1}\then{#2}}
 \newcommand{\koerce}[2]{\castby{#1}\then{#2}}
 \newcommand{\tick}[2]{{#1}\then{#2}}

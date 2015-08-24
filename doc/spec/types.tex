@@ -24,8 +24,8 @@
 \begin{aligned}
   x, y, z, f, g, h, K &\in Var
   \\
-  q, r &\in KontVar
-  \\
+  % q, r &\in KontVar
+  % \\
   j &\in JumpVar
   \\
   a, b, T &\in TypeVar
@@ -165,7 +165,7 @@ We use some conventional shorthands to make programs easier to read:
   \\
   \Delta \in& KoEnvironment
   &
-  &::= q
+  &::= \mt
   \Alt \Delta, j
 \end{aligned}
 \end{gather*}
@@ -180,7 +180,7 @@ Term scoping: $\scopetm{\Gamma}{\tm}$
   \qquad
   \infer
   {\scopetm{\Gamma}{\compute q \cmd}}
-  {\scopecmd{\Gamma}{q}{\cmd}}
+  {\scopecmd{\Gamma}{\mt}{\cmd}}
   \qquad
   \infer
   {\scopetm{\Gamma}{\cn}}
@@ -201,9 +201,9 @@ Term scoping: $\scopetm{\Gamma}{\tm}$
 
 Continuation scoping: $\scopeko{\Gamma}{\Delta}{\ko}$
 \begin{gather*}
-  \infer
+  \axiom
   {\scopeko{\Gamma}{\Delta}{\ret q}}
-  {q \in \Delta}
+  %{q \in \Delta}
   \qquad
   \infer
   {\scopeko{\Gamma}{\Delta}{\caseas{x}{\vect[n]{\analt_n}}}}
@@ -363,30 +363,30 @@ also perform an \emph{exit analysis} on a program (bindings, terms, commands,
 always have a \emph{unique} exit point and cannot jump outside their scope.  The
 intuition is:
 \begin{quote}
-  Terms cannot contain any references to free continuation or jump variables.
+  Terms cannot contain any references to free continuation variables.
 \end{quote}
 This restriction makes sure that $\lambda$-abstractions cannot close over
-continuation variables available from its context, so that bound continuations
-and jump variables do not escape through a returned $\lambda$-abstraction.
-Thus, all the jump variables used within a $\lambda$-abstraction must be local
-to that $\lambda$-abstraction.  Additionally, in all computations
-$\comp{r}\cmd$, the underlying command $c$ has precisely one unique exit point,
-$r$, which names the returned result of the computation.  Any jump variables
-referenced inside of $c$ must be local to the term itself, and not refer to its
-enclosing scope.
+continuation variables available from its context, so that let-bound
+parameterized continuations do not escape through a returned
+$\lambda$-abstraction.  Thus, all the jump variables used within a
+$\lambda$-abstraction must be local to that $\lambda$-abstraction.
+Additionally, in all computations $\comp{r}\cmd$, the underlying command $c$ has
+precisely one unique exit point, denoted by $\ret r$, which gives the returned
+result of the computation.  Any parameterized continuations referenced inside of
+$c$ must be local to the term itself, and not refer to its enclosing scope.
 
-If the command $c$ inside the well-scoped term $\comp{r}\cmd$ stops execution
-with some value $V$ sent to some continuation variable $q$, then we know that:
-\begin{itemize}
-\item $q$ must be equal to $r$, due to the fact that $r$ is the only allowable
-  free continuation variable inside of $\cmd$, and
-\item $r$ does not appear free inside the resulting value $V$, again due to the
-  scoping rules for continuation variables inside of a command.
-\end{itemize}
-In the simple case, this means execution of the term $\comp{r}\cmd$ yields
-$\comp{r}\cut{V}{\ret r}$, which $\eta$-reduces to just the value $V$ by the
-previously mentioned reasoning.  Thus, evaluating a term always results in a
-unique value.
+% If the command $c$ inside the well-scoped term $\comp{r}\cmd$ stops execution
+% with some value $V$ sent to some continuation variable $q$, then we know that:
+% \begin{itemize}
+% \item $q$ must be equal to $r$, due to the fact that $r$ is the only allowable
+%   free continuation variable inside of $\cmd$, and
+% \item $r$ does not appear free inside the resulting value $V$, again due to the
+%   scoping rules for continuation variables inside of a command.
+% \end{itemize}
+% In the simple case, this means execution of the term $\comp{r}\cmd$ yields
+% $\comp{r}\cut{V}{\ret r}$, which $\eta$-reduces to just the value $V$ by the
+% previously mentioned reasoning.  Thus, evaluating a term always results in a
+% unique value.
 
 Notice that these scoping rules, while not very complex, still manage to tell us
 something about the expressive capabilities of the language.  For example, we
@@ -431,7 +431,7 @@ However, we do not make this distinction here.
   \\
   \Delta \in& KoEnvironment
   &
-  &::= q : \ty
+  &::= \ret q : \ty
   \Alt \Delta, j : \ty
 \end{align*}
 
@@ -455,7 +455,7 @@ Term typing: $\typetm{\Gamma}{\tm}{\ty}$
   \\\\
   \infer
   {\typetm{\Gamma}{\compute{\ann q \ty} \cmd}{\ty}}
-  {\typecmd{\Gamma}{q:\ty}{\cmd}}
+  {\typecmd{\Gamma}{\ret q:\ty}{\cmd}}
   \qquad
   \infer
   {\typetm{\Gamma}{\fn{\ann x {\ty_1}} \tm}{\ty_1 \to \ty_2}}
@@ -470,7 +470,7 @@ Continuation typing: $\typeko{\Gamma}{\Delta}{\ko}{\ty}$
 \begin{gather*}
   \infer
   {\typeko{\Gamma}{\Delta}{\ret q}{\ty}}
-  {q:\ty \in \Delta}
+  {\ret q:\ty \in \Delta}
   \qquad
   \infer
   {\typeko{\Gamma}{\Delta}{\caseas{\ann x \ty}{\vect[n]{\analt_n}}}{\ty}}
@@ -666,7 +666,7 @@ Program typing: $\typepgm{\Gamma}{\Delta}{\pgm}$
 
  Term argument typing: $\typejmptm{\Gamma}{\vect[n]{\tm_n}}{\ty}$
 \begin{gather*}
-  \axiom{\typejmptm{\Gamma}{}{\unitjmpty}}
+  \axiom{\typejmptm{\Gamma}{\mt}{\unitjmpty}}
   \qquad
   \infer
   {\typejmptm{\Gamma}{v', \vect[n]{\tm_n}}{\prodjmpty{\ty'}{\ty}}}
@@ -730,14 +730,15 @@ The typing rules for Dual System FC are given in Figures~\ref{fig:typing-rules},
 term classifies the results that it might produce, and the type of a
 continuation classifies the results that it expects to consume.  Commands do not
 have a type; they are just $\Ok$ to run.  The eventual result of a command is
-returned through the unique return continuation variable available in its
-environment.  Likewise, a program is a consistent block of code that is capable
-of running, meaning that a program is a command that runs with respect to some
-top-level declarations that introduce type information (data types, type
-synonyms, and axioms).  The normal way to type-check a top-level program is
-$\typepgm{\Gamma_0}{\tp:\ty}{\pgm}$, where $\Gamma_0$ specifies any primitive
-types and values provided by the run-time environment, and $\tp:\ty$ is the
-single, top-level exit path out of the program that expects a $\ty$ result.
+returned through the unique return continuation available in its environment.
+Likewise, a program is a consistent block of code that is capable of running,
+meaning that a program is a command that runs with respect to some top-level
+declarations that introduce type information (data types, type synonyms, and
+axioms).  The normal way to type-check a top-level program is as
+$\typepgm{\Gamma_0}{\ret\tp:\ty}{\pgm}$, where $\Gamma_0$ specifies any
+primitive types and values provided by the run-time environment, and
+$\ret\tp:\ty$ is the single, top-level exit path out of the program that expects
+a $\ty$ result.
 
 Compared with System FC, more of the typing rules enjoy the
 \emph{sub-formula property}, meaning that the types appearing in a premise above
@@ -803,8 +804,8 @@ single frame, however, $\inst{\ty}$ specifies both the polymorphic schema for
 the input it receives as well as the instantiated output it produces below the
 line of inference.
 
-Notice that the unique types of terms and final continuations (either the
-continuation variable $\ret q$ or case continuation
+Notice that the unique types of terms and final continuations (either the return
+continuation $\ret q$ or case continuation
 $\caseas{\ann x \ty}{\vect[n]{\analt_n}}$) are easy to infer.  However, frames
 do \emph{not} have a unique type.  For example, the application frame
 $\appto{1}$ can take an input of type $Int \to \ty'$ and produce an output of
@@ -813,8 +814,8 @@ polymorphic instantiation connects any universally quantified type
 $\forall a:\ki.\ty'$ to the instantiated one $\ty'\subst{a}{\ty}$.  Thus, while
 terms and final continuations support a simple type inference procedure, frames
 do not.  Instead, we just check that a frame (or stack of frames) fits a chosen
-type.  Additionally, the type of the term arguments, $\Jump\vect{\tm}$, is easy
-to check but hard to infer, whereas the type of the parameterized continuation
+type.  Additionally, the type of the term arguments, $\vect{\tm}$, is easy to
+check but hard to infer, whereas the type of the parameterized continuation
 $\fnk{\vect{x:\ty}}\cmd$ is easy to infer.  This flow of type-inferring versus
 type-checking is captured in the structure of a command and gives us a type
 checking algorithm:
@@ -827,7 +828,7 @@ checking algorithm:
   $\ko$, thereby confirming that they are well-typed, and check that
   $\vect[n]{\frm_n}$ connects these two types.
 \item If the command is a jump, $\jump{\vect{\tm}}{j}$, then read the type off
-  of $j$, and check that $\Jump\vect{\tm}$ has the same type.
+  of $j$, and check that $\vect{\tm}$ has the same type.
 \end{itemize}
 
 % Due to the difficulty of inferring the type of a polymorphic call-stack, the
@@ -913,22 +914,22 @@ $\beta$ and $\eta$ axioms:
 \begin{align*}
   \cut{\comp{r}\cmd}{\ko}
   &=
-  \cmd\subst{r}{\ko}
-  \\
+  \cmd\subst{\ret r}{\ko}
+  &
   \comp{r}\cut{\tm}{\ret r}
   &=
   \tm
-  &
-  \Where
-  r \notin FV(\tm)
+  % &
+  % \Where
+  % r \notin FV(\tm)
 \end{align*}
 The $\beta$ axiom for a $\mu$-abstraction substitutes its entire continuation
-for the bound continuation variable.  To avoid unnecessary code duplication, we
-may only want to apply the $\beta$ axiom for $\mu$ when $k$ is small (and we can
-force $k$ to be small by introducing auxiliary bindings naming arguments and
-join points).  The $\eta$ axiom for a $\mu$-abstraction is more well-behaved
-than the one for functions: it applies to \emph{any} term that does not
-reference the bound continuation variable.
+for $\ret r$.  To avoid unnecessary code duplication, we may only want to apply
+the $\beta$ axiom for $\mu$ when $k$ is small (and we can force $k$ to be small
+by introducing auxiliary bindings naming arguments and join points).  The $\eta$
+axiom for a $\mu$-abstraction is more well-behaved than the one for functions:
+it applies to \emph{any} term that does not reference the bound continuation
+variable.
 
 Case continuations have their own form of $\beta$ and $\eta$ axioms.  The
 $\beta$ axiom for a case continuation selects the appropriate branch based on
@@ -1405,42 +1406,43 @@ computation expressions all correspond to computation $\mu$-abstractions.
     { Seq\trans{\expr_1}
     | \appto{Seq\trans{\expr_2}}
     | \ret r }
-  \\
-  &
-  \Where{}
-    (\expr_1 ~ \expr_2) : \ty
+  % \\
+  % &
+  % \Where{}
+  %   (\expr_1 ~ \expr_2) : \ty
   \\
   Seq\trans{\Let \abind \In \expr}
   &=
   \comp{\ann r \ty}\Let Seq\trans{\abind} \In \cut{\expr}{\ret r}
-  \\
-  &
-  \Where{}
-    (\Let \abind \In \expr) : \ty
+  % \\
+  % &
+  % \Where{}
+  %   (\Let \abind \In \expr) : \ty
   \\
   Seq\trans{\Case \expr \As \ann{x}{\ty} \Of \vect[n]{\analt_n}}
   &=
   \comp{\ann{r}{\ty}}
     \cut
     {Seq\trans{\expr}}
-    {\caseas{\ann{x}{\ty}}{\vect[n]{Seq\trans{\analt_n}_{r}}}}
-  \\
-  &
-  \Where{}
-    (\Case \expr \As \ann{x}{\ty} \Of \vect[n]{\analt_n}) : \ty
+    {\caseas{\ann{x}{\ty}}{\vect[n]{Seq\trans{\analt_n}}}}
+  % \\
+  % &
+  % \Where{}
+  %   (\Case \expr \As \ann{x}{\ty} \Of \vect[n]{\analt_n}) : \ty
   \\
   Seq\trans{\coerce{\expr}{\cn}}
   &=
   \comp{\ann{r}{\ty}}\braket{Seq\trans{\expr}|\castby{\cn}|\ret{r}}
-  \\
-  &
-  \Where{}
-    (\coerce{\expr}{\cn}) : \ty
+  % \\
+  % &
+  % \Where{}
+  %   (\coerce{\expr}{\cn}) : \ty
 \end{align*}
-Because the continuation variable $r$ introduced by the computation abstractions
-is annotated with its type, we need to infer the type of all apparent
-computations to determine this annotation.  We also need to translate the
-binding of a $\Let$ expression and alternatives of a case expression:
+% Because the continuation variable $r$ introduced by the computation abstractions
+% is annotated with its type, we need to infer the type of all apparent
+% computations to determine this annotation.
+We also need to translate the binding of a $\Let$ expression and alternatives of
+a case expression:
 \begin{align*}
   Seq\trans{\nonrec{\ann x \ty = \expr}}
   &=
@@ -1451,30 +1453,30 @@ binding of a $\Let$ expression and alternatives of a case expression:
   \rec{\vect[n]{\bindv{\ann{x_n}{\ty_n}}{Seq\trans{\expr_n}}}}
 \end{align*}
 \begin{align*}
-  Seq\trans{\blank \to \expr}_{r}
+  Seq\trans{\blank \to \expr}%_{r}
   &=
   \blank \to \cut{Seq\trans{\expr}}{\ret r}
   \\
   Seq\trans{
     K ~ \vect[n]{\ann{x_n}{\ty_n}} \to \expr
-  }_{r}
+  }%_{r}
   &=
   K ~ \vect[n]{\ann{x_n}{\ty_n}}
   \to
   \cut{Seq\trans{\expr}}{\ret r}
   \\
-  Seq\trans{\lit \to \expr}_{r}
+  Seq\trans{\lit \to \expr}%_{r}
   &=
   \lit \to \cut{Seq\trans{\expr}}{\ret r}
 \end{align*}
-Note that because case alternatives in Sequent Core point to self-contained
-commands, we explicitly spell out the common continuation that every alternative
-``returns'' to, which was introduced as the return continuation for the case
-expression itself.  Finally, we can translate a whole program from Core to
-Sequent Core by giving some chosen continuation variable on which we expect to
-receive the final result of the program:
+% Note that because case alternatives in Sequent Core point to self-contained
+% commands, we explicitly spell out the common continuation that every alternative
+% ``returns'' to, which was introduced as the return continuation for the case
+% expression itself.
+Finally, we can translate a whole program from Core to Sequent Core which gives
+its final result on $\ret r$:
 \begin{align*}
-  Seq\trans{\vect[n]{\decl_n}; e}_{r}
+  Seq\trans{\vect[n]{\decl_n}; e}%_{r}
   &=
   \vect[n]{\decl_n}; \cut{Seq\trans{e}}{\ret r}
 \end{align*}
@@ -1506,10 +1508,10 @@ types), the translation is much the same:
   Seq\trans{\ty} &= \ty
   \\
   Seq\trans{\expr}
-  &= \comp{r:\ty} Seq\trans{\expr : \ty} \mt ~ (\ret r)
+  &= \comp{r:\ty} (Seq\trans{\expr} \mt ~ \ret{r})
   &
   \Where
-  \expr &:\ty \text{ is an apparent computation}
+  \expr & \text{ is an apparent computation}
 \end{align*}
 The main difference is when we find an apparent computation (an application, let
 expression, case expression, or cast), identified by the last clause above.  In
@@ -1538,21 +1540,21 @@ the outer-most frames of the computation:
   \vect[n]{\frm_n} ~ \ko
   &=
   \Braket
-    { \comp{\ann{r}{\ty'}} Seq\trans{\expr} \mt ~ \ko'
+    { \comp{\ann{r}{\ty'}} (Seq\trans{\expr} \mt ~ \ko')
     | \vect[n]{\frm_n}
     | \ko }
-  \\ &
+  \\
   \Where{}
-    \ko' =
+    \ko' &=
        \begin{aligned}[t]
          &
          \Case \As \ann{x}{\ty} \Of
-         \\
-         &\qquad
+         % \\
+         % &\qquad
          \vect[m]{Core\trans{\analt_m} \mt ~ (\ret r)}
        \end{aligned}
-  \\ & \phantom{\Where{}}
-    (\Case \expr \As \ann{x}{\ty} \Of \vect[n]{\analt_n}) : \ty'
+  % \\ & \phantom{\Where{}}
+    % (\Case \expr \As \ann{x}{\ty} \Of \vect[n]{\analt_n}) : \ty'
   \\[1ex]
   Seq\trans{\coerce{\expr}{\cn}} \vect[n]{\frm_n} ~ \ko
   &=
@@ -1601,7 +1603,7 @@ we begin expecting the resulting expression to be computation-like:
   \lit \to Seq\trans{\expr} \vect[n]{\frm_n} ~ \ko
 \end{align*}
 \begin{align*}
-  Seq\trans{\vect[n]{\decl_n}; \expr}_{r}
+  Seq\trans{\vect[n]{\decl_n}; \expr}%_{r}
   &=
   \vect[n]{\decl_n}; Seq\trans{\expr} \mt ~ (\ret r)
 \end{align*}
@@ -1626,18 +1628,17 @@ straightforward, given by $Core\trans{\tm}$:
 All but one Sequent Core term, namely the computation abstraction, corresponds
 directly to a Core value.  To translate a computational term to a Core
 expression, we need to translate the underlying command and read off the result
-returned to the abstracted continuation variable, as given by
-$Core\trans{\cmd}_{r}$:
+returned (to $\ret r$), as given by $Core\trans{\cmd}$:
 \begin{align*}
-  Core\trans{\Let \abind \In \cmd}_{r}
+  Core\trans{\Let \abind \In \cmd}
   &=
-  \Let Core\trans{\abind}_{r} \In Core\trans{\cmd}_{r}
+  \Let Core\trans{\abind} \In Core\trans{\cmd}
   \\
-  Core\trans{\braket{\tm | \vect[n]{\frm_n} | \ko}}_{r}
+  Core\trans{\braket{\tm | \vect[n]{\frm_n} | \ko}}
   &=
-  Core\trans{\ko}_{r}[\vect[n]{Core\trans{\frm_n}}[Core\trans{\tm}]]
+  Core\trans{\ko}[\vect[n]{Core\trans{\frm_n}}[Core\trans{\tm}]]
   \\
-  Core\trans{\jump{\vect[n]{\tm_n}}{j}}_{r}
+  Core\trans{\jump{\vect[n]{\tm_n}}{j}}
   &=
   j ~ \vect[n]{Core\trans{\tm_n}}
 \end{align*}
@@ -1654,9 +1655,9 @@ $Core\trans{\frm}$:
   Core \trans{\castby{\cn}} &= \coerce{\hole}{\cn}
 \end{align*}
 The evaluation contexts corresponding to final continuations which return their
-result on $r$ are given by $Core\trans{\ko}_{r}$:
+result are given by $Core\trans{\ko}_{r}$:
 \begin{align*}
-  Core\trans{\ret r}_{r} &= \hole
+  Core\trans{\ret r} &= \hole
   % \\
   % Core\trans{\app{\tm}{\ko}}_{r}
   % &=
@@ -1666,70 +1667,70 @@ result on $r$ are given by $Core\trans{\ko}_{r}$:
   % &=
   % Core\trans{\ko}_{r}[\coerce{\hole}{\cn}]
   \\
-  Core\trans{\caseas{\ann x \ty}{\vect[n]{\analt_n}}}_{r}
+  Core\trans{\caseas{\ann x \ty}{\vect[n]{\analt_n}}}
   &=
-  \Case \hole \As \ann x \ty \Of \vect[n]{Core\trans{\analt_n}_{r}}
+  \Case \hole \As \ann x \ty \Of \vect[n]{Core\trans{\analt_n}}
 \end{align*}
 
 Besides translating terms, commands, and continuations, we also need to convert
 Sequent Core bindings and alternatives back into Core bindings and alternatives.
 The alternatives of case analysis have a straightforward, one-to-one
-correspondence between Core and Sequent Core, given by $Core\trans{\analt}_{r}$,
-where Sequent Core alternatives lead to commands that output their result on a
-return continuation variable $r$:
+correspondence between Core and Sequent Core, given by $Core\trans{\analt}$,
+where Sequent Core alternatives lead to commands that output their result on
+$\ret r$:
 \begin{align*}
-  Core\trans{\blank \to \cmd}_{r}
+  Core\trans{\blank \to \cmd}%_{r}
   &=
-  \blank \to Core\trans{\cmd}_{r}
+  \blank \to Core\trans{\cmd}%_{r}
   \\
-  Core\trans{K ~ \vect[n]{\ann x \ty} \to \cmd}_{r}
+  Core\trans{K ~ \vect[n]{\ann x \ty} \to \cmd}%_{r}
   &=
-  K ~ \vect[n]{\ann x \ty} \to Core\trans{\cmd}_{r}
+  K ~ \vect[n]{\ann x \ty} \to Core\trans{\cmd}%_{r}
   \\
-  Core\trans{\lit \to \cmd}_{r}
+  Core\trans{\lit \to \cmd}%_{r}
   &=
-  \lit \to Core\trans{\cmd}_{r}
+  \lit \to Core\trans{\cmd}%_{r}
 \end{align*}
 Translating the bindings back to Core is more interesting, since Sequent Core
 has two different types of bindings (value and continuation bindings) whereas
 Core only has the one.  Thus, we collapse both bound terms and continuations
-into bound Core expressions, given by $Core\trans{\abind}_{r}$ and
-$Core\trans{\bp}_{r}$.
+into bound Core expressions, given by $Core\trans{\abind}$ and
+$Core\trans{\bp}$.
 \begin{align*}
-  Core\trans{\nonrec{\bp}}_{r}
+  Core\trans{\nonrec{\bp}}
   &=
-  \nonrec{Core\trans{\bp}_{r}}
+  \nonrec{Core\trans{\bp}}
   \\
-  Core\trans{\rec{\vect[n]{\bp_n}}}_{r}
+  Core\trans{\rec{\vect[n]{\bp_n}}}
   &=
-  \rec{\vect[n]{Core\trans{\bp_n}_{r}}}
+  \rec{\vect[n]{Core\trans{\bp_n}}}
 \end{align*}
 \begin{align*}
-  Core\trans{\bindv{\ann x \ty}{\tm}}_{r}
+  Core\trans{\bindv{\ann x \ty}{\tm}}
   &=
   (\ann x \ty = Core\trans{\tm})
   \\
   Core\trans{
     \bindk{\ann j \ty}{\fnk{\vect[n]{\ann{x_n}{\ty_n}}}\cmd}
-  }_{r}
+  }
   &=
   (
     \ann{j}{Core^\neg\trans{\ty}_{\ty'}}
     =
-    \vect[n]{\fn{\ann{x_n}{\ty_n}}} Core\trans{\cmd}_{r}
+    \vect[n]{\fn{\ann{x_n}{\ty_n}}} Core\trans{\cmd}
     )
   \\
   \Where
-  r &: \ty'
+  \ret r &: \ty'
 \end{align*}
-We need to know the return variable $r$ in order to convert continuation
-bindings, since continuations do not just return results, but instead output
-them on the continuation variable $r$.  In the conversion of the continuation
-bound to $j$ into an expression, we effectively negate the type of $j$.  So
-instead of standing for a continuation that accepts multiple inputs as an
-unboxed tuple, the converted $j$ stands for a function from the multiple inputs
-to the ultimate result type given by the surrounding return continuation $r$.
-The negation of a parameterized continuation is given by
+We need to know the type of the return continuation $\ret r$ in order to convert
+continuation bindings, since continuations do not just return results, but
+instead output them on the continuation $\ret r$.  In the conversion of the
+continuation bound to $j$ into an expression, we effectively negate the type of
+$j$.  So instead of standing for a continuation that accepts multiple inputs as
+an unboxed tuple, the converted $j$ stands for a function from the multiple
+inputs to the ultimate result type given by the surrounding return continuation
+$r$.  The negation of a parameterized continuation is given by
 $Core^\neg\trans{\sty}_{\ty}$, where $\ty$ is the ultimate return type of the
 continuation:
 \begin{align*}
@@ -1767,9 +1768,9 @@ To translate the whole Sequent Core program back into Core, we just translate
 the main command with respect to the continuation on which we expect to receive
 the program's result.
 \begin{align*}
-  Core\trans{\vect[n]{\decl_n}; \cmd}_{r}
+  Core\trans{\vect[n]{\decl_n}; \cmd}%_{r}
   &=
-  \vect[n]{\decl_n}; Core\trans{\cmd}_{r}
+  \vect[n]{\decl_n}; Core\trans{\cmd}%_{r}
 \end{align*}
 
 \section{Design discussion}
