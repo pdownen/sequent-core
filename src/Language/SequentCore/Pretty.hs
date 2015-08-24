@@ -46,11 +46,13 @@ ppr_binds_with open mid close binds = vcat $ intersperse space $ ppr_block open 
 
 ppr_binding :: OutputableBndr b => BindPair b -> SDoc
 ppr_binding pair
-  = pprBndr LetBind val_bdr $$
+  = prefix <+> pprBndr LetBind val_bdr $$
     hang (ppr val_bdr <+> equals) 2 body
   where
     val_bdr = binderOfPair pair
     body = pprDeeper $ either pprCoreTerm pprCorePKont (rhsOfPair pair)
+    prefix | bindsKont pair = text "pkont"
+           | otherwise = empty
 
 ppr_comm :: OutputableBndr b => (SDoc -> SDoc) -> Command b -> SDoc
 ppr_comm add_par comm
@@ -67,10 +69,17 @@ ppr_comm add_par comm
             -> sep [char '<' <> pprCoreTerm term,
                     cat $ ppr_block (char '|') (char ';') (char '>') $ (ppr_kont_frames fs ++ [ppr_end end])]
           Right (args, j)
-            -> text "jump" <+> ppr j <+> parens (pprDeeper $ pprWithCommas pprCoreTerm args)
+            -> text "jump" <+> prefix <+> ppr j <+> parens (pprDeeper $ pprWithCommas pprCoreTerm args)
+            where prefix | GHC.isTyVar j     = text "TYVAR"
+                         | GHC.isCoVar j     = text "COVAR"
+                         | not (isPKontId j) = text "IDVAR"
+                         | otherwise         = empty
 
 ppr_term :: OutputableBndr b => (SDoc -> SDoc) -> Term b -> SDoc
-ppr_term _ (Var name) = ppUnless (GHC.isId name) (text "TYVAR") <+> ppr name
+ppr_term _ (Var name) = prefix <+> ppr name
+  where prefix | GHC.isTyVar name = text "TYVAR"
+               | isPKontId name = text "PKVAR"
+               | otherwise = empty
   -- Something is quite wrong if it's a type variable!
 ppr_term add_par (Type ty) = add_par $ text "TYPE" <+> ppr ty
 ppr_term add_par (Coercion co) = add_par $ text "CO" <+> ppr co
