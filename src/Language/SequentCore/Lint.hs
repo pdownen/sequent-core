@@ -1,3 +1,5 @@
+{-# LANGUAGE MultiWayIf #-}
+
 module Language.SequentCore.Lint ( lintCoreBindings, lintTerm ) where
 
 import Language.SequentCore.Syntax
@@ -208,10 +210,12 @@ lintCoreTerm env (Var x)
   | not (isLocalId x)
   = return (idType x)
   | Just x' <- lookupInScope (getTvInScope env) x
-  = if substTy env (idType x) `eqType` idType x'
-      then return $ idType x'
-      else Left $ text "variable" <+> pprBndr LetBind x <+> text "bound as"
+  = if | not (substTy env (idType x) `eqType` idType x') ->
+           Left $ text "variable" <+> pprBndr LetBind x <+> text "bound as"
                                   <+> pprBndr LetBind x'
+       | isDeadBinder x' ->
+           Left $ text "occurrence of dead id" <+> pprBndr LetBind x'
+       | otherwise -> return $ idType x'
   | otherwise
   = Left $ text "not found in context:" <+> pprBndr LetBind x
 
