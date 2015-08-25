@@ -1,5 +1,5 @@
 module Language.SequentCore.Simpl.ExprSize (
-  ExprSize(..), termSize, kontSize, pKontSize, commandSize
+  ExprSize(..), termSize, kontSize, pKontSize, commandSize, rhsSize
 ) where
 
 import Language.SequentCore.Syntax
@@ -78,6 +78,7 @@ termSize    :: DynFlags -> Int -> SeqCoreTerm    -> Maybe ExprSize
 kontSize    :: DynFlags -> Int -> SeqCoreKont    -> Maybe ExprSize
 pKontSize   :: DynFlags -> Int -> SeqCorePKont   -> Maybe ExprSize
 commandSize :: DynFlags -> Int -> SeqCoreCommand -> Maybe ExprSize
+rhsSize     :: DynFlags -> Int -> SeqCoreRhs     -> Maybe ExprSize
 
 -- We have three mutually recursive functions, but only one argument changes
 -- between recursive calls; easiest to use one recursive function that takes
@@ -100,6 +101,8 @@ kontSize dflags cap kont = body2ExprSize [] $ bodySize dflags cap [] (K kont)
 pKontSize dflags cap (PKont xs comm)
   = let valBinders = filter isId xs
     in body2ExprSize valBinders $ bodySize dflags cap valBinders (C comm)
+
+rhsSize dflags cap = either (termSize dflags cap) (pKontSize dflags cap)
 
 bodySize dflags cap topArgs expr
   = cap `seq` size expr -- use seq to unbox cap now; we will use it often

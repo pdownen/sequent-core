@@ -14,7 +14,8 @@ core expression with (hopefully) improved usage information.
 -}
 {-# LANGUAGE CPP, BangPatterns, ViewPatterns #-}
 module Language.SequentCore.OccurAnal (
-        occurAnalysePgm, occurAnalyseTerm, occurAnalyseTerm_NoBinderSwap
+        occurAnalysePgm, occurAnalyseTerm, occurAnalyseTerm_NoBinderSwap,
+        occurAnalysePKont
     ) where
 
 import Language.SequentCore.Syntax
@@ -98,17 +99,24 @@ occurAnalysePgm this_mod active_rule imp_rules vects vectVars binds
 
 occurAnalyseTerm :: SeqCoreTerm -> SeqCoreTerm
         -- Do occurrence analysis, and discard occurrence info returned
-occurAnalyseTerm = occurAnalyseExpr' True -- do binder swap
+occurAnalyseTerm = occurAnalyseTerm' True -- do binder swap
 
 occurAnalyseTerm_NoBinderSwap :: SeqCoreTerm -> SeqCoreTerm
-occurAnalyseTerm_NoBinderSwap = occurAnalyseExpr' False -- do not do binder swap
+occurAnalyseTerm_NoBinderSwap = occurAnalyseTerm' False -- do not do binder swap
 
-occurAnalyseExpr' :: Bool -> SeqCoreTerm -> SeqCoreTerm
-occurAnalyseExpr' enable_binder_swap expr
-  = snd (occAnalTerm env expr)
+occurAnalyseTerm' :: Bool -> SeqCoreTerm -> SeqCoreTerm
+occurAnalyseTerm' enable_binder_swap term
+  = snd (occAnalTerm env term)
   where
     env = (initOccEnv all_active_rules) {occ_binder_swap = enable_binder_swap}
     -- To be conservative, we say that all inlines and rules are active
+    all_active_rules = \_ -> True
+
+occurAnalysePKont :: SeqCorePKont -> SeqCorePKont
+occurAnalysePKont pk
+  = snd (occAnalPKont env pk)
+  where
+    env = initOccEnv all_active_rules
     all_active_rules = \_ -> True
 {-
 

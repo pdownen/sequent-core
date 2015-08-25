@@ -12,7 +12,8 @@ module Language.SequentCore.Translate (
   -- $txn
   fromCoreModule, termFromCoreExpr,
   bindsToCore,
-  commandToCoreExpr, termToCoreExpr, CoreContext, kontToCoreExpr,
+  commandToCoreExpr, termToCoreExpr, pKontToCoreExpr, pKontIdToCore,
+  CoreContext, kontToCoreExpr,
   onCoreExpr, onSequentCoreTerm
 ) where
 
@@ -915,6 +916,20 @@ termToCoreExpr val =
     Coercion co  -> Core.Coercion co
     Compute kb c -> commandToCoreExpr kb c
 
+pKontToCoreExpr :: Type -> SeqCorePKont -> Core.CoreExpr
+pKontToCoreExpr = pKontToCoreExpr' NonRecursive
+
+pKontToCoreExpr' :: RecFlag -> Type -> SeqCorePKont -> Core.CoreExpr
+pKontToCoreExpr' recFlag retTy (PKont xs comm)
+  = Core.mkCoreLams (maybeOneShots xs') (commandToCoreExpr retTy comm)
+  where
+    xs'   | null xs   = [ voidArgId ]
+          | otherwise = xs
+    maybeOneShots xs | isNonRec recFlag = map setOneShotLambdaIfId xs
+                     | otherwise        = xs
+    setOneShotLambdaIfId x | isId x = setOneShotLambda x
+                           | otherwise = x
+
 type CoreContext = Core.CoreExpr -> Core.CoreExpr
 
 -- | Translates a continuation into a function that will wrap a Core expression
@@ -966,20 +981,12 @@ bindToCore retTy_maybe bind =
 
 bindPairToCore :: Maybe Type -> RecFlag -> SeqCoreBindPair
                -> (Core.CoreBndr, Core.CoreExpr)
-bindPairToCore retId_maybe recFlag pair =
+bindPairToCore retTy_maybe recFlag pair =
   case pair of
     BindTerm b v -> (b, termToCoreExpr v)
-    BindPKont b (PKont xs c) -> (b', Core.mkCoreLams (maybeOneShots xs')
-                                                     (commandToCoreExpr retId c))
+    BindPKont b pk -> (pKontIdToCore retTy b, pKontToCoreExpr' recFlag retTy pk)
       where
-        b'    = pKontIdToCore retId b
-        xs'   | null xs   = [ voidArgId ]
-              | otherwise = xs
-        maybeOneShots xs | isNonRec recFlag = map setOneShotLambdaIfId xs
-                         | otherwise        = xs
-        setOneShotLambdaIfId x | isId x = setOneShotLambda x
-                               | otherwise = x
-        retId = retId_maybe `orElse` panic "bindToCore: top-level cont"
+        retTy = retTy_maybe `orElse` panic "bindPairToCore: top-level cont"
 
 -- | Translates a list of top-level bindings into Core.
 bindsToCore :: [SeqCoreBind] -> [Core.CoreBind]

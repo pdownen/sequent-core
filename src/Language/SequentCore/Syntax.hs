@@ -25,8 +25,8 @@ module Language.SequentCore.Syntax (
   spanTypes, spanTypeArgs,
   flattenCommand,
   isValueArg, isTypeArg, isCoArg, isTyCoArg, isAppFrame, isValueAppFrame,
-  isTrivial, isTrivialTerm, isTrivialKont, isTrivialPKont, isReturnKont, isReturn,
-  isDefaultAlt,
+  isTrivial, isTrivialTerm, isTrivialKont, isTrivialPKont, isTrivialRhs,
+  isReturnKont, isReturn, isDefaultAlt,
   termIsConstruction, termAsConstruction, splitConstruction,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
   binderOfPair, setPairBinder, rhsOfPair, mkBindPair, destBindPair,
@@ -37,8 +37,8 @@ module Language.SequentCore.Syntax (
   needsCaseBinding,
   termOkForSpeculation, commandOkForSpeculation, kontOkForSpeculation,
   termOkForSideEffects, commandOkForSideEffects, kontOkForSideEffects,
-  termIsCheap, kontIsCheap, commandIsCheap, rhsIsCheap,
-  termIsExpandable, kontIsExpandable, commandIsExpandable, rhsIsExpandable,
+  termIsCheap, kontIsCheap, commandIsCheap, pKontIsCheap, rhsIsCheap,
+  termIsExpandable, kontIsExpandable, commandIsExpandable, pKontIsExpandable, rhsIsExpandable,
   CheapAppMeasure, isCheapApp, isExpandableApp,
   termIsCheapBy, kontIsCheapBy, commandIsCheapBy, rhsIsCheapBy,
   -- * Continuation ids
@@ -439,6 +439,9 @@ isTrivialPKont :: HasId b => PKont b -> Bool
 isTrivialPKont (PKont xs comm) = all (not . isRuntimeVar) (identifiers xs)
                               && isTrivial comm
 
+isTrivialRhs :: HasId b => Rhs b -> Bool
+isTrivialRhs = either isTrivialTerm isTrivialPKont
+
 -- | True if the given continuation is a return continuation, @Kont [] (Return _)@.
 isReturnKont :: Kont b -> Bool
 isReturnKont (Kont [] Return) = True
@@ -735,6 +738,10 @@ commandIsCheap, commandIsExpandable :: HasId b => Command b -> Bool
 commandIsCheap      = commCheap isCheapApp
 commandIsExpandable = commCheap isExpandableApp
 
+pKontIsCheap, pKontIsExpandable :: HasId b => PKont b -> Bool
+pKontIsCheap      = pKontCheap isCheapApp
+pKontIsExpandable = pKontCheap isExpandableApp
+
 rhsIsCheap, rhsIsExpandable :: HasId b => Rhs b -> Bool
 rhsIsCheap      = rhsCheap isCheapApp
 rhsIsExpandable = rhsCheap isExpandableApp
@@ -770,9 +777,12 @@ commCheap appCheap (Eval term kont)
 commCheap appCheap (Jump args j)
   = appCheap j (length (filter isValueArg args))
   
+pKontCheap :: HasId b => CheapAppMeasure -> PKont b -> Bool
+pKontCheap appCheap (PKont _ comm) = commCheap appCheap comm
+
 rhsCheap :: HasId b => CheapAppMeasure -> Rhs b -> Bool
 rhsCheap appCheap (Left term) = termCheap appCheap term
-rhsCheap appCheap (Right (PKont _ comm)) = commCheap appCheap comm
+rhsCheap appCheap (Right pk) = pKontCheap appCheap pk
 
 bindPairCheap :: HasId b => CheapAppMeasure -> BindPair b -> Bool
 bindPairCheap appCheap = rhsCheap appCheap . rhsOfPair
