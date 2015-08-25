@@ -2,16 +2,17 @@
 
 module Language.SequentCore.Simpl.Env (
   SimplEnv,
-  initialEnv, getMode, dynFlags, getSimplRules,
+  initialEnv, getMode, updMode, dynFlags, getSimplRules, getFamEnvs,
   getUnfoldingInRuleMatch, activeRule, getInScopeSet,
   
   SimplIdSubst, SubstAns(..),
-  substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar,
-  substTerm, substKont, substFrame, substEnd, substCommand,
+  substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar, lookupRecBndr,
+  substTerm, substKont, substFrame, substEnd, substPKont, substCommand,
   retType,
-  extendIdSubst, extendPvSubst, extendTvSubst, extendCvSubst,
+  extendIdSubst, extendPvSubst, extendIdOrPvSubst, extendTvSubst, extendCvSubst,
   setRetKont, pushKont,
-  enterScope, enterKontScope, enterScopes, mkFreshVar,
+  enterScope, enterKontScope, enterRecScopes, enterLamScope, enterLamScopes, mkFreshVar,
+  addBndrRules,
   getTvSubst, getCvSubst,
   zapSubstEnvs, zapTermSubstEnvs,
   
@@ -23,8 +24,9 @@ module Language.SequentCore.Simpl.Env (
   canDupMetaKont, setStaticPartFrom,
   
   IdDefEnv, Definition(..), Guidance(..),
-  mkBoundTo, mkBoundToPKont, mkDef,
+  mkBoundTo, mkBoundToWithGuidance, mkBoundToDFun, inlineBoringOk, mkDef,
   findDef, setDef, activeUnfolding,
+  defIsCheap, defIsConLike, defIsEvald, defIsSmallEnoughToInline, defIsStable,
   
   Floats,
   emptyFloats, addNonRecFloat, addRecFloats, zapFloats, zapKontFloats,
@@ -45,7 +47,6 @@ module Language.SequentCore.Simpl.Env (
 import Language.SequentCore.Arity
 import Language.SequentCore.OccurAnal
 import Language.SequentCore.Simpl.ExprSize
-import Language.SequentCore.Simpl.Monad
 import {-# SOURCE #-} Language.SequentCore.Simpl.Util
 import Language.SequentCore.Syntax
 import Language.SequentCore.Translate
@@ -56,18 +57,21 @@ import BasicTypes ( Activation, Arity, CompilerPhase(..), PhaseNum
                   , isInlinePragma, inlinePragmaActivation
                   , isTopLevel, isNotTopLevel, isNonRec )
 import Coercion   ( Coercion, CvSubstEnv, CvSubst(..)
-                  , coercionKind, decomposeCo, isCoVar, isReflCo
-                  , liftCoSubstWith, mkCoVarCo, mkReflCo, mkTransCo )
+                  , coercionKind, decomposeCo, isReflCo
+                  , liftCoSubstWith, mkReflCo, mkTransCo )
 import CoreFVs
 import qualified Coercion
 import CoreMonad  ( SimplifierMode(..) )
+import qualified CoreSubst
 import CoreSyn    ( Tickish(Breakpoint)
                   , Unfolding(..), UnfoldingGuidance(..), UnfoldingSource(..)
-                  , isCompulsoryUnfolding, mkOtherCon
+                  , isCompulsoryUnfolding, isStableSource, mkOtherCon
                   , tickishCounts, tickishIsCode )
+import qualified CoreSyn as Core
 import CoreUnfold ( mkCoreUnfolding, mkDFunUnfolding  )
 import DataCon
-import DynFlags   ( DynFlags, HasDynFlags, ufCreationThreshold )
+import DynFlags   ( DynFlags, ufCreationThreshold, ufUseThreshold )
+import FamInstEnv ( FamInstEnv )
 import FastString ( FastString )
 import Id
 import IdInfo
@@ -79,7 +83,7 @@ import Rules      ( RuleBase )
 import TyCon
 import Type       ( Type, TvSubstEnv, TvSubst
                   , eqType, splitTyConApp_maybe, tyVarsOfType
-                  , mkTvSubst, mkTyConApp, mkTyVarTy )
+                  , mkTvSubst, mkTyConApp )
 import qualified Type
 import UniqSupply
 import Util       ( debugIsOn
@@ -88,15 +92,16 @@ import Var
 import VarEnv
 import VarSet
 
-import Control.Applicative ( (<|>) )
 import Control.Exception   ( assert )
+import Data.List           ( mapAccumL )
 
 infixl 1 `setStaticPart`, `inDynamicScope`, `setRetKont`
 
 data SimplGlobalEnv
   = SimplGlobalEnv { sge_dflags   :: DynFlags
                    , sge_mode     :: SimplifierMode
-                   , sge_ruleBase :: RuleBase }
+                   , sge_ruleBase :: RuleBase
+                   , sge_fams     :: (FamInstEnv, FamInstEnv) }
 
 data SimplEnv
   = SimplEnv    { se_idSubst :: SimplIdSubst   -- InId      |--> TermSubstAns (in/out)
@@ -155,7 +160,9 @@ setStaticPartFrom env mk
 -- paper, section 6.3.)
 type IdDefEnv = IdEnv Definition
 data Definition
-  = BoundTo { def_term :: OutTerm
+  = NoDefinition
+  | BoundTo { def_rhs :: OutRhs
+            , def_src :: UnfoldingSource
             , def_level :: TopLevelFlag
             , def_guidance :: Guidance
             , def_arity :: Arity
@@ -164,9 +171,7 @@ data Definition
             , def_isWorkFree :: Bool
             , def_isExpandable :: Bool
             }
-  | BoundToPKont { def_pKont :: OutPKont
-                 , def_guidance :: Guidance }
-  | BoundToDFun { dfun_bndrs :: [Var]
+  | BoundToDFun { dfun_bndrs :: [OutVar]
                 , dfun_dataCon :: DataCon
                 , dfun_args :: [OutTerm] }
   | NotAmong [AltCon]
@@ -183,19 +188,26 @@ data Guidance
 always :: Guidance
 always = Usually { guEvenIfUnsat = True, guEvenIfBoring = True }
 
-mkDef :: (Monad m, HasDynFlags m)
-      => SimplEnv -> TopLevelFlag -> OutRhs -> m Definition
+mkDef :: SimplEnv -> TopLevelFlag -> OutRhs -> Definition
 mkDef env level rhs
-  = do
-    dflags <- getDynFlags
-    -- FIXME Make a BoundToDFun when possible
-    return $ case rhs of
-               Left term -> mkBoundTo env dflags term level
-               Right pkont -> mkBoundToPKont dflags pkont
+  = mkBoundTo env dflags rhs InlineRhs level False
+  where
+    dflags = dynFlags env
 
-mkBoundTo :: SimplEnv -> DynFlags -> OutTerm -> TopLevelFlag -> Definition
-mkBoundTo env dflags term level
-  = BoundTo { def_term         = occurAnalyseTerm term
+mkBoundTo :: SimplEnv -> DynFlags -> OutRhs -> UnfoldingSource -> TopLevelFlag
+          -> Bool -> Definition
+mkBoundTo env dflags rhs src level bottoming
+  | isTopLevel level, bottoming, not (isTrivialRhs rhs)
+  = NoDefinition
+  | otherwise
+  = mkBoundToWithGuidance env rhs src level arity guid
+  where (arity, guid) = mkGuidance dflags rhs
+
+mkBoundToWithGuidance :: SimplEnv -> OutRhs -> UnfoldingSource -> TopLevelFlag
+                      -> Arity -> Guidance -> Definition
+mkBoundToWithGuidance env (Left term) src level arity guid
+  = BoundTo { def_rhs          = Left (occurAnalyseTerm term)
+            , def_src          = src
             , def_level        = level
             , def_guidance     = guid
             , def_arity        = arity
@@ -204,39 +216,77 @@ mkBoundTo env dflags term level
             , def_isWorkFree   = termIsCheap term
             , def_isConLike    = termIsConLike env term
             }
-  where (arity, guid) = mkGuidance dflags term
+mkBoundToWithGuidance env (Right pk) src level arity guid
+  = BoundTo { def_rhs          = Right (occurAnalysePKont pk)
+            , def_src          = src
+            , def_level        = level
+            , def_guidance     = guid
+            , def_arity        = arity
+            , def_isExpandable = pKontIsExpandable pk
+            , def_isValue      = pKontIsHNF env pk
+            , def_isWorkFree   = pKontIsCheap pk
+            , def_isConLike    = pKontIsConLike env pk
+            }
 
-mkBoundToPKont :: DynFlags -> OutPKont -> Definition
-mkBoundToPKont dflags pkont = BoundToPKont pkont (mkPKontGuidance dflags pkont)
+mkBoundToDFun :: [OutBndr] -> DataCon -> [OutArg] -> Definition
+mkBoundToDFun bndrs con args = BoundToDFun { dfun_bndrs   = bndrs
+                                           , dfun_dataCon = con
+                                           , dfun_args    = map occurAnalyseTerm args }
 
-mkGuidance :: DynFlags -> OutTerm -> (Arity, Guidance)
-mkGuidance dflags term
+inlineBoringOk :: SeqCoreRhs -> Bool
+-- See Note [INLINE for small functions] in CoreUnfold
+-- True => the result of inlining the expression is 
+--         no bigger than the expression itself
+--     eg      (\x y -> f y x)
+-- This is a quick and dirty version. It doesn't attempt
+-- to deal with  (\x y z -> x (y z))
+-- The really important one is (x `cast` c)
+inlineBoringOk term
+  = maybe False (>= 0) (either (goT 0) goPK term)
+  where
+    goT :: Int -> SeqCoreTerm -> Maybe Int
+    goT credit (Lam x e) | isId x             = goT (credit+1) e
+                         | otherwise          = goT credit e
+    goT credit (Var {})                       = Just credit
+    goT credit (Compute _ (Eval term (Kont fs Return)))
+                                              = goF credit fs >>= \credit' ->
+                                                goT credit' term
+    goT _      _                              = Nothing
+    
+    goF credit (App (Type {}) : fs)           = goF credit fs
+    goF credit (App a : fs) | credit > 0  
+                            , isTrivialTerm a = goF (credit-1) fs
+    goF credit (Tick _ : fs)                  = goF credit fs -- dubious
+    goF credit (Cast _ : fs) 		              = goF credit fs
+    goF credit []                             = Just credit
+    goF _      _                              = Nothing
+
+    goPK (PKont xs (Eval term (Kont fs Return)))
+                                              = goF (length xs) fs >>= \credit' ->
+                                                goT credit' term
+    goPK _                                    = Nothing
+
+mkGuidance :: DynFlags -> OutRhs -> (Arity, Guidance)
+mkGuidance dflags rhs
   = let cap = ufCreationThreshold dflags
-        guid = case termSize dflags cap term of
+        guid = case rhsSize dflags cap rhs of
                  Nothing -> Never
                  Just (ExprSize base args res)
-                   | uncondInline term nValBinds base -> always
-                   | otherwise                        -> Sometimes base args res
+                   | uncondInline rhs nValBinds base -> always
+                   | otherwise                       -> Sometimes base args res
     in (nValBinds, guid)
   where
-    (bndrs, _) = lambdas term
+    bndrs = case rhs of Left term          -> fst (lambdas term)
+                        Right (PKont xs _) -> xs
     nValBinds = length (filter isId bndrs)
     
-uncondInline :: OutTerm -> Arity -> Int -> Bool
+uncondInline :: OutRhs -> Arity -> Int -> Bool
 -- Inline unconditionally if there no size increase
 -- Size of call is arity (+1 for the function)
 -- See GHC CoreUnfold: Note [INLINE for small functions]
 uncondInline rhs arity size 
   | arity > 0 = size <= 10 * (arity + 1)
-  | otherwise = isTrivialTerm rhs
-
-mkPKontGuidance :: DynFlags -> OutPKont -> Guidance
-mkPKontGuidance dflags pkont
-  = let cap = ufCreationThreshold dflags
-    in case pKontSize dflags cap pkont of
-       Nothing -> Never
-       Just (ExprSize base args res) ->
-         Sometimes base args res
+  | otherwise = isTrivialRhs rhs
 
 type In a       = a
 type InCommand  = SeqCoreCommand
@@ -282,8 +332,9 @@ type OutVar     = Var
 type OutTyVar   = TyVar
 type OutCoVar   = CoVar
 
-initialEnv :: DynFlags -> SimplifierMode -> RuleBase -> SimplEnv
-initialEnv dflags mode rules
+initialEnv :: DynFlags -> SimplifierMode -> RuleBase -> (FamInstEnv, FamInstEnv)
+           -> SimplEnv
+initialEnv dflags mode rules famEnvs
   = SimplEnv { se_idSubst = emptyVarEnv
              , se_pvSubst = emptyVarEnv
              , se_tvSubst = emptyVarEnv
@@ -293,22 +344,31 @@ initialEnv dflags mode rules
              , se_inScope = emptyInScopeSet
              , se_defs    = emptyVarEnv
              , se_floats  = emptyFloats
-             , se_global  = initialGlobalEnv dflags mode rules }
+             , se_global  = initialGlobalEnv dflags mode rules famEnvs }
              
-initialGlobalEnv :: DynFlags -> SimplifierMode -> RuleBase -> SimplGlobalEnv
-initialGlobalEnv dflags mode rules
+initialGlobalEnv :: DynFlags -> SimplifierMode -> RuleBase -> (FamInstEnv, FamInstEnv)
+                 -> SimplGlobalEnv
+initialGlobalEnv dflags mode rules famEnvs 
   = SimplGlobalEnv { sge_dflags   = dflags
                    , sge_mode     = mode
-                   , sge_ruleBase = rules }
+                   , sge_ruleBase = rules
+                   , sge_fams     = famEnvs }
 
 getMode :: SimplEnv -> SimplifierMode
 getMode = sge_mode . se_global
+
+updMode :: (SimplifierMode -> SimplifierMode) -> SimplEnv -> SimplEnv
+updMode upd env@(SimplEnv { se_global = glob })
+  = env { se_global = glob { sge_mode = upd (sge_mode glob) } }
 
 dynFlags :: SimplEnv -> DynFlags
 dynFlags = sge_dflags . se_global
 
 getSimplRules :: SimplEnv -> RuleBase
 getSimplRules = sge_ruleBase . se_global
+
+getFamEnvs :: SimplEnv -> (FamInstEnv, FamInstEnv)
+getFamEnvs = sge_fams . se_global
 
 activeRule :: SimplEnv -> Activation -> Bool
 -- Nothing => No rules at all
@@ -323,27 +383,8 @@ getInScopeSet = se_inScope
 
 enterScope :: SimplEnv -> InVar -> (SimplEnv, OutVar)
 enterScope env x
-  = (env', x')
-  where
-    SimplEnv { se_idSubst = ids, se_pvSubst = pvs
-             , se_tvSubst = tvs, se_cvSubst = cvs
-             , se_inScope = ins, se_defs    = defs } = env
-    x1    = uniqAway ins x
-    x'    = substIdType env x1
-    env'  | isTyVar x   = env { se_tvSubst = tvs', se_inScope = ins', se_defs = defs' }
-          | isCoVar x   = env { se_cvSubst = cvs', se_inScope = ins', se_defs = defs' }
-          | isPKontId x = env { se_pvSubst = pvs', se_inScope = ins', se_defs = defs' }
-          | otherwise   = env { se_idSubst = ids', se_inScope = ins', se_defs = defs' }
-    ids'  | x' /= x     = extendVarEnv ids x (DoneId x')
-          | otherwise   = delVarEnv ids x
-    pvs'  | x' /= x     = extendVarEnv pvs x (DoneId x')
-          | otherwise   = delVarEnv pvs x
-    tvs'  | x' /= x     = extendVarEnv tvs x (mkTyVarTy x')
-          | otherwise   = delVarEnv tvs x
-    cvs'  | x' /= x     = extendVarEnv cvs x (mkCoVarCo x')
-          | otherwise   = delVarEnv cvs x
-    ins'  = extendInScopeSet ins x'
-    defs' = delVarEnv defs x'
+  | isTyVar   x = enterTyVarScope env x
+  | otherwise   = enterIdScope env x
 
 enterKontScope :: SimplEnv -> InType -> (SimplEnv, OutType)
 enterKontScope env ty
@@ -352,13 +393,80 @@ enterKontScope env ty
     ty' = substTy env ty
 
 enterScopes :: SimplEnv -> [InVar] -> (SimplEnv, [OutVar])
-enterScopes env []
-  = (env, [])
-enterScopes env (x : xs)
-  = (env'', x' : xs')
+enterScopes = mapAccumL enterScope
+
+enterRecScopes :: SimplEnv -> [InId] -> (SimplEnv, [OutId])
+enterRecScopes = enterScopes
+
+enterLamScope :: SimplEnv -> InVar -> (SimplEnv, OutVar)
+enterLamScope = enterScope
+
+enterLamScopes :: SimplEnv -> [InVar] -> (SimplEnv, [OutVar])
+enterLamScopes = enterScopes
+
+enterIdScope :: SimplEnv -> InId -> (SimplEnv, OutId)
+enterIdScope env bndr
+  | Coercion.isCoVar bndr = enterCoVarScope env bndr
+  | otherwise             = enterNonCoVarIdScope env bndr
+  
+enterNonCoVarIdScope :: SimplEnv -> InId -> (SimplEnv, OutId)
+enterNonCoVarIdScope env@(SimplEnv { se_inScope = in_scope, se_defs = defs
+                                   , se_idSubst = id_subst, se_pvSubst = pv_subst })
+                     old_id
+  | tracing
+  , new_id /= old_id
+  , pprTrace "enterNonCoVarIdScope" (ppr old_id <+> darrow <+> ppr new_id) False
+  = undefined
+  | otherwise
+  = (env { se_inScope = in_scope `extendInScopeSet` new_id,
+           se_defs    = defs `delVarEnv` new_id,
+           se_idSubst = new_id_subst,
+           se_pvSubst = new_pv_subst }, new_id)
   where
-    (env', x') = enterScope env x
-    (env'', xs') = enterScopes env' xs
+    id1    = uniqAway in_scope old_id
+    id2    = substIdType env id1
+    new_id = zapFragileIdInfo id2       -- Zaps rules, worker-info, unfolding
+                                        -- and fragile OccInfo
+
+    is_pv  = isPKontId old_id
+    
+        -- Extend the substitution if the unique has changed,
+        -- or there's some useful occurrence information
+        -- See the notes with substTyVarBndr for the delSubstEnv
+    new_id_subst | is_pv 
+                 = id_subst
+                 | new_id /= old_id
+                 = extendVarEnv id_subst old_id (DoneId new_id)
+                 | otherwise
+                 = delVarEnv id_subst old_id
+    new_pv_subst | not is_pv
+                 = pv_subst
+                 | new_id /= old_id
+                 = extendVarEnv pv_subst old_id (DoneId new_id)
+                 | otherwise
+                 = delVarEnv pv_subst old_id
+
+enterTyVarScope :: SimplEnv -> InTyVar -> (SimplEnv, OutTyVar)
+enterTyVarScope env tv
+  = case Type.substTyVarBndr (getTvSubst env) tv of
+      (Type.TvSubst in_scope' tv_env', tv')
+          | tracing
+          , tv /= tv'
+          , pprTrace "enterTyVarScope" (ppr tv <+> darrow <+> ppr tv') False
+         -> undefined
+          | otherwise
+         -> (env { se_inScope = in_scope', se_tvSubst = tv_env' }, tv')
+
+enterCoVarScope :: SimplEnv -> InCoVar -> (SimplEnv, OutCoVar)
+enterCoVarScope env cv
+  = case Coercion.substCoVarBndr (getCvSubst env) cv of
+      (CvSubst in_scope' tv_env' cv_env', cv')
+          | tracing
+          , cv /= cv'
+          , pprTrace "enterCoVarScope" (ppr cv <+> darrow <+> ppr cv') False
+         -> undefined
+          | otherwise
+         -> (env { se_inScope = in_scope', se_tvSubst = tv_env', se_cvSubst = cv_env' }, cv')
 
 mkFreshVar :: MonadUnique m => SimplEnv -> FastString -> Type -> m (SimplEnv, Var)
 mkFreshVar env name ty
@@ -402,6 +510,21 @@ refine ins x
   | otherwise
   = x
 
+lookupRecBndr :: SimplEnv -> InId -> OutId
+-- Look up an Id which has been put into the envt by enterRecScopes,
+-- but where we have not yet done its RHS
+lookupRecBndr (SimplEnv { se_inScope = in_scope, se_idSubst = ids, se_pvSubst = pvs }) v
+  | isPKontId v
+  = case lookupVarEnv pvs v of
+      Just (DoneId v) -> v
+      Just _ -> pprPanic "lookupRecBndr" (ppr v)
+      Nothing -> refine in_scope v
+  | otherwise
+  = case lookupVarEnv ids v of
+      Just (DoneId v) -> v
+      Just _ -> pprPanic "lookupRecBndr" (ppr v)
+      Nothing -> refine in_scope v
+
 getTvSubst :: SimplEnv -> TvSubst
 getTvSubst env = mkTvSubst (se_inScope env) (se_tvSubst env)
 
@@ -430,16 +553,59 @@ substCo env co = Coercion.substCo (getCvSubst env) co
 substCoVar :: SimplEnv -> CoVar -> Coercion
 substCoVar env co = Coercion.substCoVar (getCvSubst env) co
 
+modifyInScope :: SimplEnv -> OutVar -> SimplEnv
+modifyInScope env var = env { se_inScope = extendInScopeSet (se_inScope env) var }
+
+addBndrRules :: SimplEnv -> InId -> OutId -> (SimplEnv, OutId)
+addBndrRules env in_id out_id
+  | isEmptySpecInfo old_rules = (env, out_id)
+  | otherwise = (modifyInScope env final_id, final_id)
+  where
+    subst     = mkCoreSubst (text "local rules") env
+    old_rules = idSpecialisation in_id
+    new_rules = CoreSubst.substSpec subst out_id old_rules
+    final_id  = out_id `setIdSpecialisation` new_rules
+
+-- Convert a whole environment to a CoreSubst.Subst. A fairly desperate measure.
+mkCoreSubst :: SDoc -> SimplEnv -> CoreSubst.Subst
+mkCoreSubst doc env@(SimplEnv { se_inScope = in_scope, se_tvSubst = tv_env, se_cvSubst = cv_env
+                              , se_idSubst = id_env, se_pvSubst = pv_env })
+  = mk_subst tv_env cv_env id_env pv_env
+  where
+    mk_subst tv_env cv_env id_env pv_env = CoreSubst.mkSubst (mapInScopeSet fiddlePKontVar in_scope)
+                                             tv_env cv_env
+                                             (mapVarEnv fiddle id_env `plusVarEnv`
+                                              mapVarEnv fiddlePKont pv_env)
+
+    fiddle (Done e)          = termToCoreExpr e
+    fiddle (DoneId v)        = Core.Var v
+    fiddle (Susp (StaticEnv env') e) = termToCoreExpr (substTerm (text "mkCoreSubst" <+> doc) env' e)
+                                                -- Don't shortcut here
+                                                
+    fiddlePKontVar x | isPKontId x = pKontIdToCore retTy x
+                     | otherwise   = x
+    
+    fiddlePKont (Done pk)    = pKontToCoreExpr (retType env) pk
+    fiddlePKont (DoneId j)   = Core.Var (pKontIdToCore retTy j)
+    fiddlePKont (Susp (StaticEnv env') e) = pKontToCoreExpr retTy (substPKont (text "mkCoreSubst" <+> doc) env' e)
+    
+    mapInScopeSet :: (Var -> Var) -> InScopeSet -> InScopeSet
+    mapInScopeSet f = mkInScopeSet . mapVarEnv f . getInScopeVars
+    
+    retTy = retType env
+
 substTerm    :: SDoc -> SimplEnv -> SeqCoreTerm    -> SeqCoreTerm
 substKont    :: SDoc -> SimplEnv -> SeqCoreKont    -> SeqCoreKont
 substFrame   :: SDoc -> SimplEnv -> SeqCoreFrame   -> SeqCoreFrame
 substEnd     :: SDoc -> SimplEnv -> SeqCoreEnd     -> SeqCoreEnd
+substPKont   :: SDoc -> SimplEnv -> SeqCorePKont   -> SeqCorePKont
 substCommand :: SDoc -> SimplEnv -> SeqCoreCommand -> SeqCoreCommand
 
 substTerm _doc env term    = doSubstT env term
 substKont _doc env kont    = doSubstK env kont
 substFrame _doc env frame  = doSubstF env frame
 substEnd _doc env end      = doSubstE env end
+substPKont _doc env pk     = doSubstP env pk
 substCommand _doc env comm = doSubstC env comm
 
 doSubstT :: SimplEnv -> SeqCoreTerm -> SeqCoreTerm
@@ -488,6 +654,10 @@ doSubstE env (Case x alts)
             rhs' = doSubstC env'' rhs
         in Alt ac bndrs' rhs'
 
+doSubstP :: SimplEnv -> SeqCorePKont -> SeqCorePKont
+doSubstP env (PKont bndrs comm) = PKont bndrs' (doSubstC env' comm)
+  where (env', bndrs') = enterLamScopes env bndrs
+
 doSubstC :: SimplEnv -> SeqCoreCommand -> SeqCoreCommand
 doSubstC env (Let bind body)
   = Let bind' (doSubstC env' body)
@@ -517,12 +687,11 @@ doSubstB env bind
       Rec pairs -> (env', Rec (zipWith mkBindPair bndrs' rhss'))
         where
           (bndrs, rhss) = unzip (map destBindPair pairs)
-          (env', bndrs') = enterScopes env bndrs
+          (env', bndrs') = enterRecScopes env bndrs
           rhss' = map (doRhs env') rhss
   where
-    doRhs env' (Left term)                = Left  (doSubstT env' term)
-    doRhs env' (Right (PKont bndrs comm)) = Right (PKont bndrs' (doSubstC env'' comm))
-      where (env'', bndrs') = enterScopes env' bndrs
+    doRhs env' (Left term) = Left  (doSubstT env' term)
+    doRhs env' (Right pk)  = Right (doSubstP env' pk)
 
 extendIdSubst :: SimplEnv -> InVar -> TermSubstAns -> SimplEnv
 extendIdSubst env x rhs
@@ -531,6 +700,21 @@ extendIdSubst env x rhs
 extendPvSubst :: SimplEnv -> InVar -> PKontSubstAns -> SimplEnv
 extendPvSubst env x rhs
   = env { se_pvSubst = extendVarEnv (se_pvSubst env) x rhs }
+
+extendIdOrPvSubst :: SimplEnv -> InVar -> SubstAns SeqCoreRhs -> SimplEnv
+extendIdOrPvSubst env x rhs
+  | isPKontId x
+  = extendPvSubst env x $ case rhs of
+                            Done (Right pk) -> Done pk
+                            DoneId j        -> DoneId j
+                            Susp stat (Right pk) -> Susp stat pk
+                            _               -> pprPanic "extendIdOrPvSubst" (ppr x <+> ppr rhs)
+  | otherwise
+  = extendIdSubst env x $ case rhs of
+                            Done (Left term) -> Done term
+                            DoneId x'        -> DoneId x'
+                            Susp stat (Left term) -> Susp stat term
+                            _                -> pprPanic "extendIdOrPvSubst" (ppr x <+> ppr rhs)
 
 extendTvSubst :: SimplEnv -> InTyVar -> OutType -> SimplEnv
 extendTvSubst env@(SimplEnv { se_tvSubst = tvs }) tyVar ty
@@ -676,14 +860,9 @@ extendFloats :: SimplEnv -> OutBind -> SimplEnv
 -- Add these bindings to the floats, and extend the in-scope env too
 extendFloats env bind
   = env { se_floats  = se_floats env `addFlts` unitFloat bind,
-          se_inScope = extendInScopeSetList (se_inScope env) bndrs,
-          se_defs    = extendVarEnvList (se_defs env) defs}
+          se_inScope = extendInScopeSetList (se_inScope env) bndrs }
   where
     bndrs = bindersOf bind
-    defs = map asDef (flattenBind bind)
-    -- FIXME The NotTopLevel flag might wind up being wrong!
-    asDef (BindTerm x term) = (x, mkBoundTo env (dynFlags env) term NotTopLevel)
-    asDef (BindPKont p pk)  = (p, mkBoundToPKont (dynFlags env) pk)
 
 addFloats :: SimplEnv -> SimplEnv -> SimplEnv
 -- Add the floats for env2 to env1;
@@ -794,19 +973,19 @@ hasNoKontFloats :: SimplEnv -> Bool
 hasNoKontFloats = foldrOL (&&) True . mapOL (all bindsTerm . flattenBind)
                                     . floatBinds . se_floats
 
-findDefBy :: SimplEnv -> OutId -> (Id -> Unfolding) -> Maybe Definition
+findDefBy :: SimplEnv -> OutId -> (Id -> Unfolding) -> Definition
 findDefBy env var id_unf
   | isStrongLoopBreaker (idOccInfo var)
-  = Nothing
+  = NoDefinition
   | otherwise
-  = lookupVarEnv (se_defs env) var <|> unfoldingToDef (id_unf var)
+  = lookupVarEnv (se_defs env) var `orElse` unfoldingToDef (id_unf var)
 
-findDef :: SimplEnv -> OutId -> Maybe Definition
+findDef :: SimplEnv -> OutId -> Definition
 findDef env var
   = findDefBy env var idUnfolding
 
-expandDef_maybe :: Definition -> Maybe SeqCoreTerm
-expandDef_maybe (BoundTo { def_isExpandable = True, def_term = term }) = Just term
+expandDef_maybe :: Definition -> Maybe SeqCoreRhs
+expandDef_maybe (BoundTo { def_isExpandable = True, def_rhs = rhs }) = Just rhs
 expandDef_maybe _ = Nothing
 
 getUnfoldingInRuleMatch :: SimplEnv -> (Id -> Unfolding)
@@ -826,23 +1005,24 @@ getUnfoldingInRuleMatch env
      | not (sm_rules mode) = active_unfolding_minimal id
      | otherwise           = isActive (sm_phase mode) (idInlineActivation id)
 
-unfoldingToDef :: Unfolding -> Maybe Definition
-unfoldingToDef NoUnfolding     = Nothing
-unfoldingToDef (OtherCon cons) = Just (NotAmong cons)
+unfoldingToDef :: Unfolding -> Definition
+unfoldingToDef NoUnfolding     = NoDefinition
+unfoldingToDef (OtherCon cons) = NotAmong cons
 unfoldingToDef unf@(CoreUnfolding {})
-  = Just $ BoundTo { def_term         = occurAnalyseTerm (termFromCoreExpr (uf_tmpl unf))
-                   , def_level        = if uf_is_top unf then TopLevel else NotTopLevel
-                   , def_guidance     = unfGuidanceToGuidance (uf_guidance unf)
-                   , def_arity        = uf_arity unf
-                   , def_isValue      = uf_is_value unf
-                   , def_isConLike    = uf_is_conlike unf
-                   , def_isWorkFree   = uf_is_work_free unf
-                   , def_isExpandable = uf_expandable unf }
+  = BoundTo { def_rhs          = Left (termFromCoreExpr (uf_tmpl unf))
+            , def_src          = uf_src unf
+            , def_level        = if uf_is_top unf then TopLevel else NotTopLevel
+            , def_guidance     = unfGuidanceToGuidance (uf_guidance unf)
+            , def_arity        = uf_arity unf
+            , def_isValue      = uf_is_value unf
+            , def_isConLike    = uf_is_conlike unf
+            , def_isWorkFree   = uf_is_work_free unf
+            , def_isExpandable = uf_expandable unf }
 unfoldingToDef unf@(DFunUnfolding {})
-  = Just $ BoundToDFun { dfun_bndrs    = df_bndrs unf
-                       , dfun_dataCon  = df_con unf
-                       , dfun_args     = map (occurAnalyseTerm . termFromCoreExpr)
-                                             (df_args unf) }
+  = BoundToDFun { dfun_bndrs    = df_bndrs unf
+                , dfun_dataCon  = df_con unf
+                , dfun_args     = map (occurAnalyseTerm . termFromCoreExpr)
+                                      (df_args unf) }
 
 unfGuidanceToGuidance :: UnfoldingGuidance -> Guidance
 unfGuidanceToGuidance UnfNever = Never
@@ -857,15 +1037,14 @@ setDef env x def
   where
     env' = env { se_inScope = extendInScopeSet (se_inScope env) x'
                , se_defs    = extendVarEnv (se_defs env) x' def }
-    x'   | DFunUnfolding {} <- idUnfolding x = x -- don't mess with these since
-                                                 -- we don't generate them
-         | otherwise = x `setIdUnfolding` defToUnfolding def
+    x'   = x `setIdUnfolding` defToUnfolding def
 
 defToUnfolding :: Definition -> Unfolding
+defToUnfolding NoDefinition    = NoUnfolding
 defToUnfolding (NotAmong cons) = mkOtherCon cons
-defToUnfolding (BoundToPKont {})
+defToUnfolding (BoundTo { def_rhs = Right _pkont })
   = NoUnfolding -- TODO Can we do better? Translating requires knowing the outer linear cont.
-defToUnfolding (BoundTo { def_term = term, def_level = lev, def_guidance = guid })
+defToUnfolding (BoundTo { def_rhs = Left term, def_level = lev, def_guidance = guid })
   = mkCoreUnfolding InlineRhs (isTopLevel lev) (termToCoreExpr term)
       (termArity term) (guidanceToUnfGuidance guid)
 defToUnfolding (BoundToDFun { dfun_bndrs = bndrs, dfun_dataCon = con, dfun_args = args})
@@ -883,15 +1062,22 @@ guidanceToUnfGuidance (Sometimes { guSize = size, guArgDiscounts = args, guResul
 -- evaluated.
 
 termIsHNF, termIsConLike :: SimplEnv -> SeqCoreTerm -> Bool
-termIsHNF     = termIsHNFLike isDataConWorkId defIsEvald
-termIsConLike = termIsHNFLike isConLikeId defIsConLike
+termIsHNF     env = rhsIsHNFLike isDataConWorkId defIsEvald env . Left
+termIsConLike env = rhsIsHNFLike isConLikeId defIsConLike env   . Left
 
-termIsHNFLike :: (Var -> Bool) -> (Definition -> Bool) -> SimplEnv -> SeqCoreTerm -> Bool
-termIsHNFLike isCon isHNFDef env term = isHNFLike term []
+pKontIsHNF, pKontIsConLike :: SimplEnv -> SeqCorePKont -> Bool
+pKontIsHNF     env = rhsIsHNFLike isDataConWorkId defIsEvald env . Right
+pKontIsConLike env = rhsIsHNFLike isConLikeId defIsConLike env   . Right
+
+rhsIsHNFLike :: (Var -> Bool) -> (Definition -> Bool) -> SimplEnv -> SeqCoreRhs -> Bool
+rhsIsHNFLike isCon isHNFDef env rhs
+  = case rhs of
+      Left term -> isHNFLike term []
+      Right pk  -> isHNFLikePKont pk
   where
     isHNFLike _                fs | hasTick fs = False
     isHNFLike (Var id)         fs = isCon id
-                                 || maybe False isHNFDef (findDef env id)
+                                 || isHNFDef (findDef env id)
                                  || idArity id > count isRuntimeApp fs
     isHNFLike (Lit {})         _  = True
     isHNFLike (Coercion {})    _  = True
@@ -901,10 +1087,11 @@ termIsHNFLike isCon isHNFDef env term = isHNFLike term []
     
     isHNFLikeComm (Let _ comm)  = isHNFLikeComm comm
     isHNFLikeComm (Jump _ j)    = isCon j -- emphasis on constructor-*like*
-                                          -- (TODO Let pkont definitions be conlike?)
     isHNFLikeComm (Eval v k)    = case k of
                                     Kont _ (Case {}) -> False
                                     Kont fs Return   -> isHNFLike v fs
+    
+    isHNFLikePKont (PKont xs comm) = any isId xs || isHNFLikeComm comm
     
     isRuntimeApp (App (Type _)) = False
     isRuntimeApp (App _)        = True
@@ -921,6 +1108,21 @@ defIsConLike :: Definition -> Bool
 defIsConLike (NotAmong _) = True
 defIsConLike (BoundTo { def_isConLike = cl }) = cl
 defIsConLike _ = False
+
+defIsCheap :: Definition -> Bool
+defIsCheap (BoundTo { def_isWorkFree = wf }) = wf
+defIsCheap _ = False
+
+defIsStable :: Definition -> Bool
+defIsStable (BoundTo { def_src = src })      = isStableSource src
+defIsStable (BoundToDFun {})                 = True
+defIsStable _                                = False
+
+defIsSmallEnoughToInline :: DynFlags -> Definition -> Bool
+defIsSmallEnoughToInline dflags (BoundTo { def_guidance = Sometimes { guSize = size }})
+  = size <= ufUseThreshold dflags
+defIsSmallEnoughToInline _ _
+  = False
 
 activeUnfolding :: SimplEnv -> Id -> Bool
 activeUnfolding env
@@ -998,21 +1200,21 @@ termIsConApp_maybe env id_unf term
       , Just (args, co_m') <- extractArgs (Left ins) fs
       , count isValueArg args == idArity fun
       = dealWithCoercion (mkTransCoMaybe co_m co_m') dc args
-      | Just (BoundToDFun { dfun_bndrs = bndrs
-                          , dfun_dataCon = dc
-                          , dfun_args = dcArgs }) <- def_m
+      | BoundToDFun { dfun_bndrs = bndrs
+                    , dfun_dataCon = dc
+                    , dfun_args = dcArgs } <- def
       , Just (args, co_m') <- extractArgs (Left ins) fs
       , bndrs `equalLength` args
       = let env   = env0 { se_inScope = ins } `setSubstEnvs` zipWith BindTerm bndrs args
             args' = map (substTerm (text "termIsConApp_maybe::go") env) dcArgs
         in dealWithCoercion (mkTransCoMaybe co_m co_m') dc args'
-      | Just def <- def_m
-      , Just rhs <- expandDef_maybe def
+      | assert (not (isPKontId fun)) True
+      , Just (Left term) <- expandDef_maybe def
       , def_arity def == 0
-      = let ins' = extendInScopeSetSet ins (termFreeVars rhs)
-        in go (Left ins') rhs fs co_m
+      = let ins' = extendInScopeSetSet ins (termFreeVars term)
+        in go (Left ins') term fs co_m
       where
-        def_m = findDefBy env fun id_unf
+        def = findDefBy env fun id_unf
         
     go _ _ _ _ = Nothing
     
@@ -1185,17 +1387,20 @@ instance Outputable MetaKont where
     = text "<append simplified frames>"
 
 instance Outputable Definition where
-  ppr (BoundTo { def_term = term, def_level = level, def_guidance = guid,
+  ppr (BoundTo { def_rhs = rhs, def_src = src, def_level = level, def_guidance = guid,
                  def_isConLike = cl, def_isWorkFree = wf, def_isValue = vl,
                  def_isExpandable = ex })
-    = sep [brackets (fsep [ppr level, ppr guid, ppWhen cl (text "ConLike"),
+    = sep [brackets (fsep [ppr level, ppr src, ppr guid, ppWhen cl (text "ConLike"),
                            ppWhen wf (text "WorkFree"), ppWhen vl (text "Value"),
-                           ppWhen ex (text "Expandable")]), ppr term]
-  ppr (BoundToPKont pk guid)
-    = sep [brackets (ppr guid), ppr pk]
+                           ppWhen ex (text "Expandable")]), pprEither rhs]
   ppr (BoundToDFun bndrs con args)
     = char '\\' <+> hsep (map ppr bndrs) <+> arrow <+> ppr con <+> hsep (map (parens . ppr) args)
   ppr (NotAmong alts) = text "NotAmong" <+> ppr alts
+  ppr NoDefinition = text "NoDefinition"
+  
+pprEither :: (Outputable a, Outputable b) => Either a b -> SDoc
+pprEither (Left x)  = ppr x
+pprEither (Right x) = ppr x
 
 instance Outputable Guidance where
   ppr Never = text "Never"

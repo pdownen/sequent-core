@@ -38,6 +38,7 @@ library
                        Language.SequentCore.Simpl
                        Language.SequentCore.SpecConstr
                        Language.SequentCore.Syntax
+                       Language.SequentCore.Syntax.Util
                        Language.SequentCore.Translate
   other-modules:       Language.SequentCore.Simpl.Env
                        Language.SequentCore.Simpl.ExprSize

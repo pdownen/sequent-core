@@ -18,7 +18,8 @@ module Language.SequentCore.Syntax (
     SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
   mkCommand, mkVarArg, mkLambdas, mkCompute, mkComputeEval,
-  mkAppTerm, mkCast, mkCastMaybe, castBottomTerm, mkConstruction, mkImpossibleCommand,
+  mkAppTerm, mkAppCommand, mkConstruction, mkConstructionCommand,
+  mkCast, mkCastMaybe, castBottomTerm, mkImpossibleCommand,
   addLets, addLetsToTerm, addNonRec, consFrame, addFrames,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
@@ -46,6 +47,7 @@ module Language.SequentCore.Syntax (
   -- * Values
   Value(..), SeqCoreValue, splitValue, valueToTerm, valueToCommandWith,
   -- * Alpha-equivalence
+  cheapEqTerm, cheapEqKont, cheapEqFrame, cheapEqCommand,
   (=~=), AlphaEq(..), AlphaEnv, HasId(..)
 ) where
 
@@ -53,7 +55,8 @@ import {-# SOURCE #-} Language.SequentCore.Pretty ()
 import Language.SequentCore.Util
 import Language.SequentCore.WiredIn
 
-import Coercion  ( Coercion, coercionKind, coercionType, isCoVar, isCoVarType
+import Coercion  ( Coercion, coercionKind, coercionType, coreEqCoercion
+                 , isCoVar, isCoVarType
                  , isReflCo, mkCoCast, mkCoVarCo, mkTransCo )
 import CoreSyn   ( AltCon(..), Tickish, tickishCounts, isRuntimeVar
                  , isEvaldUnfolding )
@@ -69,7 +72,7 @@ import Pair      ( pSnd )
 import PrimOp    ( PrimOp(..), primOpOkForSpeculation, primOpOkForSideEffects
                  , primOpIsCheap )
 import TyCon
-import Type      ( Type, KindOrType )
+import Type      ( Type, KindOrType, eqType )
 import qualified Type
 import TysPrim
 import Var       ( Var, isId )
@@ -234,11 +237,14 @@ mkComputeEval v fs = mkCompute ty (Eval v (Kont fs Return))
   where
     ty = foldl frameType (termType v) fs
 
-mkAppTerm :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreTerm
-mkAppTerm fun args = mkCompute retTy (Eval fun (Kont (map App args) Return))
+mkAppTerm :: HasId b => Term b -> [Term b] -> Term b
+mkAppTerm fun args = mkCompute retTy (mkAppCommand fun args)
   where
     (tyArgs, _) = spanTypes args
     (_, retTy) = Type.splitFunTys $ Type.applyTys (termType fun) tyArgs
+
+mkAppCommand :: Term b -> [Term b] -> Command b
+mkAppCommand fun args = Eval fun (Kont (map App args) Return)
 
 mkCast :: SeqCoreTerm -> Coercion -> SeqCoreTerm
 mkCast term co | isReflCo co = term
@@ -267,9 +273,13 @@ castBottomTerm v ty | termTy `Type.eqType` ty = v
     termTy = termType v
     wild = mkWildValBinder termTy
 
-mkConstruction :: DataCon -> [Type] -> [SeqCoreTerm] -> SeqCoreTerm
+mkConstruction :: HasId b => DataCon -> [Type] -> [Term b] -> Term b
 mkConstruction dc tyArgs valArgs
   = mkAppTerm (Var (dataConWorkId dc)) (map Type tyArgs ++ valArgs)
+
+mkConstructionCommand :: DataCon -> [Type] -> [Term b] -> Command b
+mkConstructionCommand dc tyArgs valArgs
+  = mkAppCommand (Var (dataConWorkId dc)) (map Type tyArgs ++ valArgs)
 
 mkImpossibleCommand :: Type -> SeqCoreCommand
 mkImpossibleCommand ty
@@ -885,6 +895,29 @@ valueToCommandWith (ConsVal dc tys vs) kont = mkCommand [] (Var (dataConWorkId d
 --------------------------------------------------------------------------------
 -- Alpha-Equivalence
 --------------------------------------------------------------------------------
+
+cheapEqTerm    :: Term b -> Term b -> Bool
+cheapEqKont    :: Kont b -> Kont b -> Bool
+cheapEqFrame   :: Frame b -> Frame b -> Bool
+cheapEqCommand :: Command b -> Command b -> Bool
+
+cheapEqTerm (Var v1)   (Var v2)   = v1==v2
+cheapEqTerm (Lit lit1) (Lit lit2) = lit1 == lit2
+cheapEqTerm (Type t1)  (Type t2)  = t1 `eqType` t2
+cheapEqTerm (Coercion c1) (Coercion c2) = c1 `coreEqCoercion` c2
+cheapEqTerm _             _             = False
+
+cheapEqFrame (App a1) (App a2)   = a1 `cheapEqTerm` a2
+cheapEqFrame (Cast t1) (Cast t2) = t1 `coreEqCoercion` t2
+cheapEqFrame _ _ = False
+
+cheapEqKont (Kont fs1 Return) (Kont fs2 Return) = and $ zipWith cheapEqFrame fs1 fs2
+cheapEqKont _                 _                 = False
+
+cheapEqCommand (Eval v1 k1) (Eval v2 k2)
+  = cheapEqTerm v1 v2 && cheapEqKont k1 k2
+cheapEqCommand _            _
+  = False
 
 -- | A class of types that contain an identifier. Useful so that we can compare,
 -- say, elements of @Command b@ for any @b@ that wraps an identifier with

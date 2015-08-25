@@ -1,4 +1,4 @@
-{-# LANGUAGE ParallelListComp, TupleSections, CPP #-}
+{-# LANGUAGE ParallelListComp, TupleSections, ViewPatterns, CPP #-}
 
 -- | 
 -- Module      : Language.SequentCore.Simpl
@@ -26,28 +26,31 @@ import Language.SequentCore.Util
 import Language.SequentCore.WiredIn
 
 import BasicTypes
-import Coercion    ( coercionKind, isCoVar, mkCoCast )
+import Coercion    ( coercionKind, isCoVar, mkCoCast, mkSymCo )
 import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                      CoreM, defaultPlugin, reinitializeGlobals,
                      isZeroSimplCount, pprSimplCount, simplCountN,
                      putMsg,
-                     getRuleBase
+                     getHscEnv, getRuleBase
                    )
-import CoreSyn     ( CoreVect(..), CoreRule(..)
-                   , isRuntimeVar, isCheapUnfolding
+import CoreSyn     ( CoreVect(..), CoreRule(..), UnfoldingSource(..)
+                   , evaldUnfolding
+                   , isRuntimeVar, isStableSource
                    , tickishCounts
                    , ruleArity )
-import CoreUnfold  ( smallEnoughToInline )
 import DataCon
+import Demand      ( StrictSig(..), dmdTypeDepth )
 import DynFlags    ( DynFlags, DumpFlag(..), GeneralFlag(..)
                    , gopt, dopt
                    , ufKeenessFactor, ufUseThreshold )
 import ErrUtils    ( dumpSDoc )
+import FamInstEnv
 import FastString
 import Id
 import IdInfo      ( IdInfo, demandInfo, strictnessInfo, vanillaIdInfo,
-                     setArityInfo, setDemandInfo, setStrictnessInfo )
-import HscTypes    ( ModGuts(..), VectInfo(..) )
+                     setArityInfo, setDemandInfo, setStrictnessInfo, zapDemandInfo )
+import HscTypes    ( ExternalPackageState(..), ModGuts(..), VectInfo(..)
+                   , hscEPS )
 import Literal     ( litIsDupable, litIsLifted )
 import Maybes      ( whenIsJust )
 import MkCore      ( mkWildValBinder )
@@ -56,21 +59,19 @@ import Name        ( mkSystemVarName )
 import Outputable
 import Pair
 import qualified PprCore as Core
-import Rules       ( extendRuleBaseList, lookupRule )
-import Type        ( Type, applyTy, funResultTy, splitFunTy_maybe, splitForAllTy_maybe
-                   , isUnLiftedType
-                   , mkTyVarTy )
+import Rules       ( extendRuleBaseList, lookupRule, unionRuleBase )
+import Type hiding ( extendTvSubst, substTy, substTyVar )
 import TysWiredIn  ( mkTupleTy )
 import UniqSupply
 import Util        ( debugIsOn )
-import Var
 import VarEnv
 import VarSet
 
 import Control.Arrow       ( second )
 import Control.Exception   ( assert )
-import Control.Monad       ( foldM, forM, when )
+import Control.Monad       ( foldM, when )
 
+import Data.List           ( mapAccumL )
 import Data.Maybe          ( catMaybes, isJust, mapMaybe )
 
 -- | Plugin data. The initializer replaces all instances of the original
@@ -122,6 +123,7 @@ runSimplifier iters mode guts
     return $ guts { mg_binds = coreBinds' }
   where
     rules = mg_rules guts
+    famEnvs = mg_fam_inst_env guts
     
     go n prevCounts binds
       | n > iters
@@ -135,6 +137,8 @@ runSimplifier iters mode guts
       = do
         dflags <- getDynFlags
         ruleBase <- getRuleBase
+        hscEnv <- getHscEnv
+        eps <- liftIO $ hscEPS hscEnv
         let mod       = mg_module guts
             vectVars  = mkVarSet $
                           catMaybes [ fmap snd $ lookupVarEnv (vectInfoVar (mg_vect_info guts)) bndr
@@ -149,7 +153,10 @@ runSimplifier iters mode guts
                       = case sm_phase mode of
                           InitialPhase -> (mg_vect_decls guts, vectVars)
                           _            -> ([], vectVars)
-            env = initialEnv dflags mode (ruleBase `extendRuleBaseList` rules)
+            rule_base1 = unionRuleBase ruleBase (eps_rule_base eps)
+            rule_base2 = extendRuleBaseList rule_base1 rules
+            famEnvs2 = (eps_fam_inst_env eps, famEnvs)
+            env = initialEnv dflags mode rule_base2 famEnvs2
             occBinds = runOccurAnal env mod maybeVects maybeVectVars binds
         when dumping $ putMsg  $ text "BEFORE" <+> int n
                               $$ text "--------" $$ pprTopLevelBinds occBinds
@@ -185,72 +192,44 @@ runSimplifier iters mode guts
                                           $$ pprTopLevelBinds binds 
                                           $$ extraDoc)
       
+-----------
+-- Binds --
+-----------
 
 simplModule :: SimplEnv -> [InBind] -> SimplM [OutBind]
-simplModule env binds
-  = do
-    finalEnv <- simplBinds env binds TopLevel
-    freeTick SimplifierDone
-    return $ getFloatBinds (getFloats finalEnv)
+simplModule env0 binds0
+  = do  {       -- Put all the top-level binders into scope at the start
+                -- so that if a transformation rule has unexpectedly brought
+                -- anything into scope, then we don't get a complaint about that.
+                -- It's rather as if the top-level binders were imported.
+                -- See note [Glomming] in OccurAnal.
+        ; let (env1, _) = enterRecScopes env0 (bindersOfBinds binds0)
+        ; dflags <- getDynFlags
+        ; let dump_flag = dopt Opt_D_verbose_core2core dflags
+        ; env2 <- simpl_binds dump_flag env1 binds0
+        ; freeTick SimplifierDone
+        ; return $ getFloatBinds (getFloats env2) }
+  where
+        -- We need to track the zapped top-level binders, because
+        -- they should have their fragile IdInfo zapped (notably occurrence info)
+        -- That's why we run down binds and bndrs' simultaneously.
+        --
+        -- The dump-flag emits a trace for each top-level binding, which
+        -- helps to locate the tracing for inlining and rule firing
+    simpl_binds :: Bool -> SimplEnv -> [InBind] -> SimplM SimplEnv
+    simpl_binds _    env []           = return env
+    simpl_binds dump env (bind:binds) = do { env' <- trace_bind dump bind $
+                                                     simpl_bind env bind
+                                           ; simpl_binds dump env' binds }
 
-simplCommandNoFloats :: SimplEnv -> InCommand -> SimplM OutCommand
-simplCommandNoFloats env comm
-  = do
-    (env', comm') <- simplCommand (zapFloats env) comm
-    return $ wrapFloats env' comm'
+    trace_bind True  bind = pprTrace "SimplBind" (ppr (bindersOf bind))
+    trace_bind False _    = \x -> x
 
-simplCommandNoKontFloats :: SimplEnv -> InCommand -> SimplM (SimplEnv, OutCommand)
-simplCommandNoKontFloats env comm
-  = do
-    (env', comm') <- simplCommand (zapKontFloats env) comm
-    return (zapKontFloats env', wrapKontFloats env' comm')
-
-simplCommand :: SimplEnv -> InCommand -> SimplM (SimplEnv, OutCommand)
-simplCommand env (Let bind comm)
-  = do
-    env' <- simplBind env bind NotTopLevel
-    simplCommand env' comm
-simplCommand env (Eval term (Kont fs end))
-  = simplTermInCommand env term (staticPart env) Nothing fs end
-simplCommand env (Jump args j)
-  = simplJump env args j
-
-simplTermNoFloats :: SimplEnv -> InTerm -> SimplM OutTerm
-simplTermNoFloats env (Compute ty comm)
-  = do
-    let (env', ty') = enterKontScope env ty
-    comm' <- simplCommandNoFloats env' comm
-    return $ mkCompute ty' comm'
-simplTermNoFloats env term
-  = do
-    (env', term') <- simplTerm (zapFloats env) term
-    return $ wrapFloatsAroundTerm env' term'
-
-simplTerm :: SimplEnv -> InTerm -> SimplM (SimplEnv, OutTerm)
-simplTerm env (Type ty)
-  = return (env, Type (substTy env ty))
-simplTerm env (Coercion co)
-  = return (env, Coercion (simplCoercion env co))
-simplTerm env (Compute ty comm)
-  = do
-    let (env', ty') = enterKontScope env ty
-    -- Terms are closed with respect to continuation variables, so they can
-    -- safely float past this binder. Continuations must *never* float past it,
-    -- however, because they necessarily invoke the continuation bound here.
-    (env'', comm') <- simplCommandNoKontFloats (zapFloats env') comm
-    return (env `addFloats` env'', mkCompute ty' comm')
-simplTerm env v
-  = do
-    let (env', ty') = enterKontScope env ty
-        env'' = zapFloats env'
-    (env''', comm) <- simplTermInCommand env'' v (staticPart env'') Nothing [] Return
-    return (env, mkCompute ty' (wrapFloats env''' comm))
-  where ty = substTy env (termType v)
-
-simplBinds :: SimplEnv -> [InBind] -> TopLevelFlag
-           -> SimplM SimplEnv
-simplBinds env bs level
-  = foldM (\env' b -> simplBind env' b level) env bs
+    simpl_bind env (Rec pairs)   = simplRec          env  pairs TopLevel
+    simpl_bind env (NonRec pair) = simplRecOrTopPair env' b b' r TopLevel NonRecursive
+        where
+          (b, r) = destBindPair pair
+          (env', b') = addBndrRules env b (lookupRecBndr env b)
 
 simplBind :: SimplEnv -> InBind -> TopLevelFlag
           -> SimplM SimplEnv
@@ -258,55 +237,108 @@ simplBind :: SimplEnv -> InBind -> TopLevelFlag
 --  | pprTraceShort "simplBind" (text "Binding" <+> parens (ppr level) <> colon <+>
 --                          ppr bind) False
 --  = undefined
-simplBind env (NonRec (BindTerm x v)) level
-  = simplNonRec env x (staticPart env) v level
-simplBind env (NonRec (BindPKont p k)) _level
-  = simplNonRecPKont env p (staticPart env) k
-simplBind env (Rec xcs) level
-  = simplRec env xcs level
+simplBind env (NonRec (destBindPair -> (x, rhs))) level
+  = simplNonRec env x (staticPart env) rhs level
+simplBind env (Rec pairs) level
+  = let (env', _) = enterRecScopes env (map binderOfPair pairs)
+    in simplRec env' pairs level
 
-simplNonRec :: SimplEnv -> InVar -> StaticEnv -> InTerm -> TopLevelFlag
+{-
+simplNonRec is used for
+  * non-top-level non-recursive lets in expressions
+  * beta reduction
+-}
+
+simplNonRec :: SimplEnv -> InVar -> StaticEnv -> InRhs -> TopLevelFlag
             -> SimplM SimplEnv
-simplNonRec env_x x env_v v level
+simplNonRec env_x x env_v rhs _level
+  | isTyVar x
+  , Left (Type ty) <- rhs
+  = let ty' = substTy (env_v `inDynamicScope` env_x) ty
+    in return $ extendTvSubst env_x x ty'
+  | isTyVar x
+  = pprPanic "simplNonRec" (ppr x <+> ppr rhs)
+simplNonRec env_x x env_v rhs level
   = do
-    let (env_x', x') = enterScope env_x x
-    simplLazyBind env_x' x x' env_v v level NonRecursive
+    preInline <- preInlineUnconditionally env_x env_v (mkBindPair x rhs) level
+    if preInline
+      then do
+        tick (PreInlineUnconditionally x)
+        let ans = Susp env_v rhs
+            env' = extendIdOrPvSubst env_x x ans
+        return env'
+      else do
+        let (env_x', x') = enterScope env_x x
+        simplLazyOrPKontBind env_x' x x' env_v rhs level NonRecursive
+
+{-
+simplRecOrTopPair is used for
+        * recursive bindings (whether top level or not)
+        * top-level non-recursive bindings
+
+It assumes the binder has already been simplified, but not its IdInfo.
+-}
+
+simplRecOrTopPair :: SimplEnv
+                  -> InId -> OutBndr -> InRhs
+                  -> TopLevelFlag -> RecFlag
+                  -> SimplM SimplEnv
+simplRecOrTopPair env old_bndr new_bndr rhs top_lvl is_rec
+  = do -- Check for unconditional inline
+       preInline <- preInlineUnconditionally env (staticPart env) (mkBindPair old_bndr rhs) top_lvl
+       if preInline
+           then do tick (PreInlineUnconditionally old_bndr)
+                   return $ extendIdOrPvSubst env old_bndr (Susp (staticPart env) rhs)
+           else simplLazyOrPKontBind env old_bndr new_bndr (staticPart env) rhs top_lvl is_rec
+
+simplLazyOrPKontBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InRhs -> TopLevelFlag
+                     -> RecFlag -> SimplM SimplEnv
+simplLazyOrPKontBind env_x x x' env_r r level recFlag
+  = case r of
+      Left term -> assert (not (isPKontId x)) $
+                   simplLazyBind env_x x x' env_r term level recFlag
+      Right pk  -> assert (isPKontId x && isNotTopLevel level) $
+                   simplPKontBind env_x x x' env_r pk recFlag
+
+{-
+simplLazyBind is used for
+  * [simplRecOrTopPair] recursive bindings (whether top level or not)
+  * [simplRecOrTopPair] top-level non-recursive bindings
+  * [simplNonRec]      non-top-level *lazy* non-recursive bindings
+
+Nota bene:
+    1. It assumes that the binder is *already* simplified,
+       and is in scope, and its IdInfo too, except unfolding
+
+    2. It assumes that the binder type is lifted.
+
+    3. It does not check for pre-inline-unconditionallly;
+       that should have been done already.
+-}
 
 simplLazyBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InTerm -> TopLevelFlag
               -> RecFlag -> SimplM SimplEnv
 simplLazyBind env_x x x' env_v v level recFlag
   | tracing
   , pprTraceShort "simplLazyBind" (ppr x <+> (if x == x' then empty else darrow <+> ppr x')
-                                      <+> ppr level <+> ppr recFlag $$ ppr v) False
+                                      <+> ppr level <+> ppr recFlag $$ pprBndr LetBind x' $$ ppr v) False
   = undefined
-  | isTyVar x
-  , Type ty <- assert (isTypeArg v) v
-  = let ty' = substTy (env_v `inDynamicScope` env_x) ty
-    in return $ extendTvSubst env_x x ty'
   | isCoVar x
   , Coercion co <- assert (isCoArg v) v
   = let co' = simplCoercion (env_v `inDynamicScope` env_x) co
     in return $ extendCvSubst env_x x co'
   | otherwise
   = do
-    preInline <- preInlineUnconditionally env_x env_v (BindTerm x v) level
-    if preInline
-      then do
-        tick (PreInlineUnconditionally x)
-        let rhs = Susp env_v v
-            env' = extendIdSubst env_x x rhs
-        return env'
-      else do
-        -- TODO Handle floating type lambdas
-        let env_v' = zapFloats (env_v `inDynamicScope` env_x)
-        (env_v'', v') <- simplTerm env_v' v
-        (env_v_final, v'') <- prepareRhsTerm env_v'' level x' v'
-        (env_x', v''')
-          <- if not (doFloatFromRhs level recFlag False v'' env_v_final)
-                then    return (env_x, wrapFloatsAroundTerm env_v_final v'')
-                else do tick LetFloatFromLet
-                        return (env_x `addFloats` env_v_final, v'')
-        completeBind env_x' x x' (Left v''') level
+    -- TODO Handle floating type lambdas
+    let env_v' = zapFloats (env_v `inDynamicScope` env_x)
+    (env_v'', v') <- simplTerm env_v' v
+    (env_v_final, v'') <- prepareRhsTerm env_v'' level x' v'
+    (env_x', v''')
+      <- if not (doFloatFromRhs level recFlag False v'' env_v_final)
+            then    return (env_x, wrapFloatsAroundTerm env_v_final v'')
+            else do tick LetFloatFromLet
+                    return (env_x `addFloats` env_v_final, v'')
+    completeBind env_x' x x' (Left v''') level
 
 -- c.f. Simplify.simplNonRecX
 simplNonRecOut :: SimplEnv -> InId -> OutTerm -> SimplM SimplEnv
@@ -433,12 +465,18 @@ prepareRhsTerm env level x (Compute ty comm)
 prepareRhsTerm env _ _ term
   = return (env, term)
 
-simplNonRecPKont :: SimplEnv -> InPKontId -> StaticEnv -> InPKont -> SimplM SimplEnv
-simplNonRecPKont env_j j env_pk pk
-  = assert (isPKontId j) $ do
-    let (env_j', j') = enterScope env_j j
-    simplPKontBind env_j' j j' env_pk pk NonRecursive
+{-
+simplPKontBind is used for
+  * [simplRecOrTopPair] recursive pkont bindings
+  * [simplNonRec]       non-recursive pkont bindings
 
+Nota bene:
+    1. It assumes that the binder is *already* simplified,
+       and is in scope, and its IdInfo too, except unfolding
+
+    2. It does not check for pre-inline-unconditionallly;
+       that should have been done already.
+-}
 simplPKontBind :: SimplEnv -> InPKontId -> OutPKontId -> StaticEnv -> InPKont
                -> RecFlag -> SimplM SimplEnv
 simplPKontBind _env_j j j' _env_pk pk recFlag
@@ -448,32 +486,38 @@ simplPKontBind _env_j j j' _env_pk pk recFlag
   = undefined
 simplPKontBind env_j j j' env_pk pk _recFlag
   = do
-    preInline <- preInlineUnconditionally env_j env_pk (BindPKont j pk) NotTopLevel
-    if preInline
-      then do
-        tick (PreInlineUnconditionally j)
-        let rhs = Susp env_pk pk
-            env' = extendPvSubst env_j j rhs
-        return env'
-      else do
-        (env_j', xs', comm') <-
-          case pk of
-            PKont [] comm -> do
-              -- No parameters, so we can float things out
-              let env_pk' = zapFloats (env_pk `inDynamicScope` env_j)
-              (env_with_floats, comm') <- simplCommand env_pk' comm
-              env_j'
-                <- if isEmptyFloats env_with_floats
-                      then return env_j
-                      else do tick LetFloatFromLet -- Can always float through a cont binding
-                              return $ env_j `addFloats` env_with_floats
-              return (env_j', [], comm')
-            PKont xs comm -> do
-              -- There are parameters, so no floating
-              let (env_pk', xs') = enterScopes (env_pk `inDynamicScope` env_j) xs
-              comm' <- simplCommandNoFloats env_pk' comm
-              return (env_j, xs', comm')
-        completeBind env_j' j j' (Right (PKont xs' comm')) NotTopLevel
+    let env_pk' = zapFloats (env_pk `inDynamicScope` env_j)
+    (env_with_floats, pk') <- simplPKont env_pk' pk
+    env_j' <-
+      if isEmptyFloats env_with_floats
+         then    return env_j
+         else do tick LetFloatFromLet -- Can always float through a cont binding
+                                      -- (If the cont has parameters, the floats
+                                      -- won't make it here; see simplPKont.)
+                 return $ env_j `addFloats` env_with_floats
+    completeBind env_j' j j' (Right pk') NotTopLevel
+
+simplPKont :: SimplEnv -> InPKont -> SimplM (SimplEnv, OutPKont)
+simplPKont env pk
+  = case pk of
+      -- Can only float bindings out if there are no parameters
+      PKont [] comm -> do
+        (env', comm') <- simplCommand env comm
+        return (env', PKont [] comm')
+      _ -> do
+        pk' <- simplPKontNoFloats env pk
+        return (env, pk')
+
+simplPKontNoFloats :: SimplEnv -> InPKont -> SimplM OutPKont
+simplPKontNoFloats env (PKont xs comm)
+  = do
+    let (env', xs') = enterLamScopes env xs
+    comm' <- simplCommandNoFloats env' comm
+    return $ PKont xs' comm'
+
+simplRhsNoFloats :: SimplEnv -> InRhs -> SimplM OutRhs
+simplRhsNoFloats env (Left term) = Left  <$> simplTermNoFloats  env term
+simplRhsNoFloats env (Right pk)  = Right <$> simplPKontNoFloats env pk
 
 -- | Bind a continuation as the current one (as bound by a Compute). Unlike with
 -- simplLazyBind and simplPKontBind, here we *have* to substitute since we can't
@@ -494,20 +538,106 @@ simplKontBind env ty env_k k
 completeBind :: SimplEnv -> InVar -> OutVar -> OutRhs
              -> TopLevelFlag -> SimplM SimplEnv
 completeBind env x x' v level
+  | isCoVar x
+  = case v of
+      Left (Coercion co) -> return (extendCvSubst env x co)
+      Right _            -> pprPanic "completeBind" (ppr x <+> ppr v)
+      _                  -> return (addNonRecFloat env (mkBindPair x' v))
+  | otherwise
   = do
     (newArity, v') <- tryEtaExpandRhs env x' v
-    postInline <- postInlineUnconditionally env (mkBindPair x v') level
+    let oldDef = findDef env x
+    newDef <- simplDef env level x v' oldDef
+    postInline <- postInlineUnconditionally env (mkBindPair x v') level newDef
     if postInline
       then do
         tick (PostInlineUnconditionally x)
         -- Nevermind about substituting x' for x; we'll substitute v' instead
-        return $ either (extendIdSubst env x . Done) (extendPvSubst env x . Done) v'
+        return $ extendIdOrPvSubst env x (Done v')
       else do
-        def <- mkDef env level v'
-        let info' = idInfo x `setArityInfo` newArity
-            (env', x'') = setDef env (x' `setIdInfo` info') def
-        when tracing $ liftCoreM $ putMsg (text "defined" <+> ppr x'' <+> equals <+> ppr def)
-        return $ addNonRecFloat env' (mkBindPair x'' v')
+        let def = mkDef env level v'
+            info1 = idInfo x' `setArityInfo` newArity
+            (env', x'') = setDef env (x' `setIdInfo` info1) def
+            info2 = idInfo x''
+              -- Demand info: Note [Setting the demand info] in GHC Simplify
+              --
+              -- We also have to nuke demand info if for some reason
+              -- eta-expansion *reduces* the arity of the binding to less
+              -- than that of the strictness sig. This can happen: see Note [Arity decrease].
+            info3 | defIsEvald def
+                    || (case strictnessInfo info2 of
+                          StrictSig dmd_ty -> newArity < dmdTypeDepth dmd_ty)
+                  = zapDemandInfo info2 `orElse` info2
+                  | otherwise
+                  = info2
+            x_final = x' `setIdInfo` info3
+        
+        when tracing $ liftCoreM $ putMsg (text "defined" <+> ppr x_final <+> equals <+> ppr def)
+        return $ addNonRecFloat env' (mkBindPair x_final v')
+
+-- (from Simplify.simplUnfolding)
+------------------------------
+simplDef :: SimplEnv -> TopLevelFlag
+         -> InId
+         -> OutRhs
+         -> Definition -> SimplM Definition
+-- Note [Setting the new unfolding]
+simplDef env top_lvl id new_rhs def
+  = case def of
+      BoundToDFun { dfun_bndrs = bndrs, dfun_dataCon = con, dfun_args = args }
+        -> do { let (env', bndrs') = enterLamScopes rule_env bndrs
+              ; args' <- mapM (simplTermNoFloats env') args
+              ; return (mkBoundToDFun bndrs' con args') }
+
+      BoundTo { def_rhs = rhs, def_arity = arity
+              , def_src = src, def_guidance = guide }
+        | isStableSource src
+        -> do { rhs' <- simplRhsNoFloats rule_env rhs
+              ; case guide of
+                  Usually {}   -- Happens for INLINE things
+                     -> let guide' = guide { guEvenIfBoring = inlineBoringOk rhs' }
+                        -- Refresh the boring-ok flag, in case expr'
+                        -- has got small. This happens, notably in the inlinings
+                        -- for dfuns for single-method classes; see
+                        -- Note [Single-method classes] in TcInstDcls.
+                        -- A test case is Trac #4138
+                        in return (mkBoundToWithGuidance env rhs' src top_lvl arity guide')
+                            -- See Note [Top-level flag on inline rules] in CoreUnfold
+
+                  _other              -- Happens for INLINABLE things
+                     -> bottoming `seq` -- See Note [Force bottoming field]
+                        do { let dflags = dynFlags env
+                           ; return (mkBoundTo env dflags rhs' src top_lvl bottoming) } }
+                -- If the guidance is UnfIfGoodArgs, this is an INLINABLE
+                -- unfolding, and we need to make sure the guidance is kept up
+                -- to date with respect to any changes in the unfolding.
+
+      _other -> bottoming `seq`
+                do { let dflags = dynFlags env
+                   ; return (mkBoundTo env dflags new_rhs InlineRhs top_lvl bottoming) }
+                     -- We make an  unfolding *even for loop-breakers*.
+                     -- Reason: (a) It might be useful to know that they are WHNF
+                     --         (b) In TidyPgm we currently assume that, if we want to
+                     --             expose the unfolding then indeed we *have* an unfolding
+                     --             to expose.  (We could instead use the RHS, but currently
+                     --             we don't.)  The simple thing is always to have one.
+  where
+    bottoming = isBottomingId id
+    act      = idInlineActivation id
+    rule_env = updMode (updModeForInlineRules act) env
+               -- See Note [Simplifying inside InlineRules] in SimplUtils
+
+updModeForInlineRules :: Activation -> SimplifierMode -> SimplifierMode
+-- See Note [Simplifying inside InlineRules]
+updModeForInlineRules inline_rule_act current_mode
+  = current_mode { sm_phase = phaseFromActivation inline_rule_act
+                 , sm_inline = True
+                 , sm_eta_expand = False }
+                 -- For sm_rules, just inherit; sm_rules might be "off"
+                 -- because of -fno-enable-rewrite-rules
+  where
+    phaseFromActivation (ActiveAfter n) = Phase n
+    phaseFromActivation _               = InitialPhase
 
 tryEtaExpandRhs :: SimplEnv -> OutId -> OutRhs -> SimplM (Arity, OutRhs)
 tryEtaExpandRhs env x (Left v)
@@ -551,7 +681,7 @@ tryEtaExpandRhsTerm env bndr rhs
 addPolyBind :: SimplEnv -> TopLevelFlag -> OutBind -> SimplM SimplEnv
 addPolyBind env level (NonRec pair)
   = do
-    def <- mkDef env level (rhsOfPair pair)
+    def <- simplDef env level (binderOfPair pair) (rhsOfPair pair) NoDefinition
     let (env', x') = setDef env (binderOfPair pair) def
     return $ addNonRecFloat env' (pair `setPairBinder` x')
 addPolyBind env _level bind@(Rec _)
@@ -559,20 +689,85 @@ addPolyBind env _level bind@(Rec _)
   -- (worst case is we cause extra iteration by not updating definitions now)
   = return $ extendFloats env bind
 
-simplRec :: SimplEnv -> [InBindPair] -> TopLevelFlag
+simplRec :: SimplEnv
+         -> [InBindPair] -- but binders *already in scope*
+         -> TopLevelFlag
          -> SimplM SimplEnv
-simplRec env xvs level
-  = do
-    let (env', xs') = enterScopes env (map binderOfPair xvs)
-    env'' <- foldM doBinding (zapFloats env')
-               [ (x, x', v) | (x, v) <- map destBindPair xvs | x' <- xs' ]
-    return $ env' `addRecFloats` env''
+simplRec env0 pairs0 top_lvl
+  = do  { let (env_with_info, triples) = mapAccumL add_rules env0 pairs0
+        ; env1 <- go (zapFloats env_with_info) triples
+        ; return (env0 `addRecFloats` env1) }
+        -- addFloats adds the floats from env1,
+        -- _and_ updates env0 with the in-scope set from env1
   where
-    doBinding :: SimplEnv -> (InId, OutId, InRhs) -> SimplM SimplEnv
-    doBinding env' (x, x', Left v)
-      = simplLazyBind env' x x' (staticPart env') v level Recursive
-    doBinding env' (p, p', Right k)
-      = simplPKontBind env' p p' (staticPart env') k Recursive
+    add_rules :: SimplEnv -> InBindPair -> (SimplEnv, (InBndr, OutBndr, InRhs))
+        -- Add the (substituted) rules to the binder
+    add_rules env (destBindPair -> (bndr, rhs)) = (env', (bndr, bndr', rhs))
+        where
+          (env', bndr') = addBndrRules env bndr (lookupRecBndr env bndr)
+
+    go env [] = return env
+
+    go env ((old_bndr, new_bndr, rhs) : pairs)
+        = do { env' <- simplRecOrTopPair env old_bndr new_bndr rhs top_lvl Recursive
+             ; go env' pairs }
+-----------------
+-- Expressions --
+-----------------
+
+simplCommandNoFloats :: SimplEnv -> InCommand -> SimplM OutCommand
+simplCommandNoFloats env comm
+  = do
+    (env', comm') <- simplCommand (zapFloats env) comm
+    return $ wrapFloats env' comm'
+
+simplCommandNoKontFloats :: SimplEnv -> InCommand -> SimplM (SimplEnv, OutCommand)
+simplCommandNoKontFloats env comm
+  = do
+    (env', comm') <- simplCommand (zapKontFloats env) comm
+    return (zapKontFloats env', wrapKontFloats env' comm')
+
+simplCommand :: SimplEnv -> InCommand -> SimplM (SimplEnv, OutCommand)
+simplCommand env (Let bind comm)
+  = do
+    env' <- simplBind env bind NotTopLevel
+    simplCommand env' comm
+simplCommand env (Eval term (Kont fs end))
+  = simplTermInCommand env term (staticPart env) Nothing fs end
+simplCommand env (Jump args j)
+  = simplJump env args j
+
+simplTermNoFloats :: SimplEnv -> InTerm -> SimplM OutTerm
+simplTermNoFloats env (Compute ty comm)
+  = do
+    let (env', ty') = enterKontScope env ty
+    comm' <- simplCommandNoFloats env' comm
+    return $ mkCompute ty' comm'
+simplTermNoFloats env term
+  = do
+    (env', term') <- simplTerm (zapFloats env) term
+    return $ wrapFloatsAroundTerm env' term'
+
+simplTerm :: SimplEnv -> InTerm -> SimplM (SimplEnv, OutTerm)
+simplTerm env (Type ty)
+  = return (env, Type (substTy env ty))
+simplTerm env (Coercion co)
+  = return (env, Coercion (simplCoercion env co))
+simplTerm env (Compute ty comm)
+  = do
+    let (env', ty') = enterKontScope env ty
+    -- Terms are closed with respect to continuation variables, so they can
+    -- safely float past this binder. Continuations must *never* float past it,
+    -- however, because they necessarily invoke the continuation bound here.
+    (env'', comm') <- simplCommandNoKontFloats (zapFloats env') comm
+    return (env `addFloats` env'', mkCompute ty' comm')
+simplTerm env v
+  = do
+    let (env', ty') = enterKontScope env ty
+        env'' = zapFloats env'
+    (env''', comm) <- simplTermInCommand env'' v (staticPart env'') Nothing [] Return
+    return (env, mkCompute ty' (wrapFloats env''' comm))
+  where ty = substTy env (termType v)
 
 simplTermInCommand :: SimplEnv -> InTerm
                    -> StaticEnv -> Maybe InCoercion -> [InFrame] -> InEnd
@@ -594,15 +789,16 @@ simplTermInCommand env_v (Var x) env_k co_m fs end
         -> do
            let lone | App {} : _ <- fs = False
                     | otherwise        = True
-           let term'_maybe = callSiteInline env_v x' (activeUnfolding env_v x')
+               term'_maybe = callSiteInline env_v x' (activeUnfolding env_v x')
                                             lone (Kont fs end)
            case term'_maybe of
              Nothing
                -> simplTermInCommandDone env_v (Var x') env_k co_m fs end
-             Just term'
+             Just (Left term')
                -> do
                   tick (UnfoldingDone x')
                   simplTermInCommand (zapSubstEnvs env_v) term' env_k co_m fs end
+             _ -> pprPanic "simplTermInCommand" (ppr x $$ ppr term'_maybe)
       Done v
         -- Term already simplified (then PostInlineUnconditionally'd), so
         -- don't do any substitutions when processing it again
@@ -636,12 +832,12 @@ simplTermInCommand env_v (Lam x body) env_k co_m (App arg : fs) end
                                             -- have function/forall type
                                           in (arg', Just co')
                       | otherwise       = (arg, Nothing)
-    env_v' <- simplNonRec env_v x env_k arg' NotTopLevel
+    env_v' <- simplNonRec env_v x env_k (Left arg') NotTopLevel
     simplTermInCommand env_v' body env_k co_m' fs end
 simplTermInCommand env_v term@(Lam {}) env_k co_m fs end
   = do
     let (xs, body) = lambdas term
-        (env_v', xs') = enterScopes env_v xs
+        (env_v', xs') = enterLamScopes env_v xs
     body' <- simplTermNoFloats env_v' body
     simplTermInCommandDone env_v (mkLambdas xs' body') env_k co_m fs end
 simplTermInCommand env_v term@(Lit {}) env_k co_m fs end
@@ -804,12 +1000,17 @@ simplKontAfterRules env ai (Case x alts)
     env' <- if length alts > 1
               then ensureDupableKont env -- we're about to duplicate the context
               else return env
-    let (env_alts, x') = enterScope env' x
-        ai' = swallowCoercion ai
+    let ai' = swallowCoercion ai
         scrut = argInfoToTerm ai'
     
-    alts' <- forM alts (simplAlt env_alts (Just scrut) [] x')
-    simplKontDone env' ai' (Case x' alts')
+    (co_m, x', alts') <- simplAlts env' scrut x alts
+    let ai'' = case co_m of
+                 Just co -> ai' { ai_frames = Cast co : ai_frames ai' }
+                 Nothing -> ai'
+    dflags <- getDynFlags
+    Kont fs' end' <- mkCase dflags x' alts'
+    let ai_final = addFramesToArgInfo ai'' fs'
+    simplKontDone env' ai_final end'
 simplKontAfterRules env ai Return
   = invokeMetaKont env ai
 
@@ -841,15 +1042,107 @@ simplKontDone env ai end
   = return (env, Eval term (Kont (reverse fs) end))
   where ArgInfo { ai_term = term, ai_frames = fs } = swallowCoercion ai
 
+simplAlts :: SimplEnv -> OutTerm -> InId -> [InAlt]
+          -> SimplM (Maybe OutCoercion, OutId, [OutAlt])
+simplAlts env scrut case_bndr alts
+  = do  { let env0 = zapFloats env
+
+        ; let (env1, case_bndr1) = enterScope env0 case_bndr
+
+        ; let fam_envs = getFamEnvs env1
+        ; (alt_env', co_m, case_bndr') <- improveSeq fam_envs env1
+                                                     case_bndr case_bndr1 alts
+        ; let scrut' = case co_m of
+                         Just co -> mkCast scrut co
+                         Nothing -> scrut
+        ; (imposs_deflt_cons, in_alts) <- prepareAlts scrut' case_bndr' alts
+          -- NB: it's possible that the returned in_alts is empty: this is handled
+          -- by the caller (rebuildCase) in the missingAlt function
+
+        ; alts' <- mapM (simplAlt alt_env' (Just scrut') imposs_deflt_cons case_bndr') in_alts
+        ; -- pprTrace "simplAlts" (ppr case_bndr $$ ppr alts_ty $$ ppr alts_ty' $$ ppr alts $$ ppr cont') $
+          return (co_m, case_bndr', alts') }
+
+improveSeq :: (FamInstEnv, FamInstEnv) -> SimplEnv
+           -> InId -> OutId -> [InAlt]
+           -> SimplM (SimplEnv, Maybe OutCoercion, OutId)
+-- Note [Improving seq] in GHC's Simplify
+improveSeq fam_envs env case_bndr case_bndr1 [Alt DEFAULT _ _]
+  | not (isDeadBinder case_bndr) -- Not a pure seq!  See Note [Improving seq]
+  , Just (co, ty2) <- topNormaliseType_maybe fam_envs (idType case_bndr1)
+  = do { case_bndr2 <- mkSysLocalM (fsLit "nt") ty2
+        ; let rhs  = Done (mkCast (Var case_bndr2) (mkSymCo co))
+              env2 = extendIdSubst env case_bndr rhs
+        ; return (env2, Just co, case_bndr2) }
+
+improveSeq _ env _ case_bndr1 _
+  = return (env, Nothing, case_bndr1)
+
 simplAlt :: SimplEnv -> Maybe OutTerm -> [AltCon] -> OutId -> InAlt -> SimplM OutAlt
-simplAlt env _scrut_maybe _notAmong _caseBndr (Alt con xs c)
-  = do
-    -- TODO Important: Update definitions! This is likely to be low-hanging
-    -- fruit. This is why we take the scrutinee, other constructors, and case
-    -- binder as arguments.
-    let (env', xs') = enterScopes env xs
-    c' <- simplCommandNoFloats env' c
-    return $ Alt con xs' c'
+simplAlt env _ notAmong caseBndr (Alt DEFAULT bndrs rhs)
+  = assert (null bndrs) $ do
+    let (env', _) = setDef env caseBndr (NotAmong notAmong)
+    rhs' <- simplCommandNoFloats env' rhs
+    return $ Alt DEFAULT [] rhs'
+simplAlt env scrut_maybe _ caseBndr (Alt (LitAlt lit) bndrs rhs)
+  = assert (null bndrs) $ do
+    env' <- addAltUnfoldings env scrut_maybe caseBndr (Lit lit)
+    rhs' <- simplCommandNoFloats env' rhs
+    return $ Alt (LitAlt lit) [] rhs'
+simplAlt env scrut' _ case_bndr' (Alt (DataAlt con) vs rhs)
+  = do  {       -- Deal with the pattern-bound variables
+                -- Mark the ones that are in ! positions in the
+                -- data constructor as certainly-evaluated.
+                -- NB: simplLamBinders preserves this eval info
+        ; let vs_with_evals = add_evals (dataConRepStrictness con)
+        ; let (env', vs') = enterLamScopes env vs_with_evals
+
+                -- Bind the case-binder to (con args)
+        ; let inst_tys' = tyConAppArgs (idType case_bndr')
+              con_app :: OutTerm
+              con_app = mkConstruction con inst_tys' (map mkVarArg vs')
+
+        ; env'' <- addAltUnfoldings env' scrut' case_bndr' con_app
+        ; rhs' <- simplCommandNoFloats env'' rhs
+        ; return $ Alt (DataAlt con) vs' rhs' }
+  where
+        -- add_evals records the evaluated-ness of the bound variables of
+        -- a case pattern.  This is *important*.  Consider
+        --      data T = T !Int !Int
+        --
+        --      case x of { T a b -> < T | $ (a+1); $ b; ret > }
+        --
+        -- We really must record that b is already evaluated so that we don't
+        -- go and re-evaluate it when constructing the result.
+        -- See Note [Data-con worker strictness] in MkId.lhs
+    add_evals the_strs
+        = go vs the_strs
+        where
+          go [] [] = []
+          go (v:vs') strs | isTyVar v = v : go vs' strs
+          go (v:vs') (str:strs)
+            | isMarkedStrict str = evald_v  : go vs' strs
+            | otherwise          = zapped_v : go vs' strs
+            where
+              zapped_v = zapIdOccInfo v   -- See Note [Case alternative occ info]
+              evald_v  = zapped_v `setIdUnfolding` evaldUnfolding
+          go _ _ = pprPanic "cat_evals" (ppr con $$ ppr vs $$ ppr the_strs)
+
+addAltUnfoldings :: SimplEnv -> Maybe OutTerm -> OutId -> OutTerm -> SimplM SimplEnv
+addAltUnfoldings env scrut case_bndr con_app
+  = do { let con_app_def = mkDef env NotTopLevel (Left con_app)
+             (env1, _) = setDef env case_bndr con_app_def
+
+             -- See Note [Add unfolding for scrutinee]
+             (env2, _) = case scrut of
+                      Just (Var v)           -> setDef env1 v con_app_def
+                      Just (Compute _ (Eval (Var v) (Kont [Cast co] Return)))
+                                             -> setDef env1 v $
+                                                mkDef env1 NotTopLevel (Left (mkCast con_app (mkSymCo co)))
+                      _                      -> (env1, undefined)
+
+       ; when tracing $ pprTraceShort "addAltUnf" (vcat [ppr case_bndr <+> ppr scrut, ppr con_app]) return ()
+       ; return env2 }
 
 simplVar :: SimplEnv -> InVar -> SimplM OutTerm
 simplVar env x
@@ -872,9 +1165,22 @@ simplJump env args j
     case substPv env j of
       DoneId j'
         -> do
-           -- FIXME Call site inline!!
-           (env', args') <- mapAccumLM simplTerm env args
-           return (env', Jump args' j')
+           let lone = null args
+               -- Pretend to callSiteInline that we're just applying a bunch of
+               -- arguments to a function
+               rhs'_maybe = callSiteInline env j' (activeUnfolding env j')
+                                           lone (Kont (map App args) Return)
+          
+           case rhs'_maybe of
+             Nothing
+               -> do
+                  (env', args') <- mapAccumLM simplTerm env args
+                  return (env', Jump args' j')
+             Just (Right pk')
+               -> do
+                  tick (UnfoldingDone j')
+                  reduce (zapSubstEnvs env) pk'
+             _ -> pprPanic "simplJump" (ppr j $$ ppr rhs'_maybe)
       Done pk
         -> reduce (zapSubstEnvs env) pk
       Susp stat pk
@@ -885,7 +1191,7 @@ simplJump env args j
         env_comm <- foldM bindArg env_pk (zip xs args)
         simplCommand env_comm comm
     bindArg env_x (x, arg)
-      = simplNonRec env_x x (staticPart env) arg NotTopLevel
+      = simplNonRec env_x x (staticPart env) (Left arg) NotTopLevel
 
 knownCon :: SimplEnv
          -> OutTerm                             -- The scrutinee
@@ -1042,9 +1348,9 @@ preInlineUnconditionally env_x _env_rhs pair level
                         _       -> True
 
 -- Based on postInlineUnconditionally in SimplUtils; see comments there
-postInlineUnconditionally :: SimplEnv -> OutBindPair -> TopLevelFlag
+postInlineUnconditionally :: SimplEnv -> OutBindPair -> TopLevelFlag -> Definition
                           -> SimplM Bool
-postInlineUnconditionally env pair level
+postInlineUnconditionally env pair level def
   = do
     ans <- go (getMode env) <$> getDynFlags
     when tracing $ liftCoreM $ putMsg $ text "postInline" <+> ppr (binderOfPair pair) <> colon <+> text (show ans)
@@ -1055,13 +1361,14 @@ postInlineUnconditionally env pair level
       | isWeakLoopBreaker occ_info  = False
       | isExportedId x              = False
       | isTopLevel level            = False
+      | defIsStable def             = False
       | either isTrivialTerm isTrivialPKont rhs = True
       | otherwise
       = case occ_info of
           OneOcc in_lam _one_br int_cxt
-            ->     smallEnoughToInline dflags unfolding
+            ->     defIsSmallEnoughToInline dflags def
                && (not in_lam ||
-                    (isCheapUnfolding unfolding && int_cxt))
+                    (defIsCheap def && int_cxt))
           IAmDead -> True
           _ -> False
 
@@ -1069,7 +1376,6 @@ postInlineUnconditionally env pair level
         (x, rhs) = destBindPair pair
         occ_info = idOccInfo x
         active = isActive (sm_phase mode) (idInlineActivation x)
-        unfolding = idUnfolding x
 
 computeDiscount :: DynFlags -> Arity -> [Int] -> Int -> [ArgSummary] -> CallCtxt
                 -> Int
@@ -1137,23 +1443,23 @@ instance Outputable CallCtxt where
   ppr DiscArgCtxt = ptext (sLit "DiscArgCtxt")
   ppr RuleArgCtxt = ptext (sLit "RuleArgCtxt")
 
-callSiteInline :: SimplEnv -> OutId -> Bool -> Bool -> InKont -> Maybe OutTerm
+callSiteInline :: SimplEnv -> OutId -> Bool -> Bool -> InKont -> Maybe OutRhs
 callSiteInline env id active_unfolding lone_variable kont
   = case findDef env id of 
       -- idUnfolding checks for loop-breakers, returning NoUnfolding
       -- Things with an INLINE pragma may have an unfolding *and* 
       -- be a loop breaker  (maybe the knot is not yet untied)
-      Just BoundTo { def_term = unf_template, def_level = is_top 
-                   , def_isWorkFree = is_wf,  def_arity = uf_arity
-                   , def_guidance = guidance, def_isExpandable = is_exp }
-                   | active_unfolding -> let (arg_infos, cont_info) = distillKont kont
-                                         in tryUnfolding (dynFlags env) id lone_variable
-                                             arg_infos cont_info unf_template (isTopLevel is_top)
-                                             is_wf is_exp uf_arity guidance
-                   | tracing
-                   -> pprTrace "Inactive unfolding:" (ppr id) Nothing
-                   | otherwise -> Nothing
-      _            -> Nothing
+      BoundTo { def_rhs = unf_template, def_level = is_top 
+              , def_isWorkFree = is_wf,  def_arity = uf_arity
+              , def_guidance = guidance, def_isExpandable = is_exp }
+              | active_unfolding -> let (arg_infos, cont_info) = distillKont kont
+                                    in tryUnfolding (dynFlags env) id lone_variable
+                                        arg_infos cont_info unf_template (isTopLevel is_top)
+                                        is_wf is_exp uf_arity guidance
+              | tracing
+              -> pprTrace "Inactive unfolding:" (ppr id) Nothing
+              | otherwise -> Nothing
+      _       -> Nothing
 
 -- Impedence mismatch between Sequent Core code and logic from CoreUnfold.
 -- TODO This never generates most of the CallCtxt values. Need to keep track of
@@ -1168,8 +1474,8 @@ distillKont (Kont fs end) = (mapMaybe doFrame fs, doEnd end)
     doEnd (Case {})    = CaseCtxt
 
 tryUnfolding :: DynFlags -> Id -> Bool -> [ArgSummary] -> CallCtxt
-             -> OutTerm -> Bool -> Bool -> Bool -> Arity -> Guidance
-             -> Maybe OutTerm
+             -> OutRhs -> Bool -> Bool -> Bool -> Arity -> Guidance
+             -> Maybe OutRhs
 tryUnfolding dflags id lone_variable 
              arg_infos cont_info unf_template is_top 
              is_wf is_exp uf_arity guidance
