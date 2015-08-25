@@ -73,11 +73,6 @@ import Control.Monad       ( foldM, forM, when )
 
 import Data.Maybe          ( catMaybes, isJust, mapMaybe )
 
-tracing, dumping, linting :: Bool
-tracing = False
-dumping = False
-linting = True
-
 -- | Plugin data. The initializer replaces all instances of the original
 -- simplifier with the new one.
 plugin :: Plugin

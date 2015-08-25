@@ -1,6 +1,9 @@
 {-# LANGUAGE LambdaCase, CPP #-}
 
 module Language.SequentCore.Simpl.Util (
+  -- * Flags
+  linting, dumping, tracing, traceTicks,
+
   -- * State of argument processing
   RevList, ArgInfo(..),
   mkArgInfo, addFrameToArgInfo, addFramesToArgInfo, swallowCoercion,
@@ -34,6 +37,17 @@ import Type hiding ( substTy )
 import Util        ( count, lengthExceeds )
 
 import Control.Exception ( assert )
+-----------
+-- Flags --
+-----------
+
+-- TODO Use proper command-line stuff.
+tracing, traceTicks, dumping, linting :: Bool
+
+tracing    = False
+traceTicks = False
+dumping    = False
+linting    = True
 
 -------------
 -- ArgInfo --

@@ -3,6 +3,8 @@ module Language.SequentCore.Simpl.Monad (
   getDynFlags, tick, freeTick, checkedTick
 ) where
 
+import {-# SOURCE #-} Language.SequentCore.Simpl.Util
+
 import CoreMonad
 import DynFlags  ( HasDynFlags(..) )
 import Outputable
@@ -11,9 +13,6 @@ import UniqSupply
 import Control.Applicative
 import Control.Monad
 import Control.Monad.IO.Class
-
-traceTicks :: Bool
-traceTicks = False
 
 newtype SimplM a = SimplM { unSimplM :: CoreM (a, SimplCount) }
 
