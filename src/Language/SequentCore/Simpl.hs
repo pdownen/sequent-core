@@ -519,22 +519,6 @@ simplRhsNoFloats :: SimplEnv -> InRhs -> SimplM OutRhs
 simplRhsNoFloats env (Left term) = Left  <$> simplTermNoFloats  env term
 simplRhsNoFloats env (Right pk)  = Right <$> simplPKontNoFloats env pk
 
--- | Bind a continuation as the current one (as bound by a Compute). Unlike with
--- simplLazyBind and simplPKontBind, here we *have* to substitute since we can't
--- give a continuation a let binding.
-simplKontBind :: SimplEnv -> Type -> StaticEnv -> InKont -> SimplM SimplEnv
-simplKontBind env ty env_k k
-  | tracing
-  , pprTraceShort "simplKontBind" (text "ret" <+> dcolon <+> ppr ty $$ ppr k) False
-  = undefined
-  | otherwise
-  = do
-    -- For now, we use Susp as if the id were definitely used only once. If we
-    -- go into a multi-branch case, we'll call mkDupableKont then.
-    return $ env' `setRetKont` SynKont { mk_state = SuspKont env_k, mk_kont = k }
-  where
-    (env', _) = enterKontScope env ty
-
 completeBind :: SimplEnv -> InVar -> OutVar -> OutRhs
              -> TopLevelFlag -> SimplM SimplEnv
 completeBind env x x' v level
@@ -733,7 +717,9 @@ simplCommand env (Let bind comm)
     env' <- simplBind env bind NotTopLevel
     simplCommand env' comm
 simplCommand env (Eval term (Kont fs end))
-  = simplTermInCommand env term (staticPart env) Nothing fs end
+  = simplTermInCommand env term Nothing (map (Incoming stat) fs) (Incoming stat end)
+  where
+    stat = staticPart env
 simplCommand env (Jump args j)
   = simplJump env args j
 
@@ -765,54 +751,113 @@ simplTerm env v
   = do
     let (env', ty') = enterKontScope env ty
         env'' = zapFloats env'
-    (env''', comm) <- simplTermInCommand env'' v (staticPart env'') Nothing [] Return
+    (env''', comm) <- simplTermInCommand env'' v Nothing [] (Incoming (staticPart env'') Return)
     return (env, mkCompute ty' (wrapFloats env''' comm))
   where ty = substTy env (termType v)
 
-simplTermInCommand :: SimplEnv -> InTerm
-                   -> StaticEnv -> Maybe InCoercion -> [InFrame] -> InEnd
-                   -> SimplM (SimplEnv, OutCommand)
-simplTermInCommand env_v v env_k co_m fs end
+{-
+Note [Main simplifier loop]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Most interesting terms go through the following sequence of mutually
+tail-recursive functions. There are a few more in between, but these are the
+most important steps.
+
+simplTermInCommand     :: SimplEnv -> InTerm -> Maybe SubstedCoercion
+                       -> [ScopedFrame] -> ScopedEnd
+                       -> SimplM (SimplEnv, OutCommand)
+
+Simplifies the term, based on its unsimplified context. Inlining and
+beta-reduction apply here, as does entering Compute terms.
+
+simplTermInCommandDone :: SimplEnv -> OutTerm -> Maybe SubstedCoercion
+                       -> [ScopedFrame] -> ScopedEnd
+                       -> SimplM (SimplEnv, OutCommand)
+
+Called when simplTermInCommand finishes. Packages up the term and the (possible)
+coercion to build the initial ArgInfo, then continues onto simplKont.
+
+simplKont              :: SimplEnv -> ArgInfo
+                       -> [ScopedFrame] -> ScopedEnd
+                       -> SimplM (SimplEnv, OutCommand)
+
+Simplifies the continuation, going frame by frame and then processing the end.
+Each frame may interrupt the flow by going into a strict argument, which pulls
+the whole state into a StrictArg metacontinuation before jumping into the
+argument. After a frame is processed, it is added to the ArgInfo, whose
+ai_frames field acts as an accumulator. Rewrite rules fire in between the frames
+and the end.
+
+invokeMetaKont         :: SimplEnv -> ArgInfo
+                       -> SimplM (SimplEnv, OutCommand)
+
+Pulls the metacontinuation from the environment, if any, and invokes it. This
+may resume an earlier loop from where a strict argument was found.
+
+simplKontDone          :: SimplEnv -> ArgInfo -> OutEnd
+                       -> SimplM (SimplEnv, OutCommand)
+
+Called at the very end, either when a Return is encountered with no bound
+metacontinuation or after all the branches of a Case are recursed into. Pulls
+the accumulated frames from the ArgInfo and returns.
+-}
+
+simplTermInCommand     :: SimplEnv -> InTerm -> Maybe SubstedCoercion
+                       -> [ScopedFrame] -> ScopedEnd
+                       -> SimplM (SimplEnv, OutCommand)
+simplTermInCommand env_v v co_m fs end
   | tracing
   , pprTraceShort "simplTermInCommand" (
-      ppr env_v $$ ppr v $$ maybe empty showCo co_m $$ ppr env_k $$ ppr (Kont fs end)
+      ppr env_v $$ ppr v $$ maybe empty showCo co_m $$ pprMultiScopedKont fs end
     ) False
   = undefined
   where
     showCo co = text "coercing:" <+> ppr fromTy <+> darrow <+> ppr toTy
       where Pair fromTy toTy = coercionKind co
-simplTermInCommand _ (Type ty) _ _ _ _
+simplTermInCommand _ (Type ty) _ _ _
   = pprPanic "simplTermInCommand" (ppr ty)
-simplTermInCommand env_v (Var x) env_k co_m fs end
+simplTermInCommand env_v v co_m fs end
+  -- If end is Return and its scope has a syntactic continuation, pull it in now
+  | (env', Return) <- openScoped env_v end
+  , Just (SynKont { mk_frames = fs', mk_end = end' }) <- substKv env'
+  = simplTermInCommand env_v v co_m (fs ++ fs') end'
+simplTermInCommand env_v (Var x) co_m fs end
   = case substId env_v x of
       DoneId x'
         -> do
-           let lone | App {} : _ <- fs = False
-                    | otherwise        = True
+           let lone | (unScope -> App {}) : _ <- fs = False
+                    | otherwise                     = True
                term'_maybe = callSiteInline env_v x' (activeUnfolding env_v x')
-                                            lone (Kont fs end)
+                                            lone fs end
            case term'_maybe of
              Nothing
-               -> simplTermInCommandDone env_v (Var x') env_k co_m fs end
+               -> simplTermInCommandDone env_v (Var x') co_m fs end
              Just (Left term')
                -> do
                   tick (UnfoldingDone x')
-                  simplTermInCommand (zapSubstEnvs env_v) term' env_k co_m fs end
+                  simplTermInCommand (zapSubstEnvs env_v) term' co_m fs end
              _ -> pprPanic "simplTermInCommand" (ppr x $$ ppr term'_maybe)
       Done v
         -- Term already simplified (then PostInlineUnconditionally'd), so
         -- don't do any substitutions when processing it again
-        -> simplTermInCommand (zapSubstEnvs env_v) v env_k co_m fs end
+        -> simplTermInCommand (zapSubstEnvs env_v) v co_m fs end
       Susp stat v
-        -> simplTermInCommand (env_v `setStaticPart` stat) v env_k co_m fs end
-simplTermInCommand env_v (Compute ty c) env_k co_m fs end
+        -> simplTermInCommand (env_v `setStaticPart` stat) v co_m fs end
+simplTermInCommand env_v (Compute ty c) co_m fs end
   = do
-    env_v' <- simplKontBind env_v ty env_k (Kont (co_m `consCastMaybe` fs) end)
-    simplCommand env_v' c
-simplTermInCommand env_v v env_k co_m (Cast co' : fs) end
-  = simplTermInCommand env_v v env_k (combineCo co_m co') fs end
-simplTermInCommand env_v v@(Coercion co) env_k co_m fs end
-  = simplTermInCommandDone env_v v' env_k Nothing fs end
+    let (env_v', _) = env_v `enterKontScope` ty
+        fs'         | Just co <- co_m
+                    = Simplified NoDup Nothing (Cast co) : fs
+                    | otherwise = fs
+        env_c       = env_v' `setRetKont` SynKont { mk_dup    = NoDup
+                                                  , mk_frames = fs'
+                                                  , mk_end    = end }
+    simplCommand env_c c
+simplTermInCommand env_v v co_m (f : fs) end
+  | (env', Cast co) <- openScoped env_v f
+  = simplTermInCommand env_v v (combineCo co_m (substCo env' co)) fs end
+simplTermInCommand env_v v@(Coercion co) co_m fs end
+  = simplTermInCommandDone env_v v' Nothing fs end
   where
     v' = case co_m of
            Just co' -> Coercion (mkCoCast co co')
@@ -821,10 +866,11 @@ simplTermInCommand env_v v@(Coercion co) env_k co_m fs end
 -- cost attribution slightly (moving the allocation of the
 -- lambda elsewhere), but we don't care: optimisation changes
 -- cost attribution all the time. (comment from Simplify.simplLam)
-simplTermInCommand env_v v@(Lam {}) env_k co_m (Tick ti : fs) end
-  | not (tickishCounts ti)
-  = simplTermInCommand env_v v env_k co_m fs end
-simplTermInCommand env_v (Lam x body) env_k co_m (App arg : fs) end
+simplTermInCommand env_v v@(Lam x body) co_m (f : fs) end
+  | Tick ti <- f'
+  , not (tickishCounts ti)
+  = simplTermInCommand env_v v co_m fs end
+  | App arg <- f'
   = do
     tick (BetaReduction x)
     let (arg', co_m') | Just co <- co_m = let Just (arg', co') = castApp arg co
@@ -832,64 +878,79 @@ simplTermInCommand env_v (Lam x body) env_k co_m (App arg : fs) end
                                             -- have function/forall type
                                           in (arg', Just co')
                       | otherwise       = (arg, Nothing)
-    env_v' <- simplNonRec env_v x env_k (Left arg') NotTopLevel
-    simplTermInCommand env_v' body env_k co_m' fs end
-simplTermInCommand env_v term@(Lam {}) env_k co_m fs end
+    env_v' <- simplNonRec env_v x (staticPart env_k) (Left arg') NotTopLevel
+    simplTermInCommand env_v' body co_m' fs end
+  where
+    (env_k, f') = openScoped env_v f
+simplTermInCommand env_v term@(Lam {}) co_m fs end
   = do
     let (xs, body) = lambdas term
         (env_v', xs') = enterLamScopes env_v xs
     body' <- simplTermNoFloats env_v' body
-    simplTermInCommandDone env_v (mkLambdas xs' body') env_k co_m fs end
-simplTermInCommand env_v term@(Lit {}) env_k co_m fs end
-  = simplTermInCommandDone env_v term env_k co_m fs end
+    simplTermInCommandDone env_v (mkLambdas xs' body') co_m fs end
+simplTermInCommand env_v term@(Lit {}) co_m fs end
+  = simplTermInCommandDone env_v term co_m fs end
 
-simplTermInCommandDone :: SimplEnv -> OutTerm
-                       -> StaticEnv -> Maybe InCoercion -> [InFrame] -> InEnd
+simplTermInCommandDone :: SimplEnv -> OutTerm -> Maybe SubstedCoercion
+                       -> [ScopedFrame] -> ScopedEnd
                        -> SimplM (SimplEnv, OutCommand)
-simplTermInCommandDone env_v v env_k co_m fs end
-  = simplKont env (mkArgInfo env v co_m' fs) fs end
-  where
-    env = env_k `inDynamicScope` env_v
-    -- The ArgInfo needs an OutCoercion, so we have to substitute now
-    co_m' = substCo env <$> co_m
 
-simplKont :: SimplEnv -> ArgInfo -> [InFrame] -> InEnd -> SimplM (SimplEnv, OutCommand)
+simplTermInCommandDone env_v v co_m fs end
+  = simplKont env_v (mkArgInfo env_v v co_m fs) fs end
+
+simplKont :: SimplEnv -> ArgInfo
+          -> [ScopedFrame] -> ScopedEnd
+          -> SimplM (SimplEnv, OutCommand)
 simplKont env ai fs end
   | tracing
   , pprTraceShort "simplKont" (
-      ppr env $$ ppr ai $$ ppr (Kont fs end)
+      ppr env $$ ppr ai $$ pprMultiScopedKont fs end
     ) False
   = undefined
-simplKont env ai (Cast co : fs) end
+simplKont env (ai@ArgInfo { ai_strs = [] }) fs end
+  -- We've run out of strictness arguments, meaning the call is definitely bottom
+  | not (null fs && isReturn (unScope end)) -- Don't bother throwing away a trivial continuation
+  = simplKontDone env ai (Case (mkWildValBinder ty) [])
+  where
+    ty = termType (argInfoToTerm ai)
+simplKont env ai (Simplified _ _ f : fs) end
+  = simplKont env (addFrameToArgInfo ai f) fs end
+simplKont env ai (f : fs) end
+  = case openScoped env f of
+      (env', f') -> simplKontFrame env' ai f' fs end
+simplKont env ai [] end
+  = case openScoped env end of
+      (env', end') -> simplKontEnd env' ai end'
+
+simplKontFrame :: SimplEnv -> ArgInfo
+               -> InFrame -> [ScopedFrame] -> ScopedEnd
+               -> SimplM (SimplEnv, OutCommand)
+simplKontFrame env ai (Cast co) fs end
   = simplKont env (ai { ai_co = ai_co ai `combineCo` substCo env co }) fs end
-simplKont env ai fs@(App _ : _) end
+simplKontFrame env ai f@(App _) fs end
   | Just co <- ai_co ai
   , let Pair fromTy _toTy = coercionKind co
   , Nothing <- splitFunTy_maybe fromTy
   , Nothing <- splitForAllTy_maybe fromTy
   -- Can't push the cast after the arguments, so eat it
-  = simplKont env (swallowCoercion ai) fs end
-simplKont env ai (App (Type tyArg) : fs) end
+  = simplKontFrame env (swallowCoercion ai) f fs end
+simplKontFrame env ai (App (Type tyArg)) fs end
   = do
     let ty' = substTy env tyArg
     simplKont env (addFrameToArgInfo ai (App (Type ty'))) fs end
-simplKont env (ai@ArgInfo { ai_strs = [] }) fs end
-  -- We've run out of strictness arguments, meaning the call is definitely bottom
-  | not (null fs && isReturn end) -- Don't bother throwing away a trivial continuation
-  = simplKontDone env ai (Case (mkWildValBinder ty) [])
-  where
-    ty = termType (argInfoToTerm ai)
-simplKont _ (ArgInfo { ai_discs = [] }) _ _
-  = pprPanic "simplKont" (text "out of discounts??")
-simplKont env ai@(ArgInfo { ai_strs = str:strs
-                          , ai_discs = disc:discs }) (App arg : fs) end
+simplKontFrame _ (ArgInfo { ai_discs = [] }) _ _ _
+  = pprPanic "simplKontFrame" (text "out of discounts??")
+simplKontFrame _ (ArgInfo { ai_strs = [] }) _ _ _
+  = pprPanic "simplKontFrame" (text "should have dealt with bottom already")
+simplKontFrame env ai@(ArgInfo { ai_strs = str:strs
+                               , ai_discs = disc:discs }) (App arg) fs end
   | str
   = do
     -- Push the current evaluation state into the environment as a
     -- meta-continuation. We'll continue with the rest of the frames when we
     -- finish simplifying the term. This, of course, reflects left-to-right
     -- call-by-value evaluation.
-    let mk = StrictArg { mk_state = SuspKont (staticPart env)
+    let mk = StrictArg { mk_dup = NoDup
                        , mk_argInfo = ai'
                        , mk_frames = fs
                        , mk_end = end }
@@ -903,34 +964,32 @@ simplKont env ai@(ArgInfo { ai_strs = str:strs
     simplKont env (addFrameToArgInfo ai' (App arg_final)) fs end
   where
     ai' = ai { ai_strs = strs, ai_discs = discs }
-simplKont env ai (f@(Tick _) : fs) end
+simplKontFrame env ai (f@(Tick _)) fs end
   -- FIXME Tick handling is actually rather delicate! In fact, we should
   -- (somehow) be putting a float barrier here (see Simplify.simplTick).
   = simplKont env (addFrameToArgInfo ai f) fs end
-simplKont env ai [] Return
-  -- If the metacontinuation will only provide more arguments, then we should run
-  -- it immediately rather than swallowing the coercion and applying rules now.
-  | Just (SynKont {}) <- substKv env
-  = invokeMetaKont env ai
-simplKont env ai@(ArgInfo { ai_co = Just _ }) [] end
-  = simplKont env (swallowCoercion ai) [] end
+
+simplKontEnd :: SimplEnv -> ArgInfo
+             -> InEnd
+             -> SimplM (SimplEnv, OutCommand)
+simplKontEnd env ai@(ArgInfo { ai_co = Just _ }) end
+  = simplKontEnd env (swallowCoercion ai) end
 -- From now on, no coercion
-simplKont env ai@(ArgInfo { ai_term = Var fun, ai_rules = rules }) [] end
+simplKontEnd env ai@(ArgInfo { ai_term = Var fun, ai_rules = rules }) end
   | not (null rules)
   = do
-    let (args, fs') = argInfoSpanArgs ai
+    let (args, extraFrames) = argInfoSpanArgs ai
     match_maybe <- tryRules env rules fun args
     case match_maybe of
       Just (ruleRhs, extraArgs) ->
-        -- spliceFrames will save the current environment in the metacontinuation,
-        -- so we're free to zap the subst envs
-        let env' = zapTermSubstEnvs (spliceFrames env (map App extraArgs ++ fs') end)
-        in simplTermInCommand env' ruleRhs (staticPart env') Nothing [] Return
+        let simplFrames = map (Simplified NoDup Nothing) (map App extraArgs ++ extraFrames)
+        in simplTermInCommand env ruleRhs Nothing simplFrames (Incoming (staticPart env) end)
       Nothing -> simplKontAfterRules env ai end
-simplKont env ai [] end
+simplKontEnd env ai end
   = simplKontAfterRules env ai end
 
-simplKontAfterRules :: SimplEnv -> ArgInfo -> InEnd
+simplKontAfterRules :: SimplEnv -> ArgInfo
+                    -> InEnd
                     -> SimplM (SimplEnv, OutCommand)
 simplKontAfterRules _ (ArgInfo { ai_co = Just co }) _
   = pprPanic "simplKontAfterRules" (text "Leftover coercion:" <+> ppr co)
@@ -1014,26 +1073,24 @@ simplKontAfterRules env ai (Case x alts)
 simplKontAfterRules env ai Return
   = invokeMetaKont env ai
 
-invokeMetaKont :: SimplEnv -> ArgInfo -> SimplM (SimplEnv, OutCommand)
+invokeMetaKont :: SimplEnv -> ArgInfo
+               -> SimplM (SimplEnv, OutCommand)
 invokeMetaKont env ai
   = case substKv env of
       Nothing
         -> simplKontDone env ai Return
-      Just mk@(SynKont { mk_kont = Kont fs end })
-        -> simplKont (envFrom mk) ai fs end
-      Just mk@(StrictArg { mk_argInfo = ai'
-                         , mk_frames = fs
-                         , mk_end = end })
+      Just (SynKont { mk_frames = fs, mk_end = end })
+        -> warnPprTrace True __FILE__ __LINE__
+             (text "SynKont lasted until invokeMetaKont" $$ ppr env $$ ppr ai) $
+             simplKont env ai fs end
+      Just (StrictArg { mk_argInfo = ai'
+                      , mk_frames = fs
+                      , mk_end = end })
         -> let arg  = argInfoToTerm ai
-               env' = envFrom mk
-           in simplKont env' (addFrameToArgInfo ai' (App arg)) fs end
-      Just mk@(AppendOutFrames { mk_outFrames = fs, mk_end = end })
-        -> let env' = envFrom mk
-           in simplKont env' (addFramesToArgInfo ai fs) [] end
-  where
-    envFrom mk = env `setStaticPartFrom` mk
+           in simplKont env (addFrameToArgInfo ai' (App arg)) fs end
 
-simplKontDone :: SimplEnv -> ArgInfo -> OutEnd -> SimplM (SimplEnv, OutCommand)
+simplKontDone :: SimplEnv -> ArgInfo -> OutEnd
+              -> SimplM (SimplEnv, OutCommand)
 simplKontDone env ai end
   | tracing
   , pprTraceShort "simplKontDone" (ppr env $$ ppr ai $$ ppr end) False
@@ -1041,6 +1098,10 @@ simplKontDone env ai end
   | otherwise
   = return (env, Eval term (Kont (reverse fs) end))
   where ArgInfo { ai_term = term, ai_frames = fs } = swallowCoercion ai
+
+-------------------
+-- Case handling --
+-------------------
 
 simplAlts :: SimplEnv -> OutTerm -> InId -> [InAlt]
           -> SimplM (Maybe OutCoercion, OutId, [OutAlt])
@@ -1168,8 +1229,9 @@ simplJump env args j
            let lone = null args
                -- Pretend to callSiteInline that we're just applying a bunch of
                -- arguments to a function
-               rhs'_maybe = callSiteInline env j' (activeUnfolding env j')
-                                           lone (Kont (map App args) Return)
+               rhs'_maybe = callSiteInline env j' (activeUnfolding env j') lone 
+                                           (map (Incoming (staticPart env) . App) args)
+                                           (Incoming (staticPart env) Return)
           
            case rhs'_maybe of
              Nothing
@@ -1247,13 +1309,6 @@ missingAlt :: SimplEnv -> Id -> [InAlt] -> SimplM (SimplEnv, OutCommand)
 missingAlt env case_bndr _
   = warnPprTrace True __FILE__ __LINE__ ( ptext (sLit "missingAlt") <+> ppr case_bndr )
     return (env, mkImpossibleCommand (retType env))
-
-spliceFrames :: SimplEnv -> [OutFrame] -> InEnd -> SimplEnv
-spliceFrames env [] Return = env
-spliceFrames env frames end
-  = env `setRetKont` AppendOutFrames { mk_state = SuspKont (staticPart env)
-                                     , mk_outFrames = frames
-                                     , mk_end = end }
 
 -------------------
 -- Rewrite rules --
@@ -1443,8 +1498,8 @@ instance Outputable CallCtxt where
   ppr DiscArgCtxt = ptext (sLit "DiscArgCtxt")
   ppr RuleArgCtxt = ptext (sLit "RuleArgCtxt")
 
-callSiteInline :: SimplEnv -> OutId -> Bool -> Bool -> InKont -> Maybe OutRhs
-callSiteInline env id active_unfolding lone_variable kont
+callSiteInline :: SimplEnv -> OutId -> Bool -> Bool -> [ScopedFrame] -> ScopedEnd -> Maybe OutRhs
+callSiteInline env id active_unfolding lone_variable fs end
   = case findDef env id of 
       -- idUnfolding checks for loop-breakers, returning NoUnfolding
       -- Things with an INLINE pragma may have an unfolding *and* 
@@ -1452,7 +1507,7 @@ callSiteInline env id active_unfolding lone_variable kont
       BoundTo { def_rhs = unf_template, def_level = is_top 
               , def_isWorkFree = is_wf,  def_arity = uf_arity
               , def_guidance = guidance, def_isExpandable = is_exp }
-              | active_unfolding -> let (arg_infos, cont_info) = distillKont kont
+              | active_unfolding -> let (arg_infos, cont_info) = distillKont fs end
                                     in tryUnfolding (dynFlags env) id lone_variable
                                         arg_infos cont_info unf_template (isTopLevel is_top)
                                         is_wf is_exp uf_arity guidance
@@ -1464,8 +1519,8 @@ callSiteInline env id active_unfolding lone_variable kont
 -- Impedence mismatch between Sequent Core code and logic from CoreUnfold.
 -- TODO This never generates most of the CallCtxt values. Need to keep track of
 -- more in able to answer more completely.
-distillKont :: InKont -> ([ArgSummary], CallCtxt)
-distillKont (Kont fs end) = (mapMaybe doFrame fs, doEnd end)
+distillKont :: [ScopedFrame] -> ScopedEnd -> ([ArgSummary], CallCtxt)
+distillKont fs end = (mapMaybe (doFrame . unScope) fs, doEnd (unScope end))
   where
     doFrame (App v)    = Just (interestingArg v)
     doFrame _          = Nothing
@@ -1555,15 +1610,13 @@ tryUnfolding dflags id lone_variable
 
 ensureDupableKont :: SimplEnv -> SimplM SimplEnv
 ensureDupableKont env
-  | Just kont <- substKv env
-  , SuspKont stat <- mk_state kont
+  | Just mk <- substKv env
+  , not (canDupMetaKont mk)
   = do
-    (env', kont') <- mkDupableKont (stat `inDynamicScope` zapFloats env) ty kont
-    return $ (env `addFloats` env') `setRetKont` kont'
+    (env', mk') <- mkDupableKont (zapFloats env) (retType env) mk
+    return $ (env `addFloats` env') `setRetKont` mk'
   | otherwise
   = return env
-  where
-    ty = retType env
 
 -- | Make a continuation into something we're okay with duplicating into each
 -- branch of a case (and each branch of those branches, ...), possibly
@@ -1588,77 +1641,79 @@ mkDupableKont env ty kont
     when tracing $ liftCoreM $ putMsg $
       hang (text "mkDupableKont") 4 (ppr env_noFloats $$ ppr ty $$ ppr kont)
     (env', ans) <- case kont of
-      SynKont { mk_kont = Kont fs end }
+      SynKont { mk_frames = fs, mk_end = end }
         -> do
-           (env', kont', mk_m) <- go env_noFloats [] ty fs end
-           return (env', SynKont { mk_state = DupableKont mk_m, mk_kont = kont' })
+           (env', fs', end') <- go env_noFloats [] ty fs end
+           return (env', SynKont { mk_dup = OkToDup
+                                 , mk_frames = map (Simplified OkToDup Nothing) fs'
+                                 , mk_end = end' })
       StrictArg { mk_argInfo = ai
                 , mk_frames  = fs
                 , mk_end     = end }
         -> do
-           (env', Kont fs' end', mk_m) <- go env_noFloats [] ty fs end
+           (env', fs', end') <- go env_noFloats [] ty fs end
            (env'', outFrames) <- mapAccumLM (makeTrivialFrame NotTopLevel) env' (ai_frames ai)
-           return (env'', kont { mk_state   = DupableKont mk_m
+           return (env'', kont { mk_dup     = OkToDup
                                , mk_argInfo = ai { ai_frames = outFrames }
-                               , mk_frames  = fs'
+                               , mk_frames  = map (Simplified OkToDup Nothing) fs'
                                , mk_end     = end' })
-      AppendOutFrames { mk_outFrames = outFrames, mk_end = end }
-        -> do
-           (env', Kont newOutFrames end', mk_m) <- go env_noFloats [] ty [] end
-           (env'', outFrames') <- mapAccumLM (makeTrivialFrame NotTopLevel) env' outFrames
-           return (env'', AppendOutFrames { mk_state     = DupableKont mk_m
-                                          , mk_outFrames = outFrames' ++ newOutFrames
-                                          , mk_end       = end' })
-           
     when tracing $ liftCoreM $ putMsg $ hang (text "mkDupableKont DONE") 4 $
       ppr ans $$ vcat (map ppr (getFloatBinds (getFloats env')))
     return (env `addFloats` env', ans)
   where
-    go :: SimplEnv -> RevList OutFrame -> OutType -> [InFrame] -> InEnd
-       -> SimplM (SimplEnv, OutKont, Maybe MetaKont)
-    go env fs' ty [] Return
-      = case substKv env of
-          Nothing                -> done env fs' Return Nothing
-          Just mk                 | canDupMetaKont mk
-                                 -> done env fs' Return (Just mk)
-          Just (mk@SynKont {})   -> do
-                                    let env' = env `setStaticPartFrom` mk
-                                        Kont fs end = mk_kont mk
-                                    go env' fs' ty fs end
-          Just (mk@StrictArg { mk_argInfo = ai }) -> do
-                                    let env' = env `setStaticPartFrom` mk
-                                        ty'  = funResultTy (termType (argInfoToTerm ai))
-                                    (env'', mk') <- mkDupableKont env' ty' mk
-                                    done env'' fs' Return (Just mk')
-          Just (mk@AppendOutFrames { mk_outFrames = frames, mk_end = end }) -> do
-                                    let env' = env `setStaticPartFrom` mk
-                                    (env'', frames') <- mapAccumLM (makeTrivialFrame NotTopLevel) env' frames
-                                    go env'' (reverse frames' ++ fs') (applyTypeToFrames ty frames') [] end
+    go :: SimplEnv -> RevList OutFrame -> OutType
+       -> [ScopedFrame] -> ScopedEnd
+       -> SimplM (SimplEnv, [OutFrame], ScopedEnd)
+    go env fs' ty (f : fs) end
+      = case openScoped env f of
+          (env', f') -> doFrame env' fs' ty f' f fs end
+    go env fs' ty [] end
+      = case openScoped env end of
+          (env', end') -> doEnd env' fs' ty end' end
     
-    go env fs' _ty (Cast co : fs) end
+    doFrame :: SimplEnv -> RevList OutFrame -> OutType
+            -> InFrame -> ScopedFrame -> [ScopedFrame] -> ScopedEnd
+            -> SimplM (SimplEnv, [OutFrame], ScopedEnd)
+    doFrame env fs' _ty (Cast co) _ fs end
       = let co' = simplCoercion env co
         in go env (Cast co' : fs') (pSnd (coercionKind co')) fs end
     
-    go env fs' ty fs@(Tick {} : _) end
-      = split env fs' ty fs end (fsLit "*tickj")
+    doFrame env fs' ty (Tick {}) f_orig fs end
+      = split env fs' ty (f_orig : fs) end (fsLit "*tickj")
     
-    go env fs' ty (App (Type tyArg) : fs) end
+    doFrame env fs' ty (App (Type tyArg)) _ fs end
       = let tyArg' = substTy env tyArg
             ty'    = applyTy ty  tyArg'
         in go env (App (Type tyArg') : fs') ty' fs end
     
-    go env fs' ty (App arg : fs) end
+    doFrame env fs' ty (App arg) _ fs end
       = do
         (env', arg') <- mkDupableTerm env arg
         go env' (App arg' : fs') (funResultTy ty) fs end
 
+    doEnd :: SimplEnv -> RevList OutFrame -> OutType
+          -> InEnd -> ScopedEnd
+          -> SimplM (SimplEnv, [OutFrame], ScopedEnd)
+    doEnd env fs' ty Return _
+      = case substKv env of
+          Nothing                -> done env fs' (Simplified OkToDup Nothing Return)
+          Just mk                 | canDupMetaKont mk
+                                 -> done env fs' (Simplified OkToDup (Just mk) Return)
+          Just (SynKont { mk_frames = fs, mk_end = end })
+                                 -> go env fs' ty fs end
+          Just (mk@StrictArg { mk_argInfo = ai })
+                                 -> do
+                                    let ty'  = funResultTy (termType (argInfoToTerm ai))
+                                    (env', mk') <- mkDupableKont env ty' mk
+                                    done env' fs' (Simplified OkToDup (Just mk') Return)
+    
     -- Don't duplicate seq (see Note [Single-alternative cases] in GHC Simplify.lhs)
-    go env fs' ty [] end@(Case caseBndr [Alt _altCon bndrs _rhs])
+    doEnd env fs' ty (Case caseBndr [Alt _altCon bndrs _rhs]) end_orig
       | all isDeadBinder bndrs
       , not (isUnLiftedType (idType caseBndr))
-      = split env fs' ty [] end (fsLit "*seqj")
+      = split env fs' ty [] end_orig (fsLit "*seqj")
 
-    go env fs' _ty [] (Case caseBndr alts)
+    doEnd env fs' _ty (Case caseBndr alts) _
       -- This is dual to the App case: We have several branches and we want to
       -- bind each to a join point.
       = do
@@ -1672,10 +1727,11 @@ mkDupableKont env ty kont
         alts' <- mapM (simplAlt altEnv Nothing [] caseBndr') alts
         (env', alts'') <- mkDupableAlts env caseBndr' alts'
         
-        done env' fs' (Case caseBndr' alts'') Nothing
-        
-    split :: SimplEnv -> RevList OutFrame -> Type -> [InFrame] -> InEnd -> FastString
-          -> SimplM (SimplEnv, OutKont, Maybe MetaKont)
+        done env' fs' (Simplified OkToDup Nothing (Case caseBndr' alts''))
+
+    split :: SimplEnv -> RevList OutFrame -> Type -> [ScopedFrame] -> ScopedEnd
+          -> FastString
+          -> SimplM (SimplEnv, [OutFrame], ScopedEnd)
     split env fs' ty fs end name
         -- XXX This is a bit ugly, but it is currently the only way to split a
         -- non-parameterized continuation in two:
@@ -1689,15 +1745,18 @@ mkDupableKont env ty kont
         let kontTy = mkKontTy (mkTupleTy UnboxedTuple [ty])
         (env', j) <- mkFreshVar env name kontTy
         let (env'', x) = enterScope env' (mkKontArgId ty)
-            join_rhs  = PKont [x] (Eval (Var x) (Kont fs end))
+            env_rhs   = env'' `setRetKont` SynKont { mk_frames = fs
+                                                   , mk_end    = end
+                                                   , mk_dup    = NoDup }
+            join_rhs  = PKont [x] (Eval (Var x) (Kont [] Return))
             join_kont = Case x [Alt DEFAULT [] (Jump [Var x] j)]
-        env_final <- simplPKontBind env'' j j (staticPart env'') join_rhs NonRecursive
+        env_final <- simplPKontBind env'' j j (staticPart env_rhs) join_rhs NonRecursive
         
-        done env_final fs' join_kont Nothing
+        done env_final fs' (Simplified OkToDup Nothing join_kont)
     
-    done :: SimplEnv -> RevList OutFrame -> OutEnd -> Maybe MetaKont
-         -> SimplM (SimplEnv, OutKont, Maybe MetaKont)
-    done env fs end mk_m = return (env, Kont (reverse fs) end, mk_m)
+    done :: SimplEnv -> RevList OutFrame -> ScopedEnd
+         -> SimplM (SimplEnv, [OutFrame], ScopedEnd)
+    done env fs end = return (env, reverse fs, end)
     
 mkDupableTerm :: SimplEnv -> InTerm
                         -> SimplM (SimplEnv, OutTerm)

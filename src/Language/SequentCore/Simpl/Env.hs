@@ -1,11 +1,13 @@
-{-# LANGUAGE ViewPatterns, BangPatterns, CPP #-}
+{-# LANGUAGE ViewPatterns, BangPatterns, ImpredicativeTypes, CPP #-}
 
 module Language.SequentCore.Simpl.Env (
+  -- * Simplifier context
   SimplEnv,
   initialEnv, getMode, updMode, dynFlags, getSimplRules, getFamEnvs,
   getUnfoldingInRuleMatch, activeRule, getInScopeSet,
   
-  SimplIdSubst, SubstAns(..),
+  -- * Substitution and lexical scope
+  SubstAns(..), KontSubst,
   substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar, lookupRecBndr,
   substTerm, substKont, substFrame, substEnd, substPKont, substCommand,
   retType,
@@ -16,31 +18,44 @@ module Language.SequentCore.Simpl.Env (
   getTvSubst, getCvSubst,
   zapSubstEnvs, zapTermSubstEnvs,
   
+  -- * Extracting the part of the context carrying lexically scoped information
   StaticEnv,
   staticPart, setStaticPart, inDynamicScope,
   zapSubstEnvsStatic,
   
-  MetaKont(..), KontState(..),
-  canDupMetaKont, setStaticPartFrom,
+  -- * Objects with lexical scope information attached
+  Scoped(..), DupFlag(..),
+  ScopedFrame, ScopedEnd,
+  openScoped, decompScoped, unScope,
+  okToDup,
+  pprMultiScopedKont,
   
+  -- * Generalized notion of continuation
+  MetaKont(..),
+  canDupMetaKont,
+  
+  -- * Sequent Core definitions (unfoldings) of identifiers
   IdDefEnv, Definition(..), Guidance(..),
   mkBoundTo, mkBoundToWithGuidance, mkBoundToDFun, inlineBoringOk, mkDef,
   findDef, setDef, activeUnfolding,
   defIsCheap, defIsConLike, defIsEvald, defIsSmallEnoughToInline, defIsStable,
   
+  -- * Definitions floating outward
   Floats,
   emptyFloats, addNonRecFloat, addRecFloats, zapFloats, zapKontFloats,
   mapFloats, extendFloats, addFloats, wrapFloats, wrapKontFloats, wrapFloatsAroundTerm,
   isEmptyFloats, hasNoKontFloats,
   doFloatFromRhs, getFloatBinds, getFloats,
   
-  InCommand, InTerm, InArg, InKont, InFrame, InEnd, InPKont,
+  -- * Type synonyms distinguishing incoming (unsubstituted) syntax from outgoing
+  In, InCommand, InTerm, InArg, InKont, InFrame, InEnd, InPKont,
   InAlt, InBind, InBndr, InBindPair, InRhs, InValue,
   InType, InCoercion, InId, InPKontId, InVar, InTyVar, InCoVar,
-  OutCommand, OutTerm, OutArg, OutKont, OutFrame, OutEnd, OutPKont,
+  Out, OutCommand, OutTerm, OutArg, OutKont, OutFrame, OutEnd, OutPKont,
   OutAlt, OutBind, OutBndr, OutBindPair, OutRhs, OutValue,
   OutType, OutCoercion, OutId, OutPKontId, OutVar, OutTyVar, OutCoVar,
   
+  -- * Term information
   termIsHNF, termIsConLike, termIsConApp_maybe
 ) where
 
@@ -92,6 +107,7 @@ import Var
 import VarEnv
 import VarSet
 
+import Control.Applicative ( (<$>) )
 import Control.Exception   ( assert )
 import Data.List           ( mapAccumL )
 
@@ -109,7 +125,7 @@ data SimplEnv
                 , se_tvSubst :: TvSubstEnv     -- InTyVar   |--> OutType
                 , se_cvSubst :: CvSubstEnv     -- InCoVar   |--> OutCoercion
                 , se_retTy   :: Maybe OutType
-                , se_retKont :: Maybe MetaKont
+                , se_retKont :: KontSubst      -- ()        |--> Scoped MetaKont (in/out)
                 --  ^^^ static part ^^^  --
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
                 , se_defs    :: IdDefEnv       -- OutId     |--> Definition (out)
@@ -128,32 +144,140 @@ type SimplIdSubst  = SimplSubst SeqCoreTerm
 type SimplPvSubst  = SimplSubst SeqCorePKont
 type TermSubstAns  = SubstAns SeqCoreTerm
 type PKontSubstAns = SubstAns SeqCorePKont
+type KontSubst     = Maybe MetaKont
 
--- The MetaKont type is intimately connected with Simpl.simplKont; a MetaKont
--- is, to a first approximation, a defunctionalized continuation that will be
--- "invoked" by simplKont when it hits a Return. The other consumer is
--- mkDupableKont, which (among other things) picks through the terms in the
--- MetaKont and runs makeTrivial on each of them.
-data MetaKont = SynKont  { mk_state :: KontState
-                         , mk_kont  :: InKont } -- or OutKont if dupable
-              | StrictArg { mk_state   :: KontState
-                          , mk_argInfo :: ArgInfo
-                          , mk_frames  :: [InFrame] -- or OutFrame if dupable
-                          , mk_end     :: InEnd }   -- or OutEnd if dupable
-              | AppendOutFrames { mk_state     :: KontState
-                                , mk_outFrames :: [OutFrame] -- not necessarily dupable
-                                , mk_end       :: InEnd }    -- or OutEnd if dupable
+{-
 
-data KontState = DupableKont (Maybe MetaKont) -- Invariant: contained MetaKont is dupable
-               | SuspKont StaticEnv
+Note [Metacontinuations]
+------------------------
+
+Sequent Core is a sequent calculus for call-by-name (lazy) evaluation. However,
+much of GHC's optimization effort goes toward selectively applying call-by-value
+(strict) rules instead whenever it is safe to do so. Since call-by-value has
+different evaluation contexts from call-by-name, it has different continuations
+as well. Hence, in order to support both call-by-name and call-by-value, the
+simplifier's concept of a continuation must be made more general than Sequent
+Core itself allows.
+
+For instance, suppose that f is strict in its first argument, v is an arbitrary
+term, and the simplifier is processing this command:
+
+    < f | $ v; $ y; ret >
+
+Say we have simplified f already, so we are now considering the strict argument
+v. Typically, a sequent calculus expresses call-by-value argument evaluation
+like so:
+
+    < f | $ v; $ y; ret > --> < v | bind x. < f | $ x; $ y; ret > >
+
+Here "bind x" means "bind the result to x and perform the following command."
+In this case, we're saying to compute v, producing a value x, then plug x in as
+the first argument to f.
+
+Sequent Core is a restricted grammar, so we cannot actually form the command on
+the right-hand side here. However, the simplifier state does not consist of a
+command alone: We have both a command and an environment. Along with bindings
+for terms, the environment carries a continuation. Hence the simplifier state is
+actually something more like
+
+    < f | $ v; $ y; ret > { k },
+
+where "{ k }" indicates that k is the currently bound continuation. Then we can
+write:
+
+    < f | $ v; $ y; ret > { k } -->
+    < v | ret > { bind x. < f | $ x; $ y; ret > { k } }
+
+Now the expressions in braces are not restricted to be Sequent Core; they can
+include syntax known only to the simplifier. So we say that the simplifier
+state includes a *metacontinuation,* sometimes known as a *semantic
+continuation.* The metacontinuation for a strict argument is exactly the
+StrictArg form in the MetaKont datatype.
+
+-}
+
+data MetaKont = SynKont { mk_frames :: [ScopedFrame]
+                        , mk_end    :: ScopedEnd
+                        , mk_dup    :: !DupFlag }
+              | StrictArg { mk_argInfo :: ArgInfo
+                          , mk_frames  :: [ScopedFrame]
+                          , mk_end     :: ScopedEnd
+                          , mk_dup     :: !DupFlag }
 
 canDupMetaKont :: MetaKont -> Bool
-canDupMetaKont mk = case mk_state mk of { DupableKont _ -> True; _ -> False }
+canDupMetaKont = (== OkToDup) . mk_dup
 
-setStaticPartFrom :: SimplEnv -> MetaKont -> SimplEnv
-setStaticPartFrom env mk
-  = case mk_state mk of DupableKont mk_m -> (zapSubstEnvs env) { se_retKont = mk_m }
-                        SuspKont stat    -> env `setStaticPart` stat
+---------------------
+-- Lexical scoping --
+---------------------
+
+{-
+
+Note [Scoped values]
+~~~~~~~~~~~~~~~~~~~~
+
+A value of type Scoped t is a closure over t - that is, a t together with
+information about the names bound in its lexical scope. It's useful to have
+scoped types so that we can mix together objects from different scopes, even
+some that have already been simplified.
+
+A scoped value can be in two different states:
+
+  - Incoming: This is a value that has not yet been seen by the simplifier. We
+    need to keep around the environment under which it needs to be simplified.
+  
+  - Simplified: This is a value that has already been simplified. It may in
+    addition be *duplicable*; mkDupableKont is in charge of putting values in
+    the duplicable state. In either case, as term substitution has already been
+    performed, most of the static environment is no longer needed.
+    
+One further wrinkle is metacontinuations (see Note [Metacontinuations]). Most of
+the bindings carried in the environment can be substituted directly into a
+Sequent Core expression, but a metacontinuation cannot in general. Hence even a
+fully-simplified expression isn't necessarily "closed," and so a Simplified
+value carries a Scoped MetaKont as its one remaining piece of context.
+
+-}
+
+-- TODO This is almost the same as SubstAns. Do we need both?
+data Scoped a = Incoming           StaticEnv (In  a)
+              | Simplified DupFlag KontSubst (Out a)
+data DupFlag = NoDup | OkToDup
+  deriving (Eq)
+
+type ScopedFrame = Scoped SeqCoreFrame
+type ScopedEnd = Scoped SeqCoreEnd
+
+openScoped :: SimplEnv -> Scoped a -> (SimplEnv, In a)
+openScoped env scoped
+  = case scoped of
+      Incoming     stat a -> (env `setStaticPart` stat, a)
+      Simplified _ mk   a -> (zapSubstEnvs env `setKontSubst` mk, a)
+
+-- | Decompose a scoped term into the term and its scope, represented as a
+-- partially applied constructor for Scoped. Useful for copying an expression's
+-- scope into its subexpressions:
+--     case decompScoped cont of
+--       (scope, Kont fs end) -> (map scope fs, scope end) }
+decompScoped :: Scoped a -> (forall b. b -> Scoped b, a)
+decompScoped scoped
+  = case scoped of
+      Incoming       stat a -> (Incoming stat,     a)
+      Simplified dup mk   a -> (Simplified dup mk, a)
+
+unScope :: Scoped a -> a
+unScope scoped
+  = case scoped of
+      Incoming   _ a   -> a
+      Simplified _ _ a -> a
+
+okToDup :: Scoped a -> Bool
+okToDup (Simplified OkToDup _ _) = True
+okToDup _                        = False
+
+-----------------
+-- Definitions --
+-----------------
 
 -- The original simplifier uses the IdDetails stored in a Var to store unfolding
 -- info. We store similar data externally instead. (This is based on the Secrets
@@ -288,6 +412,10 @@ uncondInline rhs arity size
   | arity > 0 = size <= 10 * (arity + 1)
   | otherwise = isTrivialRhs rhs
 
+------------------
+-- In/Out Types --
+------------------
+
 type In a       = a
 type InCommand  = SeqCoreCommand
 type InTerm     = SeqCoreTerm
@@ -331,6 +459,10 @@ type OutPKontId = PKontId
 type OutVar     = Var
 type OutTyVar   = TyVar
 type OutCoVar   = CoVar
+
+-----------------
+-- Environment --
+-----------------
 
 initialEnv :: DynFlags -> SimplifierMode -> RuleBase -> (FamInstEnv, FamInstEnv)
            -> SimplEnv
@@ -728,12 +860,19 @@ setRetKont :: SimplEnv -> MetaKont -> SimplEnv
 setRetKont env mk
   = env { se_retKont = Just mk }
 
+setKontSubst :: SimplEnv -> KontSubst -> SimplEnv
+setKontSubst env mk_m
+  = env { se_retKont = mk_m }
+
 pushKont :: SimplEnv -> InKont -> SimplEnv
-pushKont env kont
+pushKont env (Kont frames end)
   -- Since invoking this metacontinuation will restore the current environment,
   -- the original metacontinuation will run after this one.
-  = env `setRetKont` SynKont { mk_state = SuspKont (staticPart env)
-                             , mk_kont  = kont }
+  = env `setRetKont` (SynKont { mk_frames = Incoming stat <$> frames
+                              , mk_end    = Incoming stat end
+                              , mk_dup    = NoDup })
+  where
+    stat = staticPart env
 
 zapSubstEnvs :: SimplEnv -> SimplEnv
 zapSubstEnvs env
@@ -785,6 +924,10 @@ inDynamicScope = flip setStaticPart
 zapSubstEnvsStatic :: StaticEnv -> StaticEnv
 zapSubstEnvsStatic (StaticEnv env)
   = StaticEnv $ zapSubstEnvs env
+
+------------
+-- Floats --
+------------
 
 -- See [Simplifier floats] in SimplEnv
 
@@ -972,6 +1115,10 @@ isEmptyFloats = isNilOL . floatBinds . se_floats
 hasNoKontFloats :: SimplEnv -> Bool
 hasNoKontFloats = foldrOL (&&) True . mapOL (all bindsTerm . flattenBind)
                                     . floatBinds . se_floats
+
+-----------------------------
+-- Definitions (continued) --
+-----------------------------
 
 findDefBy :: SimplEnv -> OutId -> (Id -> Unfolding) -> Definition
 findDefBy env var id_unf
@@ -1327,6 +1474,13 @@ termIsConApp_maybe env id_unf term
     mkTransCoMaybe co_m1 Nothing         = co_m1
     mkTransCoMaybe (Just co1) (Just co2) = Just (mkTransCo co1 co2)
 
+----------------
+-- Outputable --
+----------------
+
+pprMultiScopedKont :: [ScopedFrame] -> ScopedEnd -> SDoc
+pprMultiScopedKont frames end = sep $ punctuate semi (map ppr frames ++ [ppr end])
+
 instance Outputable SimplEnv where
   ppr env
     =  text "<InScope =" <+> braces (fsep (map ppr (varEnvElts (getInScopeVars (se_inScope env)))))
@@ -1355,36 +1509,16 @@ instance Outputable StaticEnv where
 instance Outputable a => Outputable (SubstAns a) where
   ppr (Done v) = brackets (text "Done:" <+> ppr v)
   ppr (DoneId x) = brackets (text "Id:" <+> ppr x)
-  ppr (Susp {}) = text "Suspended"
---  ppr (Susp _env v)
---    = brackets $ hang (text "Suspended:") 2 (ppr v)
-
-instance Outputable KontState where
-  ppr (DupableKont mk_m) = text "ok to dup" <+> ppWhen (isJust mk_m) (text "(cascades)")
-  ppr (SuspKont {})      = text "suspended"
-
-pprOkDup :: Maybe MetaKont -> SDoc
-pprOkDup mk_m = parens (text "ok to dup" <> ppWhen (isJust mk_m)
-                                     (comma <+> text "cascades"))
+  ppr (Susp _env v) = brackets $ hang (text "Suspended:") 2 (pprDeeper (ppr v))
 
 instance Outputable MetaKont where
-  ppr (SynKont { mk_state = DupableKont mk_m, mk_kont = kont })
-    = pprOkDup mk_m <+> ppr kont
-  ppr (SynKont {})
-    = text "<suspended syntax>"
-  ppr (StrictArg { mk_state = DupableKont mk_m
-                 , mk_argInfo = ai
+  ppr (SynKont { mk_frames = frames, mk_end = end })
+    = pprMultiScopedKont frames end
+  ppr (StrictArg { mk_argInfo = ai
                  , mk_frames = fs
                  , mk_end = end })
-    = hang (text "Strict argument to:" <+> pprOkDup mk_m) 2 (ppr ai $$ ppr (Kont fs end))
-  ppr (StrictArg {})
-    = text "<strict argument>"
-  ppr (AppendOutFrames { mk_state = DupableKont mk_m
-                       , mk_outFrames = fs
-                       , mk_end = end })
-    = hang (text "Append simplified frames:" <+> pprOkDup mk_m) 2 (ppr (Kont fs end))
-  ppr (AppendOutFrames {})
-    = text "<append simplified frames>"
+    = hang (text "Strict argument to:") 2 $ pprDeeper $
+        ppr ai $$ pprMultiScopedKont fs end
 
 instance Outputable Definition where
   ppr (BoundTo { def_rhs = rhs, def_src = src, def_level = level, def_guidance = guid,
@@ -1392,7 +1526,8 @@ instance Outputable Definition where
                  def_isExpandable = ex })
     = sep [brackets (fsep [ppr level, ppr src, ppr guid, ppWhen cl (text "ConLike"),
                            ppWhen wf (text "WorkFree"), ppWhen vl (text "Value"),
-                           ppWhen ex (text "Expandable")]), pprEither rhs]
+                           ppWhen ex (text "Expandable")]),
+                           pprDeeper (pprEither rhs)]
   ppr (BoundToDFun bndrs con args)
     = char '\\' <+> hsep (map ppr bndrs) <+> arrow <+> ppr con <+> hsep (map (parens . ppr) args)
   ppr (NotAmong alts) = text "NotAmong" <+> ppr alts
@@ -1401,6 +1536,14 @@ instance Outputable Definition where
 pprEither :: (Outputable a, Outputable b) => Either a b -> SDoc
 pprEither (Left x)  = ppr x
 pprEither (Right x) = ppr x
+
+instance Outputable a => Outputable (Scoped a) where
+  ppr (Incoming _ a) = text "<incoming>" <+> ppr a
+  ppr (Simplified _ dup a) = ppr dup <+> ppr a
+
+instance Outputable DupFlag where
+  ppr OkToDup = text "<ok to dup>"
+  ppr NoDup   = text "<no dup>"
 
 instance Outputable Guidance where
   ppr Never = text "Never"

@@ -5,7 +5,7 @@ module Language.SequentCore.Simpl.Util (
   linting, dumping, tracing, traceTicks,
 
   -- * State of argument processing
-  RevList, ArgInfo(..),
+  RevList, SubstedCoercion, ArgInfo(..),
   mkArgInfo, addFrameToArgInfo, addFramesToArgInfo, swallowCoercion,
   argInfoToTerm, argInfoSpanArgs,
   
@@ -63,13 +63,13 @@ linting    = True
 -------------
 
 type RevList a = [a]
+type SubstedCoercion = OutCoercion -- Substituted but not optimized
 
 data ArgInfo
   = ArgInfo {
         ai_term   :: OutTerm,    -- The function (or possibly a literal)
         ai_frames :: RevList OutFrame, -- ...applied to these args/casts (which are in *reverse* order)
-        ai_co     :: Maybe OutCoercion, -- Last coercion applied; not yet added to ai_frames
-                                        -- Coercion is substed but *not* optimized yet
+        ai_co     :: Maybe SubstedCoercion, -- Last coercion applied; not yet added to ai_frames
         ai_rules  :: [CoreRule], -- Rules for this function
         ai_encl   :: Bool,       -- Flag saying whether this function
                                  -- or an enclosing one has rules (recursively)
@@ -80,26 +80,29 @@ data ArgInfo
                                  --   Usually infinite, but if it is finite it guarantees
                                  --   that the function diverges after being given
                                  --   that number of args
-        ai_discs  :: [Int]       -- Discounts for remaining value arguments; non-zero => be keener to inline
+        ai_discs  :: [Int],      -- Discounts for remaining value arguments; non-zero => be keener to inline
                                  --   Always infinite
+        ai_dup    :: DupFlag
     }
 
-mkArgInfo :: SimplEnv -> OutTerm -> Maybe InCoercion -> [InFrame] -> ArgInfo
+mkArgInfo :: SimplEnv -> OutTerm -> Maybe SubstedCoercion -> [ScopedFrame] -> ArgInfo
 mkArgInfo env term@(Var fun) co_m fs
   | n_val_args < idArity fun            -- Note [Unsaturated functions]
-  = ArgInfo { ai_term = term, ai_frames = [], ai_co = co_m
+  = ArgInfo { ai_term  = term, ai_frames = [], ai_co = co_m
             , ai_rules = rules, ai_encl = False
-            , ai_strs = vanilla_stricts
-            , ai_discs = vanilla_discounts }
+            , ai_strs  = vanilla_stricts
+            , ai_discs = vanilla_discounts
+            , ai_dup   = NoDup }
   | otherwise
-  = ArgInfo { ai_term = term, ai_frames = [], ai_co = co_m
+  = ArgInfo { ai_term  = term, ai_frames = [], ai_co = co_m
             , ai_rules = rules
-            , ai_encl = False -- TODO Implement this when implementing rules
+            , ai_encl  = False -- TODO Implement this when implementing rules
             , ai_strs  = add_type_str fun_ty arg_stricts
-            , ai_discs = arg_discounts }
+            , ai_discs = arg_discounts
+            , ai_dup   = NoDup }
   where
     fun_ty = idType fun
-    n_val_args = count isValueAppFrame fs
+    n_val_args = count (isValueAppFrame . unScope) fs
     rules = getRules (getSimplRules env) fun
 
     vanilla_discounts, arg_discounts :: [Int]
@@ -156,7 +159,8 @@ mkArgInfo _env term co_m _fs
             , ai_rules = [], ai_encl = False
             , ai_strs = repeat False -- Could be [], but applying to a non-function
                                      -- isn't bottom, it's ill-defined!
-            , ai_discs = repeat 0 }
+            , ai_discs = repeat 0
+            , ai_dup = NoDup }
 
 argInfoToTerm :: ArgInfo -> OutTerm
 argInfoToTerm ai = mkComputeEval (ai_term ai') (reverse (ai_frames ai'))
@@ -259,7 +263,7 @@ instance Outputable ArgSummary where
 simplCoercion :: SimplEnv -> InCoercion -> OutCoercion
 simplCoercion env co = optCoercion (getCvSubst env) co
 
-simplOutCoercion :: OutCoercion -> OutCoercion
+simplOutCoercion :: SubstedCoercion -> OutCoercion
 simplOutCoercion co = optCoercion emptyCvSubst co
 
 combineCo :: Maybe OutCoercion -> OutCoercion -> Maybe OutCoercion
@@ -667,11 +671,13 @@ instance Outputable ArgInfo where
   ppr (ArgInfo { ai_term = term
                , ai_frames = fs
                , ai_co = co_m
-               , ai_strs = strs })
+               , ai_strs = strs
+               , ai_dup = dup })
     = hang (text "ArgInfo") 8 $ vcat [ text "Term:" <+> ppr term
-                                     , text "Prev. Frames:" <+> pprWithCommas ppr fs
+                                     , text "Prev. frames:" <+> pprWithCommas ppr fs
                                      , case co_m of Just co -> text "Coercion:" <+> ppr co
                                                     Nothing -> empty
+                                     , ppWhen (dup == OkToDup) $ text "Okay to duplicate"
                                      , strictDoc ]
     where
       strictDoc = case strs of []        -> text "Expression is bottom"
