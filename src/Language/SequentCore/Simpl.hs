@@ -42,6 +42,7 @@ import DataCon
 import Demand      ( StrictSig(..), dmdTypeDepth )
 import DynFlags    ( DynFlags, DumpFlag(..), GeneralFlag(..)
                    , gopt, dopt
+                   , printInfoForUser
                    , ufKeenessFactor, ufUseThreshold )
 import ErrUtils    ( dumpSDoc )
 import FamInstEnv
@@ -55,7 +56,7 @@ import Literal     ( litIsDupable, litIsLifted )
 import Maybes      ( whenIsJust )
 import MkCore      ( mkWildValBinder )
 import MonadUtils
-import Name        ( mkSystemVarName )
+import Name        ( isExternalName, mkSystemVarName )
 import Outputable
 import Pair
 import qualified PprCore as Core
@@ -695,6 +696,7 @@ simplRec env0 pairs0 top_lvl
     go env ((old_bndr, new_bndr, rhs) : pairs)
         = do { env' <- simplRecOrTopPair env old_bndr new_bndr rhs top_lvl Recursive
              ; go env' pairs }
+
 -----------------
 -- Expressions --
 -----------------
@@ -835,6 +837,7 @@ simplTermInCommand env_v (Var x) co_m fs end
              Just (Left term')
                -> do
                   tick (UnfoldingDone x')
+                  dump_inline (dynFlags env_v) term' fs end
                   simplTermInCommand (zapSubstEnvs env_v) term' co_m fs end
              _ -> pprPanic "simplTermInCommand" (ppr x $$ ppr term'_maybe)
       Done v
@@ -843,6 +846,19 @@ simplTermInCommand env_v (Var x) co_m fs end
         -> simplTermInCommand (zapSubstEnvs env_v) v co_m fs end
       Susp stat v
         -> simplTermInCommand (env_v `setStaticPart` stat) v co_m fs end
+  where
+    dump_inline dflags def fs end
+      | not (tracing || dopt Opt_D_dump_inlinings dflags) = return ()
+      | not (tracing || dopt Opt_D_verbose_core2core dflags)
+      = when (isExternalName (idName x)) $
+            liftIO $ printInfoForUser dflags alwaysQualify $
+                sep [text "Inlining done:", nest 4 (ppr x)]
+      | otherwise
+      = liftIO $ printInfoForUser dflags alwaysQualify $
+           sep [text "Inlining done: " <> ppr x,
+                nest 4 (vcat [text "Inlined fn: " <+> nest 2 (ppr def),
+                              text "Cont:  " <+> pprMultiScopedKont fs end])]
+
 simplTermInCommand env_v (Compute ty c) co_m fs end
   = do
     let (env_v', _) = env_v `enterKontScope` ty
@@ -942,8 +958,7 @@ simplKontFrame _ (ArgInfo { ai_discs = [] }) _ _ _
   = pprPanic "simplKontFrame" (text "out of discounts??")
 simplKontFrame _ (ArgInfo { ai_strs = [] }) _ _ _
   = pprPanic "simplKontFrame" (text "should have dealt with bottom already")
-simplKontFrame env ai@(ArgInfo { ai_strs = str:strs
-                               , ai_discs = disc:discs }) (App arg) fs end
+simplKontFrame env ai@(ArgInfo { ai_strs = str:_ }) (App arg) fs end
   | str
   = do
     -- Push the current evaluation state into the environment as a
@@ -951,7 +966,7 @@ simplKontFrame env ai@(ArgInfo { ai_strs = str:strs
     -- finish simplifying the term. This, of course, reflects left-to-right
     -- call-by-value evaluation.
     let mk = StrictArg { mk_dup = NoDup
-                       , mk_argInfo = ai'
+                       , mk_argInfo = ai
                        , mk_frames = fs
                        , mk_end = end }
         (env', _ty') = enterKontScope env (termType arg)
@@ -961,9 +976,7 @@ simplKontFrame env ai@(ArgInfo { ai_strs = str:strs
   = do
     -- Don't float out of lazy arguments (see Simplify.rebuildCall)
     arg_final <- simplTermNoFloats env arg
-    simplKont env (addFrameToArgInfo ai' (App arg_final)) fs end
-  where
-    ai' = ai { ai_strs = strs, ai_discs = discs }
+    simplKont env (addFrameToArgInfo ai (App arg_final)) fs end
 simplKontFrame env ai (f@(Tick _)) fs end
   -- FIXME Tick handling is actually rather delicate! In fact, we should
   -- (somehow) be putting a float barrier here (see Simplify.simplTick).
@@ -1511,7 +1524,8 @@ callSiteInline env id active_unfolding lone_variable fs end
                                     in tryUnfolding (dynFlags env) id lone_variable
                                         arg_infos cont_info unf_template (isTopLevel is_top)
                                         is_wf is_exp uf_arity guidance
-              | tracing
+              | let dflags = dynFlags env
+              , tracing || dopt Opt_D_dump_inlinings dflags && dopt Opt_D_verbose_core2core dflags
               -> pprTrace "Inactive unfolding:" (ppr id) Nothing
               | otherwise -> Nothing
       _       -> Nothing
@@ -1522,7 +1536,8 @@ callSiteInline env id active_unfolding lone_variable fs end
 distillKont :: [ScopedFrame] -> ScopedEnd -> ([ArgSummary], CallCtxt)
 distillKont fs end = (mapMaybe (doFrame . unScope) fs, doEnd (unScope end))
   where
-    doFrame (App v)    = Just (interestingArg v)
+    doFrame (App v)    | not (isTypeArg v)
+                       = Just (interestingArg v)
     doFrame _          = Nothing
     
     doEnd (Return {})  = BoringCtxt
@@ -1652,9 +1667,13 @@ mkDupableKont env ty kont
                 , mk_end     = end }
         -> do
            (env', fs', end') <- go env_noFloats [] ty fs end
-           (env'', outFrames) <- mapAccumLM (makeTrivialFrame NotTopLevel) env' (ai_frames ai)
+           (env'', ai') <- case ai_dup ai of
+             NoDup -> do 
+                      (env'', outFrames) <- mapAccumLM (makeTrivialFrame NotTopLevel) env' (ai_frames ai)
+                      return (env'', ai { ai_frames = outFrames, ai_dup = OkToDup })
+             OkToDup -> return (env', ai)
            return (env'', kont { mk_dup     = OkToDup
-                               , mk_argInfo = ai { ai_frames = outFrames }
+                               , mk_argInfo = ai'
                                , mk_frames  = map (Simplified OkToDup Nothing) fs'
                                , mk_end     = end' })
     when tracing $ liftCoreM $ putMsg $ hang (text "mkDupableKont DONE") 4 $
@@ -1665,6 +1684,9 @@ mkDupableKont env ty kont
        -> [ScopedFrame] -> ScopedEnd
        -> SimplM (SimplEnv, [OutFrame], ScopedEnd)
     go env fs' ty (f : fs) end
+      | Simplified OkToDup _ f' <- f
+      = go env (f' : fs') (frameType ty f') fs end
+      | otherwise
       = case openScoped env f of
           (env', f') -> doFrame env' fs' ty f' f fs end
     go env fs' ty [] end

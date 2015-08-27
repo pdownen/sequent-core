@@ -173,12 +173,22 @@ argInfoToTerm ai = mkComputeEval (ai_term ai') (reverse (ai_frames ai'))
 addFrameToArgInfo :: ArgInfo -> OutFrame -> ArgInfo
 addFrameToArgInfo ai f
   = case f of
-      App arg  | Just co <- ai_co ai
-              -> case castApp arg co of
-                   Just (arg', co') -> ai { ai_frames = App arg' : ai_frames ai
-                                          , ai_co     = Just co' }
-                   Nothing          -> ai' { ai_frames = App arg : ai_frames ai' }
-                     where ai' = swallowCoercion ai
+      App arg ->
+        let -- If we have a coercion, either push it into the arg or swallow it
+            (arg', ai1) | Just co <- ai_co ai
+                        = case castApp arg co of
+                            Just (arg', co') -> (arg', ai { ai_co = Just co' })
+                            Nothing          -> (arg, swallowCoercion ai)
+                        | otherwise
+                        = (arg, ai)
+            -- If the argument is a term, advance ai_strs and ai_discs
+            ai2         | isTypeArg arg
+                        = ai1
+                        | otherwise
+                        = ai1 { ai_strs  = tail (ai_strs ai1)
+                              , ai_discs = tail (ai_discs ai1) }
+            -- Finally, add the (possibly modified) frame
+            in ai2 { ai_frames = App arg' : ai_frames ai2 }
       Cast co -> ai { ai_co = ai_co ai `combineCo` co }
       _       -> ai { ai_frames = f : ai_frames ai }
 
