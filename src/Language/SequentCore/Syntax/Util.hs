@@ -12,13 +12,21 @@ module Language.SequentCore.Syntax.Util (
   cmpAlt, ltAlt, findDefault, findAlt, mergeAlts, trimConArgs, filterAlts,
   
   -- * Size (for stats)
-  seqCoreBindsSize
+  seqCoreBindsSize,
+  
+  -- * Eta-reduction
+  tryEtaReduce,
+  
+  -- * Free variables
+  termFreeVars
 ) where
 
 import Language.SequentCore.Syntax
+import Language.SequentCore.Translate
 
 import Coercion
-import CoreSyn   ( cmpAltCon, Tickish(..) )
+import CoreFVs   ( exprFreeVars )
+import CoreSyn   ( cmpAltCon, isEvaldUnfolding, Tickish(..) )
 import CoreUtils ( dataConRepInstPat )
 import DataCon
 import Id
@@ -27,8 +35,10 @@ import Outputable
 import TyCon
 import Type
 import Unique
-import Util      ( debugIsOn, dropList, filterOut )
+import Util      ( debugIsOn
+                 , count, dropList, filterOut )
 import Var
+import VarSet
 
 import Control.Applicative ( (<$>) )
 import Control.Exception ( assert )
@@ -220,3 +230,82 @@ seqCoreBindsSize = sum . map sizeB
     sizeC (Let b c)     = sizeB b + sizeC c
     sizeC (Jump args j) = j `seq` sum (sizeT <$> args) + 1
     sizeC (Eval v k)    = sizeT v + sizeK k
+
+-------------------
+-- Eta-reduction --
+-------------------
+
+-- (from CoreUtils)
+tryEtaReduce :: [Var] -> SeqCoreTerm -> Maybe SeqCoreTerm
+tryEtaReduce bndrs body@(Compute _ (Eval fun (Kont fs Return)))
+  | ok_fun fun
+  = go bndrs fs (mkReflCo Representational (termType body))
+  where
+    incoming_arity = count isId bndrs
+
+    go :: [Var]            -- Binders, types [a1,a2,a3]
+       -> [SeqCoreFrame]   -- Of type a1 -> a2 -> a3 -> tr
+       -> Coercion         -- Of type tr ~ ts
+       -> Maybe SeqCoreTerm   -- Of type a1 -> a2 -> a3 -> ts
+    -- See Note [Eta reduction with casted arguments]
+    -- for why we have an accumulating coercion
+    go [] [] co
+      | let used_vars = termFreeVars fun `unionVarSet` tyCoVarsOfCo co
+      , not (any (`elemVarSet` used_vars) bndrs)
+      = Just (mkCast fun co)   -- Check for any of the binders free in the result
+                               -- including the accumulated coercion
+
+    go (b : bs) (App arg : fs) co
+      | Just co' <- ok_arg b arg co
+      = go bs fs co'
+    
+    go bs (Cast co' : fs) co
+      = go bs fs (mkTransCo co' co)
+
+    go _ _ _  = Nothing         -- Failure!
+
+    ---------------
+    -- Note [Eta reduction conditions]
+    ok_fun (Var fun_id)        = ok_fun_id fun_id || all ok_lam bndrs
+    ok_fun _fun                = False
+
+    ---------------
+    ok_fun_id fun = fun_arity fun >= incoming_arity
+
+    ---------------
+    fun_arity fun             -- See Note [Arity care]
+       | isLocalId fun
+       , isStrongLoopBreaker (idOccInfo fun) = 0
+       | arity > 0                           = arity
+       | isEvaldUnfolding (idUnfolding fun)  = 1  
+            -- See Note [Eta reduction of an eval'd function]
+       | otherwise                           = 0
+       where
+         arity = idArity fun
+
+    ---------------
+    ok_lam v = isTyVar v || isEvVar v
+
+    ---------------
+    ok_arg :: Var              -- Of type bndr_t
+           -> SeqCoreArg       -- Of type arg_t
+           -> Coercion         -- Of kind (t1~t2)
+           -> Maybe Coercion   -- Of type (arg_t -> t1 ~  bndr_t -> t2)
+                               --   (and similarly for tyvars, coercion args)
+    -- See Note [Eta reduction with casted arguments]
+    ok_arg bndr (Type ty) co
+       | Just tv <- getTyVar_maybe ty
+       , bndr == tv  = Just (mkForAllCo tv co)
+    ok_arg bndr (Var v) co
+       | bndr == v   = Just (mkFunCo Representational
+                                     (mkReflCo Representational (idType bndr)) co)
+    ok_arg bndr (Compute _ (Eval (Var v) (Kont [Cast co_arg] Return))) co
+       | bndr == v  = Just (mkFunCo Representational (mkSymCo co_arg) co)
+       -- The simplifier combines multiple casts into one,
+       -- so we can have a simple-minded pattern match here
+    ok_arg _ _ _ = Nothing
+tryEtaReduce _ _ = Nothing
+
+termFreeVars :: SeqCoreTerm -> VarSet
+-- Cheat for now
+termFreeVars = exprFreeVars . termToCoreExpr

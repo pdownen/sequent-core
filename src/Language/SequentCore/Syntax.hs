@@ -23,6 +23,7 @@ module Language.SequentCore.Syntax (
   addLets, addLetsToTerm, addNonRec, consFrame, addFrames,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
+  splitCastTerm, splitCastCommand,
   spanTypes, spanTypeArgs,
   flattenCommand,
   isValueArg, isTypeArg, isCoArg, isTyCoArg, isAppFrame, isValueAppFrame,
@@ -68,7 +69,7 @@ import IdInfo    ( IdDetails(..) )
 import Literal   ( Literal, isZeroLit, litIsTrivial, literalType, mkMachString )
 import MkCore    ( rUNTIME_ERROR_ID, mkWildValBinder )
 import Outputable
-import Pair      ( pSnd )
+import Pair      ( Pair(..), pSnd )
 import PrimOp    ( PrimOp(..), primOpOkForSpeculation, primOpOkForSideEffects
                  , primOpIsCheap )
 import TyCon
@@ -246,7 +247,7 @@ mkAppTerm fun args = mkCompute retTy (mkAppCommand fun args)
 mkAppCommand :: Term b -> [Term b] -> Command b
 mkAppCommand fun args = Eval fun (Kont (map App args) Return)
 
-mkCast :: SeqCoreTerm -> Coercion -> SeqCoreTerm
+mkCast :: Term b -> Coercion -> Term b
 mkCast term co | isReflCo co = term
 mkCast (Coercion termCo) co | isCoVarType (pSnd (coercionKind co))
                             = Coercion (mkCoCast termCo co)
@@ -384,6 +385,26 @@ flattenCommand = go []
     go binds (Let bind comm) = go (bind:binds) comm
     go binds (Eval term kont)  = (reverse binds, Left (term, kont))
     go binds (Jump args j)   = (reverse binds, Right (args, j))
+
+-- TODO Since this function has to look at the end of a list that could be long
+-- (namely the list of frames in the continuation), we should try and find ways
+-- around needing it.
+splitCastTerm :: Term b -> (Term b, Maybe Coercion)
+splitCastTerm (Compute _ty comm)
+  | (comm', Just co) <- splitCastCommand comm
+  , let Pair fromTy _toTy = coercionKind co
+  = (mkCompute fromTy comm', Just co)
+splitCastTerm term = (term, Nothing)
+
+splitCastCommand :: Command b -> (Command b, Maybe Coercion)
+splitCastCommand (Eval term (Kont fs Return))
+  | not (null fs)
+  , Cast co <- last fs
+  = (Eval term (Kont (init fs) Return), Just co)
+splitCastCommand (Let b comm)
+  | (comm', Just co) <- splitCastCommand comm
+  = (Let b comm', Just co)
+splitCastCommand comm = (comm, Nothing)
 
 -- | True if the given term constitutes a value argument rather than a type
 -- argument (see 'Type').
@@ -820,6 +841,7 @@ cutCheap appCheap (Var fid) kont@(Kont (App {} : _) _)
     selCheap [arg]      = termCheap appCheap arg
     selCheap _          = False
     primOpCheap op args = primOpIsCheap op && all (termCheap appCheap) args
+cutCheap appCheap _ (Kont [] end) = endCheap appCheap end
 cutCheap _ _ _ = False
     
 isCheapApp, isExpandableApp :: CheapAppMeasure

@@ -332,7 +332,7 @@ simplLazyBind env_x x x' env_v v level recFlag
   = do
     -- TODO Handle floating type lambdas
     let env_v' = zapFloats (env_v `inDynamicScope` env_x)
-    (env_v'', v') <- simplTerm env_v' v
+    (env_v'', v') <- simplTerm env_v' RhsCtxt v
     (env_v_final, v'') <- prepareRhsTerm env_v'' level x' v'
     (env_x', v''')
       <- if not (doFloatFromRhs level recFlag False v'' env_v_final)
@@ -517,7 +517,7 @@ simplPKontNoFloats env (PKont xs comm)
     return $ PKont xs' comm'
 
 simplRhsNoFloats :: SimplEnv -> InRhs -> SimplM OutRhs
-simplRhsNoFloats env (Left term) = Left  <$> simplTermNoFloats  env term
+simplRhsNoFloats env (Left term) = Left  <$> simplTermNoFloats  env RhsCtxt term
 simplRhsNoFloats env (Right pk)  = Right <$> simplPKontNoFloats env pk
 
 completeBind :: SimplEnv -> InVar -> OutVar -> OutRhs
@@ -571,7 +571,7 @@ simplDef env top_lvl id new_rhs def
   = case def of
       BoundToDFun { dfun_bndrs = bndrs, dfun_dataCon = con, dfun_args = args }
         -> do { let (env', bndrs') = enterLamScopes rule_env bndrs
-              ; args' <- mapM (simplTermNoFloats env') args
+              ; args' <- mapM (simplTermNoFloats env' BoringCtxt) args
               ; return (mkBoundToDFun bndrs' con args') }
 
       BoundTo { def_rhs = rhs, def_arity = arity
@@ -725,33 +725,33 @@ simplCommand env (Eval term (Kont fs end))
 simplCommand env (Jump args j)
   = simplJump env args j
 
-simplTermNoFloats :: SimplEnv -> InTerm -> SimplM OutTerm
-simplTermNoFloats env (Compute ty comm)
+simplTermNoFloats :: SimplEnv -> CallCtxt -> InTerm -> SimplM OutTerm
+simplTermNoFloats env ctxt (Compute ty comm)
   = do
-    let (env', ty') = enterKontScope env ty
+    let (env', ty') = enterKontScope env ctxt ty
     comm' <- simplCommandNoFloats env' comm
     return $ mkCompute ty' comm'
-simplTermNoFloats env term
+simplTermNoFloats env ctxt term
   = do
-    (env', term') <- simplTerm (zapFloats env) term
+    (env', term') <- simplTerm (zapFloats env) ctxt term
     return $ wrapFloatsAroundTerm env' term'
 
-simplTerm :: SimplEnv -> InTerm -> SimplM (SimplEnv, OutTerm)
-simplTerm env (Type ty)
+simplTerm :: SimplEnv -> CallCtxt -> InTerm -> SimplM (SimplEnv, OutTerm)
+simplTerm env _ctxt (Type ty)
   = return (env, Type (substTy env ty))
-simplTerm env (Coercion co)
+simplTerm env _ctxt (Coercion co)
   = return (env, Coercion (simplCoercion env co))
-simplTerm env (Compute ty comm)
+simplTerm env ctxt (Compute ty comm)
   = do
-    let (env', ty') = enterKontScope env ty
+    let (env', ty') = enterKontScope env ctxt ty
     -- Terms are closed with respect to continuation variables, so they can
     -- safely float past this binder. Continuations must *never* float past it,
     -- however, because they necessarily invoke the continuation bound here.
     (env'', comm') <- simplCommandNoKontFloats (zapFloats env') comm
     return (env `addFloats` env'', mkCompute ty' comm')
-simplTerm env v
+simplTerm env ctxt v
   = do
-    let (env', ty') = enterKontScope env ty
+    let (env', ty') = enterKontScope env ctxt ty
         env'' = zapFloats env'
     (env''', comm) <- simplTermInCommand env'' v Nothing [] (Incoming (staticPart env'') Return)
     return (env, mkCompute ty' (wrapFloats env''' comm))
@@ -861,7 +861,7 @@ simplTermInCommand env_v (Var x) co_m fs end
 
 simplTermInCommand env_v (Compute ty c) co_m fs end
   = do
-    let (env_v', _) = env_v `enterKontScope` ty
+    let (env_v', _) = enterKontScope env_v (getContext env_v) ty
         fs'         | Just co <- co_m
                     = Simplified NoDup Nothing (Cast co) : fs
                     | otherwise = fs
@@ -902,8 +902,9 @@ simplTermInCommand env_v term@(Lam {}) co_m fs end
   = do
     let (xs, body) = lambdas term
         (env_v', xs') = enterLamScopes env_v xs
-    body' <- simplTermNoFloats env_v' body
-    simplTermInCommandDone env_v (mkLambdas xs' body') co_m fs end
+    body' <- simplTermNoFloats env_v' BoringCtxt body
+    term' <- mkLam env_v xs' body'
+    simplTermInCommandDone env_v term' co_m fs end
 simplTermInCommand env_v term@(Lit {}) co_m fs end
   = simplTermInCommandDone env_v term co_m fs end
 
@@ -912,7 +913,7 @@ simplTermInCommandDone :: SimplEnv -> OutTerm -> Maybe SubstedCoercion
                        -> SimplM (SimplEnv, OutCommand)
 
 simplTermInCommandDone env_v v co_m fs end
-  = simplKont env_v (mkArgInfo env_v v co_m fs) fs end
+  = simplKont env_v (mkArgInfo env_v v co_m fs end) fs end
 
 simplKont :: SimplEnv -> ArgInfo
           -> [ScopedFrame] -> ScopedEnd
@@ -958,7 +959,8 @@ simplKontFrame _ (ArgInfo { ai_discs = [] }) _ _ _
   = pprPanic "simplKontFrame" (text "out of discounts??")
 simplKontFrame _ (ArgInfo { ai_strs = [] }) _ _ _
   = pprPanic "simplKontFrame" (text "should have dealt with bottom already")
-simplKontFrame env ai@(ArgInfo { ai_strs = str:_ }) (App arg) fs end
+simplKontFrame env ai@(ArgInfo { ai_strs = str:_
+                               , ai_discs = disc:_ }) (App arg) fs end
   | str
   = do
     -- Push the current evaluation state into the environment as a
@@ -968,15 +970,20 @@ simplKontFrame env ai@(ArgInfo { ai_strs = str:_ }) (App arg) fs end
     let mk = StrictArg { mk_dup = NoDup
                        , mk_argInfo = ai
                        , mk_frames = fs
+                       , mk_context = getContext env
                        , mk_end = end }
-        (env', _ty') = enterKontScope env (termType arg)
+        (env', _ty') = enterKontScope env cci (termType arg)
         env_final    = env' `setRetKont` mk
     simplCommand env_final (Eval arg (Kont [] Return))
   | otherwise
   = do
     -- Don't float out of lazy arguments (see Simplify.rebuildCall)
-    arg_final <- simplTermNoFloats env arg
+    arg_final <- simplTermNoFloats env cci arg
     simplKont env (addFrameToArgInfo ai (App arg_final)) fs end
+  where
+    cci | ai_encl ai = RuleArgCtxt
+        | disc > 0   = DiscArgCtxt
+        | otherwise  = BoringCtxt
 simplKontFrame env ai (f@(Tick _)) fs end
   -- FIXME Tick handling is actually rather delicate! In fact, we should
   -- (somehow) be putting a float barrier here (see Simplify.simplTick).
@@ -1226,7 +1233,7 @@ simplVar env x
   = case substId env x of
     DoneId x' -> return $ Var x'
     Done v -> return v
-    Susp stat v -> simplTermNoFloats (env `setStaticPart` stat) v
+    Susp stat v -> simplTermNoFloats (env `setStaticPart` stat) BoringCtxt v
 
 simplJump :: SimplEnv -> [InArg] -> InPKontId -> SimplM (SimplEnv, OutCommand)
 simplJump env args j
@@ -1249,7 +1256,7 @@ simplJump env args j
            case rhs'_maybe of
              Nothing
                -> do
-                  (env', args') <- mapAccumLM simplTerm env args
+                  (env', args') <- mapAccumLM (flip simplTerm BoringCtxt) env args
                   return (env', Jump args' j')
              Just (Right pk')
                -> do
@@ -1490,27 +1497,6 @@ computeDiscount dflags uf_arity arg_discounts res_discount arg_infos cont_info
                 -- But we want to aovid inlining large functions that return 
                 -- constructors into contexts that are simply "interesting"
 
-data CallCtxt
-  = BoringCtxt
-  | RhsCtxt             -- Rhs of a let-binding; see Note [RHS of lets]
-  | DiscArgCtxt         -- Argument of a fuction with non-zero arg discount
-  | RuleArgCtxt         -- We are somewhere in the argument of a function with rules
-
-  | ValAppCtxt          -- We're applied to at least one value arg
-                        -- This arises when we have ((f x |> co) y)
-                        -- Then the (f x) has argument 'x' but in a ValAppCtxt
-
-  | CaseCtxt            -- We're the scrutinee of a case
-                        -- that decomposes its scrutinee
-
-instance Outputable CallCtxt where
-  ppr CaseCtxt    = ptext (sLit "CaseCtxt")
-  ppr ValAppCtxt  = ptext (sLit "ValAppCtxt")
-  ppr BoringCtxt  = ptext (sLit "BoringCtxt")
-  ppr RhsCtxt     = ptext (sLit "RhsCtxt")
-  ppr DiscArgCtxt = ptext (sLit "DiscArgCtxt")
-  ppr RuleArgCtxt = ptext (sLit "RuleArgCtxt")
-
 callSiteInline :: SimplEnv -> OutId -> Bool -> Bool -> [ScopedFrame] -> ScopedEnd -> Maybe OutRhs
 callSiteInline env id active_unfolding lone_variable fs end
   = case findDef env id of 
@@ -1520,7 +1506,7 @@ callSiteInline env id active_unfolding lone_variable fs end
       BoundTo { def_rhs = unf_template, def_level = is_top 
               , def_isWorkFree = is_wf,  def_arity = uf_arity
               , def_guidance = guidance, def_isExpandable = is_exp }
-              | active_unfolding -> let (arg_infos, cont_info) = distillKont fs end
+              | active_unfolding -> let (arg_infos, cont_info) = distillKont env fs end
                                     in tryUnfolding (dynFlags env) id lone_variable
                                         arg_infos cont_info unf_template (isTopLevel is_top)
                                         is_wf is_exp uf_arity guidance
@@ -1531,16 +1517,14 @@ callSiteInline env id active_unfolding lone_variable fs end
       _       -> Nothing
 
 -- Impedence mismatch between Sequent Core code and logic from CoreUnfold.
--- TODO This never generates most of the CallCtxt values. Need to keep track of
--- more in able to answer more completely.
-distillKont :: [ScopedFrame] -> ScopedEnd -> ([ArgSummary], CallCtxt)
-distillKont fs end = (mapMaybe (doFrame . unScope) fs, doEnd (unScope end))
+distillKont :: SimplEnv -> [ScopedFrame] -> ScopedEnd -> ([ArgSummary], CallCtxt)
+distillKont env fs end = (mapMaybe (doFrame . unScope) fs, doEnd (unScope end))
   where
     doFrame (App v)    | not (isTypeArg v)
                        = Just (interestingArg v)
     doFrame _          = Nothing
     
-    doEnd (Return {})  = BoringCtxt
+    doEnd (Return {})  = getContext env
     doEnd (Case {})    = CaseCtxt
 
 tryUnfolding :: DynFlags -> Id -> Bool -> [ArgSummary] -> CallCtxt

@@ -1,4 +1,4 @@
-{-# LANGUAGE LambdaCase, CPP #-}
+{-# LANGUAGE LambdaCase, ViewPatterns, CPP #-}
 
 module Language.SequentCore.Simpl.Util (
   -- * Flags
@@ -17,9 +17,13 @@ module Language.SequentCore.Simpl.Util (
   castApp, combineCo, consCastMaybe, simplCoercion, simplOutCoercion,
   
   -- * Cases
-  matchCase, mkCase, prepareAlts
+  matchCase, mkCase, prepareAlts,
+  
+  -- * Lambda construction
+  mkLam
 ) where
 
+import Language.SequentCore.Arity
 import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Simpl.Monad
 import Language.SequentCore.Syntax
@@ -74,8 +78,6 @@ data ArgInfo
         ai_encl   :: Bool,       -- Flag saying whether this function
                                  -- or an enclosing one has rules (recursively)
                                  --      True => be keener to inline in all args
-                                 --      TODO Currently "or an enclosing one" is a lie;
-                                 --      need to track interestingness of context in env
         ai_strs   :: [Bool],     -- Strictness of remaining value arguments
                                  --   Usually infinite, but if it is finite it guarantees
                                  --   that the function diverges after being given
@@ -85,8 +87,9 @@ data ArgInfo
         ai_dup    :: DupFlag
     }
 
-mkArgInfo :: SimplEnv -> OutTerm -> Maybe SubstedCoercion -> [ScopedFrame] -> ArgInfo
-mkArgInfo env term@(Var fun) co_m fs
+mkArgInfo :: SimplEnv -> OutTerm -> Maybe SubstedCoercion
+          -> [ScopedFrame] -> ScopedEnd -> ArgInfo
+mkArgInfo env term@(Var fun) co_m fs end
   | n_val_args < idArity fun            -- Note [Unsaturated functions]
   = ArgInfo { ai_term  = term, ai_frames = [], ai_co = co_m
             , ai_rules = rules, ai_encl = False
@@ -96,7 +99,7 @@ mkArgInfo env term@(Var fun) co_m fs
   | otherwise
   = ArgInfo { ai_term  = term, ai_frames = [], ai_co = co_m
             , ai_rules = rules
-            , ai_encl  = False -- TODO Implement this when implementing rules
+            , ai_encl  = interestingArgContext endEnv rules (Kont (map unScope fs) end')
             , ai_strs  = add_type_str fun_ty arg_stricts
             , ai_discs = arg_discounts
             , ai_dup   = NoDup }
@@ -104,6 +107,7 @@ mkArgInfo env term@(Var fun) co_m fs
     fun_ty = idType fun
     n_val_args = count (isValueAppFrame . unScope) fs
     rules = getRules (getSimplRules env) fun
+    (endEnv, end') = openScoped env end
 
     vanilla_discounts, arg_discounts :: [Int]
     vanilla_discounts = repeat 0
@@ -152,7 +156,7 @@ mkArgInfo env term@(Var fun) co_m fs
         = (str || isStrictType arg_ty) : add_type_str fun_ty' strs
     add_type_str _ strs
         = strs
-mkArgInfo _env term co_m _fs
+mkArgInfo _env term co_m _fs _end
   -- Build "arg info" for something that's not a function.
   -- Any App frame is a type error anyway, so many of these fields don't matter.
   = ArgInfo { ai_term = term, ai_frames = [], ai_co = co_m
@@ -260,6 +264,15 @@ nonTriv ::  ArgSummary -> Bool
 nonTriv TrivArg = False
 nonTriv _       = True
 
+-- See comments on SimplUtils.interestingArgContext
+interestingArgContext :: SimplEnv -> [CoreRule] -> InKont -> Bool
+interestingArgContext env rules (Kont fs end)
+  | not (null rules)  = True
+  | Case {} <- end    = False
+  | any isAppFrame fs = False
+  | RuleArgCtxt <- getContext env
+                      = True
+  | otherwise         = False
 
 instance Outputable ArgSummary where
   ppr TrivArg    = ptext (sLit "TrivArg")
@@ -672,6 +685,57 @@ without getting changed to c1=I# c2.
 I don't think this is worth fixing, even if I knew how. It'll
 all come out in the next pass anyway.
 -}
+
+-------------------------
+-- Lambda construction --
+-------------------------
+
+-- (from SimplUtils)
+mkLam :: SimplEnv -> [OutBndr] -> OutTerm -> SimplM OutTerm
+-- mkLam tries two things
+--      a) eta reduction, if that gives a trivial expression
+--      b) eta expansion [only if there are some value lambdas]
+
+mkLam _env [] body
+  = return body
+mkLam env bndrs body
+  = do  { dflags <- getDynFlags
+        ; mkLam' dflags bndrs body }
+  where
+    mkLam' :: DynFlags -> [OutBndr] -> OutTerm -> SimplM OutTerm
+    mkLam' dflags bndrs (splitCastTerm -> (body, Just co))
+      | not (any bad bndrs)
+        -- Note [Casts and lambdas]
+      = do { lam <- mkLam' dflags bndrs body
+           ; return (mkCast lam (mkPiCos Representational bndrs co)) }
+      where
+        co_vars  = tyCoVarsOfCo co
+        bad bndr = isCoVar bndr && bndr `elemVarSet` co_vars
+
+    mkLam' dflags bndrs body@(Lam {})
+      = mkLam' dflags (bndrs ++ bndrs1) body1
+      where
+        (bndrs1, body1) = lambdas body
+
+    mkLam' dflags bndrs body
+      | gopt Opt_DoEtaReduction dflags
+      , Just etad_lam <- tryEtaReduce bndrs body
+      = do { tick (EtaReduction (head bndrs))
+           ; return etad_lam }
+
+      | not inRhsCtxt   -- See Note [Eta-expanding lambdas]
+      , gopt Opt_DoLambdaEtaExpansion dflags
+      , any isId bndrs
+      , let body_arity = termEtaExpandArity dflags body
+      , body_arity > 0
+      = do { tick (EtaExpansion (head bndrs))
+           ; return (mkLambdas bndrs (etaExpand body_arity body)) }
+
+      | otherwise
+      = return (mkLambdas bndrs body)
+      
+    inRhsCtxt | RhsCtxt <- getContext env = True
+              | otherwise                 = False
 
 ---------------
 -- Instances --

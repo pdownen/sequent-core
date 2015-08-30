@@ -2,7 +2,7 @@
 
 module Language.SequentCore.Simpl.Env (
   -- * Simplifier context
-  SimplEnv,
+  SimplEnv, CallCtxt(..),
   initialEnv, getMode, updMode, dynFlags, getSimplRules, getFamEnvs,
   getUnfoldingInRuleMatch, activeRule, getInScopeSet,
   
@@ -10,10 +10,10 @@ module Language.SequentCore.Simpl.Env (
   SubstAns(..), KontSubst,
   substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar, lookupRecBndr,
   substTerm, substKont, substFrame, substEnd, substPKont, substCommand,
-  retType,
   extendIdSubst, extendPvSubst, extendIdOrPvSubst, extendTvSubst, extendCvSubst,
   setRetKont, pushKont,
   enterScope, enterKontScope, enterRecScopes, enterLamScope, enterLamScopes, mkFreshVar,
+  retType, getContext,
   addBndrRules,
   getTvSubst, getCvSubst,
   zapSubstEnvs, zapTermSubstEnvs,
@@ -83,7 +83,7 @@ import CoreSyn    ( Tickish(Breakpoint)
                   , isCompulsoryUnfolding, isStableSource, mkOtherCon
                   , tickishCounts, tickishIsCode )
 import qualified CoreSyn as Core
-import CoreUnfold ( mkCoreUnfolding, mkDFunUnfolding  )
+import CoreUnfold ( CallCtxt(..), mkCoreUnfolding, mkDFunUnfolding )
 import DataCon
 import DynFlags   ( DynFlags, ufCreationThreshold, ufUseThreshold )
 import FamInstEnv ( FamInstEnv )
@@ -129,6 +129,7 @@ data SimplEnv
                 --  ^^^ static part ^^^  --
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
                 , se_defs    :: IdDefEnv       -- OutId     |--> Definition (out)
+                , se_context :: CallCtxt
                 , se_floats  :: Floats
                 , se_global  :: SimplGlobalEnv }
 
@@ -202,6 +203,7 @@ data MetaKont = SynKont { mk_frames :: [ScopedFrame]
               | StrictArg { mk_argInfo :: ArgInfo
                           , mk_frames  :: [ScopedFrame]
                           , mk_end     :: ScopedEnd
+                          , mk_context :: CallCtxt
                           , mk_dup     :: !DupFlag }
 
 canDupMetaKont :: MetaKont -> Bool
@@ -473,6 +475,7 @@ initialEnv dflags mode rules famEnvs
              , se_cvSubst = emptyVarEnv
              , se_retTy   = Nothing
              , se_retKont = Nothing
+             , se_context = BoringCtxt
              , se_inScope = emptyInScopeSet
              , se_defs    = emptyVarEnv
              , se_floats  = emptyFloats
@@ -518,9 +521,12 @@ enterScope env x
   | isTyVar   x = enterTyVarScope env x
   | otherwise   = enterIdScope env x
 
-enterKontScope :: SimplEnv -> InType -> (SimplEnv, OutType)
-enterKontScope env ty
-  = (env { se_pvSubst = emptyVarEnv, se_retTy = Just ty', se_retKont = Nothing }, ty')
+enterKontScope :: SimplEnv -> CallCtxt -> InType -> (SimplEnv, OutType)
+enterKontScope env ctxt ty
+  = (env { se_pvSubst = emptyVarEnv
+         , se_retTy   = Just ty'
+         , se_retKont = Nothing
+         , se_context = ctxt }, ty')
   where
     ty' = substTy env ty
 
@@ -758,7 +764,7 @@ doSubstT env (Lam bndr body)
 doSubstT env (Compute ty comm)
   = Compute ty' (doSubstC env' comm)
   where
-    (env', ty') = enterKontScope env ty
+    (env', ty') = enterKontScope env BoringCtxt ty
 
 doSubstK :: SimplEnv -> SeqCoreKont -> SeqCoreKont
 doSubstK env (Kont fs end)
@@ -903,6 +909,9 @@ retType env
   = substTy env ty
   | otherwise
   = panic "retType at top level"
+
+getContext :: SimplEnv -> CallCtxt
+getContext = se_context
 
 staticPart :: SimplEnv -> StaticEnv
 staticPart = StaticEnv
@@ -1323,12 +1332,18 @@ termIsConApp_maybe env id_unf term
        -> Maybe OutCoercion
        -> Maybe (DataCon, [Type], [OutTerm])
     go subst term@(Lam {}) fs co_m
-      | Just (args, co_m') <- extractArgs subst fs
+      | Just (args, co_m') <- extractArgs subst True fs -- only trivial args
       , let (bndrs, body) = lambdas term
-      , Compute _ (Eval term' (Kont fs' Return)) <- body
+      , bndrs `equalLength` args
+      , Just (term', fs') <- match body
       = let subst' = foldl2 extend subst bndrs args
             co_m'' = mkTransCoMaybe co_m co_m'
         in go subst' term' (map (subst_frame subst') fs') co_m''
+      where
+        match (Compute _ (Eval term (Kont fs Return)))
+                            = Just (term, fs)
+        match (Compute _ _) = Nothing
+        match other         = Just (other, [])
     
     go subst (Compute _ (Eval term (Kont fs' Return))) fs co_m
       = go subst term (fs' ++ fs) co_m
@@ -1344,13 +1359,13 @@ termIsConApp_maybe env id_unf term
     
     go (Left ins) (Var fun) fs co_m
       | Just dc <- isDataConWorkId_maybe fun
-      , Just (args, co_m') <- extractArgs (Left ins) fs
+      , Just (args, co_m') <- extractArgs (Left ins) False fs
       , count isValueArg args == idArity fun
       = dealWithCoercion (mkTransCoMaybe co_m co_m') dc args
       | BoundToDFun { dfun_bndrs = bndrs
                     , dfun_dataCon = dc
                     , dfun_args = dcArgs } <- def
-      , Just (args, co_m') <- extractArgs (Left ins) fs
+      , Just (args, co_m') <- extractArgs (Left ins) False fs
       , bndrs `equalLength` args
       = let env   = env0 { se_inScope = ins } `setSubstEnvs` zipWith BindTerm bndrs args
             args' = map (substTerm (text "termIsConApp_maybe::go") env) dcArgs
@@ -1365,25 +1380,25 @@ termIsConApp_maybe env id_unf term
         
     go _ _ _ _ = Nothing
     
-    extractArgs :: Either InScopeSet SimplEnv -> [OutFrame] -> Maybe ([OutTerm], Maybe OutCoercion)
-    extractArgs = goF [] Nothing
+    extractArgs :: Either InScopeSet SimplEnv -> Bool -> [OutFrame] -> Maybe ([OutTerm], Maybe OutCoercion)
+    extractArgs subst trivOnly = goF [] Nothing
       where
         -- Like exprIsConApp_maybe, we expect all arguments to come before any
         -- casts. So only accept an argument when the coercion is Nothing.
-        goF args Nothing subst (App arg : fs)
-          | isTrivialTerm arg
-          = goF (subst_arg subst arg : args) Nothing subst fs
-        goF args co_m subst (Cast co : fs)
-          = goF args (Just co'') subst fs
+        goF args Nothing (App arg : fs)
+          | not trivOnly || isTrivialTerm arg
+          = goF (subst_arg subst arg : args) Nothing fs
+        goF args co_m (Cast co : fs)
+          = goF args (Just co'') fs
           where
             co'  = subst_co subst co
             co'' = maybe co' (`mkTransCo` co') co_m
-        goF args co_m subst (Tick ti : fs)
+        goF args co_m (Tick ti : fs)
           | not (tickishIsCode ti)
-          = goF args co_m subst fs
-        goF args co_m _subst []
+          = goF args co_m fs
+        goF args co_m []
           = Just (reverse args, co_m)
-        goF _ _ _ _
+        goF _ _ _
           = Nothing
     
     env0 = zapSubstEnvs env
@@ -1491,6 +1506,7 @@ instance Outputable SimplEnv where
     $$ text " CvSubst   =" <+> ppr (se_cvSubst env)
     $$ text " RetTy     =" <+> ppr (se_retTy env)
     $$ text " RetKont   =" <+> ppr (se_retKont env)
+    $$ text " Context   =" <+> ppr (se_context env)
     $$ text " Floats    =" <+> ppr floatBndrs
      <> char '>'
     where
