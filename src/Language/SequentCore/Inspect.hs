@@ -15,17 +15,20 @@ import GhcPlugins ( Plugin(installCoreToDos), CommandLineOption
                   , defaultPlugin
                   , reinitializeGlobals
                   , CoreM, CoreToDo(CoreDoPluginPass)
-                  , putMsg, errorMsg
+                  , putMsg, fatalErrorMsg, liftIO
                   , getDynFlags, ufCreationThreshold
                   )
 
+import Language.SequentCore.Lint
 import Language.SequentCore.Simpl.ExprSize
 import Language.SequentCore.Syntax
 import Language.SequentCore.Plugin
 
+import ErrUtils   ( ghcExit )
 import Outputable
+import Maybes     ( whenIsJust )
 
-import Control.Monad (forM_)
+import Control.Monad ( forM_, unless, when )
 
 -- | The plugin. A GHC plugin is a module that exports a value called @plugin@
 -- with the type 'Plugin'.
@@ -35,38 +38,73 @@ plugin = defaultPlugin {
 }
 
 install :: [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
-install opts todos =
+install cmdLine todos =
   do reinitializeGlobals
-     -- This puts the dump pass at the beginning of the pipeline, before any
-     -- optimization. To see the post-optimizer state, put 'newPass' at the back
-     -- of the list instead.
-     return $ newPass : todos
+     let opts    = parseOpts cmdLine
+         newPass = mkPass opts
+         todos'  = case opt_where opts of
+                     AtStart -> newPass : todos
+                     AtEnd   -> todos ++ [newPass]
+                     AtBoth  -> newPass : todos ++ [newPass]
+         unknownOpts = opt_badOptions opts
+     unless (null unknownOpts) $ do
+       fatalErrorMsg $ hang (text "Language.SequentCore.Inspect: Unrecognized option(s): ") 4
+                       (pprWithCommas (quotes . text) unknownOpts)
+       dflags <- getDynFlags
+       liftIO $ ghcExit dflags 1
+     
+     return todos'
   where
-    newPass  = CoreDoPluginPass "sequent-core-inspect" passFunc
-    passFunc = sequentPass (inspectSequentCore opts)
+    mkPass opts   = CoreDoPluginPass "SeqCoreInspect" (passFunc opts)
+    passFunc opts = sequentPass (inspectSequentCore opts)
 
-data Options = Options { optShowSizes :: Bool, optUnrecognized :: [String] }
+data Options = Options { opt_where :: Where
+                       , opt_silent, opt_lint, opt_sizes :: Bool
+                       , opt_badOptions :: [CommandLineOption] }
+
+data Where = AtStart | AtEnd | AtBoth
 
 defaults :: Options
-defaults = Options { optShowSizes = False, optUnrecognized = [] }
+defaults = Options { opt_where  = AtStart
+                   , opt_silent = False
+                   , opt_lint   = True
+                   , opt_sizes  = False
+                   , opt_badOptions = [] }
 
-parseOption :: String -> Options -> Options
-parseOption "size" opts = opts { optShowSizes = True }
-parseOption other  opts = opts { optUnrecognized = other : optUnrecognized opts }
+parseOpts :: [CommandLineOption] -> Options
+parseOpts = foldl parse defaults . concatMap (split ',')
+  where
+    parse opts str = case str of
+      "start"  -> opts { opt_where  = AtStart }
+      "end"    -> opts { opt_where  = AtEnd   }
+      "both"   -> opts { opt_where  = AtBoth  }
+      "lint"   -> opts { opt_lint   = True    }
+      "nolint" -> opts { opt_lint   = False   }
+      "silent" -> opts { opt_silent = True    }
+      "size"   -> opts { opt_sizes  = True    }
+      _        -> opts { opt_badOptions = str : opt_badOptions opts }
+    
+    split _ [] = []
+    split c cs = case break (== c) cs of
+                   (end, []) -> [end]
+                   (next, _:rest) -> next : split c rest
 
-inspectSequentCore :: [CommandLineOption] -> [SeqCoreBind] -> CoreM [SeqCoreBind]
-inspectSequentCore rawOpts bs = do
-  let opts        = foldr parseOption defaults rawOpts
-      unknownOpts = optUnrecognized opts
-  if null unknownOpts
-    then do
-      forM_ bs $ \bind -> case bind of
-        NonRec pair -> showBind opts pair
-        Rec pairs -> forM_ pairs (showBind opts)
-    else do
-      errorMsg $ text "Unrecognized option(s): " <+>
-                   sep (punctuate comma $ map text unknownOpts)
+inspectSequentCore :: Options -> [SeqCoreBind] -> CoreM [SeqCoreBind]
+inspectSequentCore opts bs = do
+  inspect opts bs
+  when (opt_lint opts) $
+    whenIsJust (lintCoreBindings bs) $ \err -> do
+      fatalErrorMsg $ hang (text "lint error in dumped code") 4 err
+      dflags <- getDynFlags
+      liftIO $ ghcExit dflags 1
   return bs
+
+inspect :: Options -> [SeqCoreBind] -> CoreM ()
+inspect (Options { opt_silent = True }) _ = return ()
+inspect opts bs = do
+  forM_ bs $ \bind -> case bind of
+    NonRec pair -> showBind opts pair
+    Rec pairs -> forM_ pairs (showBind opts)
 
 showBind :: Options -> SeqCoreBindPair -> CoreM ()
 showBind opts pair
@@ -75,8 +113,7 @@ showBind opts pair
     let (x, rhs) = destBindPair pair
         idPart = ppr x
         cap = ufCreationThreshold dflags
-        sizePart | optShowSizes opts = ppr size
-                 | otherwise         = empty
+        sizePart | opt_sizes opts = ppr size
+                 | otherwise      = empty
         size = either (termSize dflags cap) (pKontSize dflags cap) rhs
     putMsg $ sep [ idPart, sizePart ]
-  where
