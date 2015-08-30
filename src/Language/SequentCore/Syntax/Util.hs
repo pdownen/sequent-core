@@ -9,20 +9,28 @@
 
 module Language.SequentCore.Syntax.Util (
   -- * Case alternatives
-  cmpAlt, ltAlt, findDefault, findAlt, mergeAlts, trimConArgs, filterAlts
+  cmpAlt, ltAlt, findDefault, findAlt, mergeAlts, trimConArgs, filterAlts,
+  
+  -- * Size (for stats)
+  seqCoreBindsSize
 ) where
 
 import Language.SequentCore.Syntax
 
-import CoreSyn   ( cmpAltCon )
+import Coercion
+import CoreSyn   ( cmpAltCon, Tickish(..) )
 import CoreUtils ( dataConRepInstPat )
 import DataCon
+import Id
+import IdInfo
 import Outputable
 import TyCon
 import Type
 import Unique
 import Util      ( debugIsOn, dropList, filterOut )
+import Var
 
+import Control.Applicative ( (<$>) )
 import Control.Exception ( assert )
 
 import Data.List
@@ -169,3 +177,46 @@ filterAlts us ty imposs_cons alts
     impossible_alt _ (Alt con _ _) | con `elem` imposs_cons = True
     impossible_alt inst_tys (Alt (DataAlt con) _ _) = dataConCannotMatch inst_tys con
     impossible_alt _  _                         = False
+
+----------
+-- Size --
+----------
+
+seqCoreBindsSize :: SeqCoreProgram -> Int
+seqCoreBindsSize = sum . map sizeB
+  where
+    sizeB (NonRec pair) = sizeBP pair
+    sizeB (Rec pairs) = sum (sizeBP <$> pairs)
+    
+    sizeBP (BindTerm x term) = sizeX x + sizeT term
+    sizeBP (BindPKont j pk)  = sizeX j + sizePK pk
+    
+    sizeX x | isTyVar x = seqType (tyVarKind x) `seq` 1
+            | otherwise = seqType (idType x)       `seq`
+                          megaSeqIdInfo (idInfo x) `seq`
+                          1
+    
+    sizePK (PKont xs c) = sum (sizeX <$> xs) + sizeC c
+    
+    sizeT (Var x) = x `seq` 1
+    sizeT (Lit lit) = lit `seq` 1
+    sizeT (Type ty) = seqType ty `seq` 1
+    sizeT (Coercion co) = seqCo co `seq` 1
+    sizeT (Lam x v) = sizeX x + sizeT v
+    sizeT (Compute ty c) = seqType ty `seq` sizeC c
+    
+    sizeK (Kont fs e) = sum (sizeF <$> fs) + sizeE e
+    
+    sizeF (App arg) = sizeT arg
+    sizeF (Cast co) = seqCo co `seq` 1
+    sizeF (Tick (ProfNote cc _ _)) = cc `seq` 1
+    sizeF (Tick _) = 1
+    
+    sizeE Return = 1
+    sizeE (Case x alts) = sizeX x + sum (sizeA <$> alts)
+    
+    sizeA (Alt con xs c) = con `seq` sum (sizeX <$> xs) + sizeC c
+    
+    sizeC (Let b c)     = sizeB b + sizeC c
+    sizeC (Jump args j) = j `seq` sum (sizeT <$> args) + 1
+    sizeC (Eval v k)    = sizeT v + sizeK k
