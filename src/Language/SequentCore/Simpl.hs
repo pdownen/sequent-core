@@ -499,16 +499,33 @@ simplPKontBind env_j j j' env_pk pk _recFlag
                  return $ env_j `addFloats` env_with_floats
     completeBind env_j' j j' (Right pk') NotTopLevel
 
+{-
+Note [Call ensureDupableKont outside join point]
+
+We need to make sure we call ensureDupableKont whenever the same binding of ret,
+the return continuation, appears in two places. When there are no join points in
+scope, we can just wait until we see a multi-branch case, but join points make
+this trickier: A ret inside a join point might be the only occurrence, but maybe
+not. One solution would be to leverage the occurrence analyzer: It could count
+the rets just like any other name, and we could add an OccInfo (or a placeholder
+binder) to the Compute constructor to hold it. For the time being, we assume
+that any join point needs the continuation to be duplicable. At worst, this
+might cause an extra iteration if mkDupableKont creates bindings that are only
+used once.
+-}
+
 simplPKont :: SimplEnv -> InPKont -> SimplM (SimplEnv, OutPKont)
 simplPKont env pk
-  = case pk of
+  = do
+    env_dup_kont <- ensureDupableKont env -- Note [Call ensureDupableKont outside join point]
+    case pk of
       -- Can only float bindings out if there are no parameters
       PKont [] comm -> do
-        (env', comm') <- simplCommand env comm
+        (env', comm') <- simplCommand env_dup_kont comm
         return (env', PKont [] comm')
       _ -> do
-        pk' <- simplPKontNoFloats env pk
-        return (env, pk')
+        pk' <- simplPKontNoFloats env_dup_kont pk
+        return (env_dup_kont, pk')
 
 simplPKontNoFloats :: SimplEnv -> InPKont -> SimplM OutPKont
 simplPKontNoFloats env (PKont xs comm)
