@@ -269,8 +269,9 @@ simplNonRec env_x x env_v rhs level
             env' = extendIdOrPvSubst env_x x ans
         return env'
       else do
-        let (env_x', x') = enterScope env_x x
-        simplLazyOrPKontBind env_x' x x' env_v rhs level NonRecursive
+        let (env_x',  x')  = enterScope env_x x
+            (env_x'', x'') = addBndrRules env_x' x x'
+        simplLazyOrPKontBind env_x'' x x'' env_v rhs level NonRecursive
 
 {-
 simplRecOrTopPair is used for
