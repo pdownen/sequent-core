@@ -808,18 +808,18 @@ argument. After a frame is processed, it is added to the ArgInfo, whose
 ai_frames field acts as an accumulator. Rewrite rules fire in between the frames
 and the end.
 
-invokeMetaKont         :: SimplEnv -> ArgInfo
+invokeMetaKont         :: SimplEnv -> OutTerm
                        -> SimplM (SimplEnv, OutCommand)
 
 Pulls the metacontinuation from the environment, if any, and invokes it. This
 may resume an earlier loop from where a strict argument was found.
 
-simplKontDone          :: SimplEnv -> ArgInfo -> OutEnd
+simplKontDone          :: SimplEnv -> OutTerm -> OutEnd
                        -> SimplM (SimplEnv, OutCommand)
 
 Called at the very end, either when a Return is encountered with no bound
-metacontinuation or after all the branches of a Case are recursed into. Pulls
-the accumulated frames from the ArgInfo and returns.
+metacontinuation or after all the branches of a Case are recursed into. Attaches
+the Term to the End and returns.
 -}
 
 simplTermInCommand     :: SimplEnv -> InTerm -> Maybe SubstedCoercion
@@ -933,6 +933,25 @@ simplTermInCommandDone :: SimplEnv -> OutTerm -> Maybe SubstedCoercion
 simplTermInCommandDone env_v v co_m fs end
   = simplKont env_v (mkArgInfo env_v v co_m fs end) fs end
 
+{-
+Note [simplKont invariants]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+simplKont is used in two rather different situations:
+  1. Simplifying the continuation in an Eval command (then possibly invoking rules)
+  2. Simplifying the arguments to a jump
+
+The ArgInfo contains a "target" that identifies the case: In case 1, the target
+is a TermTarget with the term on the left of the command, and in case 2, the
+target identifies a parameterized continuation (either by its body or by its
+name).
+
+As a jump has a very specific form, case 2 has some invariants:
+  - All the frames are App frames, and there are exactly as many as the arity
+    of the join point
+  - The end is a Return
+-}
+
 simplKont :: SimplEnv -> ArgInfo
           -> [ScopedFrame] -> ScopedEnd
           -> SimplM (SimplEnv, OutCommand)
@@ -945,9 +964,10 @@ simplKont env ai fs end
 simplKont env (ai@ArgInfo { ai_strs = [] }) fs end
   -- We've run out of strictness arguments, meaning the call is definitely bottom
   | not (null fs && isReturn (unScope end)) -- Don't bother throwing away a trivial continuation
-  = simplKontDone env ai (Case (mkWildValBinder ty) [])
+  = simplKontDone env term (Case (mkWildValBinder ty) []) -- Skips invokeMetaKont
   where
-    ty = termType (argInfoToTerm ai)
+    term = argInfoToTerm ai
+    ty = termType term
 simplKont env ai (Simplified _ _ f : fs) end
   = simplKont env (addFrameToArgInfo ai f) fs end
 simplKont env ai (f : fs) end
@@ -1010,10 +1030,25 @@ simplKontFrame env ai (f@(Tick _)) fs end
 simplKontEnd :: SimplEnv -> ArgInfo
              -> InEnd
              -> SimplM (SimplEnv, OutCommand)
+{-
+If simplifying a Jump, rules cannot apply, there cannot be a coercion, the end
+must be Return, and the metacontinuation will not be invoked (it is only invoked
+by a Return from an actual Eval command). Thus we skip out here.
+-}
+simplKontEnd env (ArgInfo { ai_target = JumpTarget j, ai_frames = fs }) end
+  = assert (isReturn end && all isAppFrame fs) $ -- Note [simplKont invariants]
+    return (env, Jump [ arg | App arg <- reverse fs ] j)
+simplKontEnd env (ArgInfo { ai_target = PKontTarget pk, ai_frames = fs }) end
+  = assert (isReturn end && all isAppFrame fs) $ -- Note [simplKont invariants]
+    do
+    let (env', PKont xs comm) = openScoped env pk
+        args = [ arg | App arg <- reverse fs ]
+    env'' <- foldM (\env (x, v) -> simplNonRecOut env x v) env' (zip xs args)
+    simplCommand env'' comm
 simplKontEnd env ai@(ArgInfo { ai_co = Just _ }) end
   = simplKontEnd env (swallowCoercion ai) end
 -- From now on, no coercion
-simplKontEnd env ai@(ArgInfo { ai_term = Var fun, ai_rules = rules }) end
+simplKontEnd env ai@(ArgInfo { ai_target = TermTarget (Var fun), ai_rules = rules }) end
   | not (null rules)
   = do
     let (args, extraFrames) = argInfoSpanArgs ai
@@ -1022,7 +1057,7 @@ simplKontEnd env ai@(ArgInfo { ai_term = Var fun, ai_rules = rules }) end
       Just (ruleRhs, extraArgs) ->
         let simplFrames = map (Simplified NoDup Nothing) (map App extraArgs ++ extraFrames)
         in simplTermInCommand env ruleRhs Nothing simplFrames (Incoming (staticPart env) end)
-      Nothing -> simplKontAfterRules env ai end
+      Nothing -> simplKontAfterRules env ai end    
 simplKontEnd env ai end
   = simplKontAfterRules env ai end
 
@@ -1032,7 +1067,7 @@ simplKontAfterRules :: SimplEnv -> ArgInfo
 simplKontAfterRules _ (ArgInfo { ai_co = Just co }) _
   = pprPanic "simplKontAfterRules" (text "Leftover coercion:" <+> ppr co)
 simplKontAfterRules env ai (Case x alts)
-  | Lit lit <- ai_term ai
+  | TermTarget (Lit lit) <- ai_target ai
   , not (litIsLifted lit)
   , null (ai_frames ai) -- TODO There could be ticks here; deal with them
   = do
@@ -1048,7 +1083,8 @@ simplKontAfterRules env ai (Case x alts)
       Just (Alt DEFAULT binds rhs) -> bindCaseBndr binds rhs
       Just (Alt _       binds rhs) -> knownCon env scrut dc tyArgs valArgs x binds rhs 
   where
-    scrut = argInfoToTerm ai
+    scrut = assert (argInfoHasTerm ai) $ argInfoToTerm ai
+              -- Note [simplKont invariants]
     bindCaseBndr binds rhs
       = assert (null binds) $ do
         env' <- simplNonRecOut env x scrut
@@ -1107,35 +1143,37 @@ simplKontAfterRules env ai (Case x alts)
     dflags <- getDynFlags
     Kont fs' end' <- mkCase dflags x' alts'
     let ai_final = addFramesToArgInfo ai'' fs'
-    simplKontDone env' ai_final end'
+        term_final = argInfoToTerm ai_final
+    simplKontDone env' term_final end'
 simplKontAfterRules env ai Return
-  = invokeMetaKont env ai
+  = invokeMetaKont env (argInfoToTerm ai)
 
-invokeMetaKont :: SimplEnv -> ArgInfo
+invokeMetaKont :: SimplEnv -> OutTerm
                -> SimplM (SimplEnv, OutCommand)
-invokeMetaKont env ai
+invokeMetaKont env term
   = case substKv env of
       Nothing
-        -> simplKontDone env ai Return
+        -> simplKontDone env term Return
       Just (SynKont { mk_frames = fs, mk_end = end })
         -> warnPprTrace True __FILE__ __LINE__
-             (text "SynKont lasted until invokeMetaKont" $$ ppr env $$ ppr ai) $
-             simplKont env ai fs end
+             (text "SynKont lasted until invokeMetaKont" $$ ppr env $$ ppr term) $
+             simplTermInCommand env term Nothing fs end
       Just (StrictArg { mk_argInfo = ai'
                       , mk_frames = fs
                       , mk_end = end })
-        -> let arg  = argInfoToTerm ai
-           in simplKont env (addFrameToArgInfo ai' (App arg)) fs end
+        -> simplKont env (addFrameToArgInfo ai' (App term)) fs end
 
-simplKontDone :: SimplEnv -> ArgInfo -> OutEnd
+simplKontDone :: SimplEnv -> OutTerm -> OutEnd
               -> SimplM (SimplEnv, OutCommand)
-simplKontDone env ai end
+simplKontDone env term end
   | tracing
-  , pprTraceShort "simplKontDone" (ppr env $$ ppr ai $$ ppr end) False
+  , pprTraceShort "simplKontDone" (ppr env $$ ppr term $$ ppr end) False
   = undefined
+  | Compute _ (Eval term' (Kont fs Return)) <- term
+      -- Common code path: simplKontAfterRules -> invokeKont -> simplKontDone
+  = return (env, Eval term' (Kont fs end))
   | otherwise
-  = return (env, Eval term (Kont (reverse fs) end))
-  where ArgInfo { ai_term = term, ai_frames = fs } = swallowCoercion ai
+  = return (env, mkCommand [] term (Kont [] end))
 
 -------------------
 -- Case handling --
@@ -1260,22 +1298,19 @@ simplJump env args j
     False
   = undefined
 simplJump env args j
-  = do
-    case substPv env j of
+  = case substPv env j of
       DoneId j'
         -> do
            let lone = null args
                -- Pretend to callSiteInline that we're just applying a bunch of
                -- arguments to a function
                rhs'_maybe = callSiteInline env j' (activeUnfolding env j') lone 
-                                           (map (Incoming (staticPart env) . App) args)
-                                           (Incoming (staticPart env) Return)
+                                           frames end
           
            case rhs'_maybe of
              Nothing
-               -> do
-                  (env', args') <- mapAccumLM (flip simplTerm BoringCtxt) env args
-                  return (env', Jump args' j')
+               -> simplKont env (mkJumpArgInfo env j' frames) frames end
+                    -- Activate case 2 of simplKont (Note [simplKont invariants])
              Just (Right pk')
                -> do
                   tick (UnfoldingDone j')
@@ -1283,15 +1318,15 @@ simplJump env args j
              _ -> pprPanic "simplJump" (ppr j $$ ppr rhs'_maybe)
       Done pk
         -> reduce (zapSubstEnvs env) pk
-      Susp stat pk
-        -> reduce (env `setStaticPart` stat) pk
+      Susp stat' pk
+        -> reduce (env `setStaticPart` stat') pk
   where
-    reduce env_pk (PKont xs comm)
-      = do
-        env_comm <- foldM bindArg env_pk (zip xs args)
-        simplCommand env_comm comm
-    bindArg env_x (x, arg)
-      = simplNonRec env_x x (staticPart env) (Left arg) NotTopLevel
+    stat   = staticPart env
+    frames = map (Incoming stat . App) args
+    end    = Incoming stat Return
+    reduce env_pk pk
+      = simplKont env_pk (mkPKontArgInfo env_pk (Incoming (staticPart env_pk) pk) frames)
+                  frames end
 
 knownCon :: SimplEnv
          -> OutTerm                             -- The scrutinee

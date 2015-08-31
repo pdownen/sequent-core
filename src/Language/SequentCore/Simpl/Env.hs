@@ -25,7 +25,7 @@ module Language.SequentCore.Simpl.Env (
   
   -- * Objects with lexical scope information attached
   Scoped(..), DupFlag(..),
-  ScopedFrame, ScopedEnd,
+  ScopedFrame, ScopedEnd, ScopedPKont,
   openScoped, decompScoped, unScope,
   okToDup,
   pprMultiScopedKont,
@@ -248,7 +248,8 @@ data DupFlag = NoDup | OkToDup
   deriving (Eq)
 
 type ScopedFrame = Scoped SeqCoreFrame
-type ScopedEnd = Scoped SeqCoreEnd
+type ScopedEnd   = Scoped SeqCoreEnd
+type ScopedPKont = Scoped SeqCorePKont
 
 openScoped :: SimplEnv -> Scoped a -> (SimplEnv, In a)
 openScoped env scoped

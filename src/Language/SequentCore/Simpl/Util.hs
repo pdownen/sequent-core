@@ -5,9 +5,10 @@ module Language.SequentCore.Simpl.Util (
   linting, dumping, tracing, traceTicks,
 
   -- * State of argument processing
-  RevList, SubstedCoercion, ArgInfo(..),
-  mkArgInfo, addFrameToArgInfo, addFramesToArgInfo, swallowCoercion,
-  argInfoToTerm, argInfoSpanArgs,
+  RevList, SubstedCoercion, ArgInfo(..), Target(..),
+  mkArgInfo, mkJumpArgInfo, mkPKontArgInfo, addFrameToArgInfo,
+  addFramesToArgInfo, swallowCoercion,
+  argInfoToTerm, argInfoHasTerm, argInfoSpanArgs,
   
   -- * Summary of arguments
   ArgSummary(..),
@@ -29,6 +30,7 @@ import Language.SequentCore.Simpl.Monad
 import Language.SequentCore.Syntax
 import Language.SequentCore.Syntax.Util
 import Language.SequentCore.Util
+import Language.SequentCore.WiredIn
 
 import Coercion
 import CoreMonad   ( Tick(..) )
@@ -71,7 +73,7 @@ type SubstedCoercion = OutCoercion -- Substituted but not optimized
 
 data ArgInfo
   = ArgInfo {
-        ai_term   :: OutTerm,    -- The function (or possibly a literal)
+        ai_target :: Target,     -- The term or join point
         ai_frames :: RevList OutFrame, -- ...applied to these args/casts (which are in *reverse* order)
         ai_co     :: Maybe SubstedCoercion, -- Last coercion applied; not yet added to ai_frames
         ai_rules  :: [CoreRule], -- Rules for this function
@@ -87,20 +89,24 @@ data ArgInfo
         ai_dup    :: DupFlag
     }
 
+data Target = TermTarget OutTerm
+            | JumpTarget OutPKontId
+            | PKontTarget ScopedPKont
+
 mkArgInfo :: SimplEnv -> OutTerm -> Maybe SubstedCoercion
           -> [ScopedFrame] -> ScopedEnd -> ArgInfo
 mkArgInfo env term@(Var fun) co_m fs end
   | n_val_args < idArity fun            -- Note [Unsaturated functions]
-  = ArgInfo { ai_term  = term, ai_frames = [], ai_co = co_m
+  = ArgInfo { ai_target = TermTarget term, ai_frames = [], ai_co = co_m
             , ai_rules = rules, ai_encl = False
             , ai_strs  = vanilla_stricts
             , ai_discs = vanilla_discounts
             , ai_dup   = NoDup }
   | otherwise
-  = ArgInfo { ai_term  = term, ai_frames = [], ai_co = co_m
+  = ArgInfo { ai_target = TermTarget term, ai_frames = [], ai_co = co_m
             , ai_rules = rules
             , ai_encl  = interestingArgContext endEnv rules (Kont (map unScope fs) end')
-            , ai_strs  = add_type_str fun_ty arg_stricts
+            , ai_strs  = add_type_str fun_ty (idArgStrictnesses fun n_val_args)
             , ai_discs = arg_discounts
             , ai_dup   = NoDup }
   where
@@ -116,30 +122,9 @@ mkArgInfo env term@(Var fun) co_m fs end
                               -> discounts ++ vanilla_discounts
                         _     -> vanilla_discounts
 
-    vanilla_stricts, arg_stricts :: [Bool]
-    vanilla_stricts  = repeat False
-
-    arg_stricts
-      = case splitStrictSig (idStrictness fun) of
-          (demands, result_info)
-                | not (demands `lengthExceeds` n_val_args)
-                ->      -- Enough args, use the strictness given.
-                        -- For bottoming functions we used to pretend that the arg
-                        -- is lazy, so that we don't treat the arg as an
-                        -- interesting context.  This avoids substituting
-                        -- top-level bindings for (say) strings into
-                        -- calls to error.  But now we are more careful about
-                        -- inlining lone variables, so its ok (see SimplUtils.analyseCont)
-                   if isBotRes result_info then
-                        map isStrictDmd demands         -- Finite => result is bottom
-                   else
-                        map isStrictDmd demands ++ vanilla_stricts
-               | otherwise
-               -> warnPprTrace True __FILE__ __LINE__ 
-                               (text "More demands than arity" <+> ppr fun <+> ppr (idArity fun)
-                                <+> ppr n_val_args <+> ppr demands )
-                   vanilla_stricts      -- Not enough args, or no strictness
-
+    vanilla_stricts :: [Bool]
+    vanilla_stricts = repeat False
+    
     add_type_str :: Type -> [Bool] -> [Bool]
     -- If the function arg types are strict, record that in the 'strictness bits'
     -- No need to instantiate because unboxed types (which dominate the strict
@@ -159,16 +144,113 @@ mkArgInfo env term@(Var fun) co_m fs end
 mkArgInfo _env term co_m _fs _end
   -- Build "arg info" for something that's not a function.
   -- Any App frame is a type error anyway, so many of these fields don't matter.
-  = ArgInfo { ai_term = term, ai_frames = [], ai_co = co_m
+  = ArgInfo { ai_target = TermTarget term, ai_frames = [], ai_co = co_m
             , ai_rules = [], ai_encl = False
             , ai_strs = repeat False -- Could be [], but applying to a non-function
                                      -- isn't bottom, it's ill-defined!
             , ai_discs = repeat 0
             , ai_dup = NoDup }
 
+argInfoTerm :: ArgInfo -> OutTerm
+argInfoTerm (ArgInfo { ai_target = TermTarget term }) = term
+argInfoTerm ai = pprPanic "argInfoTerm" (ppr ai)
+
 argInfoToTerm :: ArgInfo -> OutTerm
-argInfoToTerm ai = mkComputeEval (ai_term ai') (reverse (ai_frames ai'))
+argInfoToTerm ai = mkComputeEval (argInfoTerm ai') (reverse (ai_frames ai'))
   where ai' = swallowCoercion ai
+
+argInfoHasTerm :: ArgInfo -> Bool
+argInfoHasTerm (ArgInfo { ai_target = TermTarget {} }) = True
+argInfoHasTerm _ = False
+
+mkJumpArgInfo :: SimplEnv -> OutPKontId -> [ScopedFrame] -> ArgInfo
+mkJumpArgInfo _env j fs
+  = ArgInfo { ai_target = JumpTarget j, ai_frames = [], ai_co = Nothing
+            , ai_rules = []
+            , ai_encl  = False
+            , ai_strs  = add_type_str j_ty (idArgStrictnesses j n_val_args)
+            , ai_discs = vanilla_discounts
+            , ai_dup   = NoDup }
+  where
+    j_ty = idType j
+    n_val_args = count (isValueAppFrame . unScope) fs
+    
+    vanilla_discounts :: [Int]
+    vanilla_discounts = repeat 0
+    
+    add_type_str :: Type -> [Bool] -> [Bool]
+    -- Similar to add_type_str within mkArgInfo, but this is an unboxed tuple,
+    -- not a function type
+    add_type_str ty strs
+      | Just kontTy <- isKontTy_maybe ty
+      = goOuter kontTy strs
+      | otherwise
+      = pprPanic "mkJumpArgInfo" (ppr ty)
+      where
+        goOuter :: Type -> [Bool] -> [Bool]
+        goOuter _ty [] = []
+        goOuter ty strs
+          | Just (_, bodyTy) <- isUbxExistsTy_maybe ty
+          = goOuter bodyTy strs
+          | isUnboxedTupleType ty
+          = let (_, args) = splitTyConApp ty
+            in goTupleArgs args strs
+          | otherwise
+          = pprPanic "mkJumpArgInfo" (ppr j_ty)
+          
+        goTupleArgs :: [Type] -> [Bool] -> [Bool]
+        goTupleArgs [] strs = strs
+        goTupleArgs _  []   = []
+        goTupleArgs [ty] strs
+          | Just (_, bodyTy) <- isUbxExistsTy_maybe ty
+          = goOuter bodyTy strs
+        goTupleArgs (ty:tys) (str:strs)
+          = (str || isStrictType ty) : goTupleArgs tys strs
+
+mkPKontArgInfo :: SimplEnv -> ScopedPKont -> [ScopedFrame] -> ArgInfo
+mkPKontArgInfo _env pk _fs
+  = ArgInfo { ai_target = PKontTarget pk, ai_frames = [], ai_co = Nothing
+            , ai_rules = []
+            , ai_encl  = False
+            , ai_strs  = stricts ++ repeat False
+            , ai_discs = repeat 0
+            , ai_dup   = NoDup }
+  where
+    stricts = case unScope pk of PKont xs _ -> map isStrictId xs
+
+idArgStrictnesses :: Var -> Int -> [Bool]
+idArgStrictnesses fun n_val_args
+  = case splitRealStrictness of
+      (demands, result_info)
+            | not (demands `lengthExceeds` n_val_args)
+            ->      -- Enough args, use the strictness given.
+                    -- For bottoming functions we used to pretend that the arg
+                    -- is lazy, so that we don't treat the arg as an
+                    -- interesting context.  This avoids substituting
+                    -- top-level bindings for (say) strings into
+                    -- calls to error.  But now we are more careful about
+                    -- inlining lone variables, so its ok (see SimplUtils.analyseCont)
+               if isBotRes result_info then
+                    map isStrictDmd demands         -- Finite => result is bottom
+               else
+                    map isStrictDmd demands ++ vanilla_stricts
+           | otherwise
+           -> warnPprTrace True __FILE__ __LINE__ 
+                           (text "More demands than arity" <+> pprBndr LetBind fun <+> ppr (idArity fun)
+                            <+> ppr n_val_args <+> ppr demands )
+               vanilla_stricts
+  where
+    vanilla_stricts = repeat False
+    splitRealStrictness
+      | isPKontId fun -- Argument is always an unboxed tuple; need to look inside
+      = case splitStrictSig (idStrictness fun) of
+          (demands, result_info)
+            | [splitProdDmd_maybe -> Just demands'] <- demands
+            -> (demands', result_info)
+            | otherwise
+            -> ([], result_info)
+      | otherwise
+      = splitStrictSig (idStrictness fun)
 
 -- Add a frame to the ArgInfo. If it is an argument and the ArgInfo has a
 -- coercion pending, this will call 'castApp' to push the coercion past the
@@ -742,18 +824,26 @@ mkLam env bndrs body
 ---------------
 
 instance Outputable ArgInfo where
-  ppr (ArgInfo { ai_term = term
+  ppr (ArgInfo { ai_target = target
                , ai_frames = fs
                , ai_co = co_m
                , ai_strs = strs
                , ai_dup = dup })
-    = hang (text "ArgInfo") 8 $ vcat [ text "Term:" <+> ppr term
+    = hang (text "ArgInfo") 8 $ vcat [ targetLabel <+> ppr target
                                      , text "Prev. frames:" <+> pprWithCommas ppr fs
                                      , case co_m of Just co -> text "Coercion:" <+> ppr co
                                                     Nothing -> empty
                                      , ppWhen (dup == OkToDup) $ text "Okay to duplicate"
                                      , strictDoc ]
     where
+      targetLabel = case target of TermTarget {}  -> text "Term:"
+                                   JumpTarget {}  -> text "Join point id:"
+                                   PKontTarget {} -> text "Inlining join point:"
       strictDoc = case strs of []        -> text "Expression is bottom"
                                True  : _ -> text "Next argument strict"
                                False : _ -> text "Next argument lazy"
+
+instance Outputable Target where
+  ppr (TermTarget term) = ppr term
+  ppr (JumpTarget j)    = ppr j
+  ppr (PKontTarget pk)  = ppr pk
