@@ -5,7 +5,7 @@ module Language.SequentCore.Simpl.Util (
   linting, dumping, tracing, traceTicks,
 
   -- * State of argument processing
-  RevList, SubstedCoercion, ArgInfo(..), Target(..),
+  RevList, ArgInfo(..), Target(..),
   mkArgInfo, mkJumpArgInfo, mkPKontArgInfo, addFrameToArgInfo,
   addFramesToArgInfo, swallowCoercion,
   argInfoToTerm, argInfoHasTerm, argInfoSpanArgs,
@@ -69,7 +69,6 @@ linting    = True
 -------------
 
 type RevList a = [a]
-type SubstedCoercion = OutCoercion -- Substituted but not optimized
 
 data ArgInfo
   = ArgInfo {

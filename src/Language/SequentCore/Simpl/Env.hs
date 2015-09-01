@@ -13,7 +13,7 @@ module Language.SequentCore.Simpl.Env (
   extendIdSubst, extendPvSubst, extendIdOrPvSubst, extendTvSubst, extendCvSubst,
   setRetKont, pushKont,
   enterScope, enterKontScope, enterRecScopes, enterLamScope, enterLamScopes, mkFreshVar,
-  retType, getContext,
+  retType, getContext, setContext,
   addBndrRules,
   getTvSubst, getCvSubst,
   zapSubstEnvs, zapTermSubstEnvs,
@@ -25,7 +25,7 @@ module Language.SequentCore.Simpl.Env (
   
   -- * Objects with lexical scope information attached
   Scoped(..), DupFlag(..),
-  ScopedFrame, ScopedEnd, ScopedPKont,
+  ScopedFrame, ScopedEnd, ScopedPKont, ScopedCommand,
   openScoped, decompScoped, unScope,
   okToDup,
   pprMultiScopedKont,
@@ -54,6 +54,7 @@ module Language.SequentCore.Simpl.Env (
   Out, OutCommand, OutTerm, OutArg, OutKont, OutFrame, OutEnd, OutPKont,
   OutAlt, OutBind, OutBndr, OutBindPair, OutRhs, OutValue,
   OutType, OutCoercion, OutId, OutPKontId, OutVar, OutTyVar, OutCoVar,
+  SubstedCoercion,
   
   -- * Term information
   termIsHNF, termIsConLike, termIsConApp_maybe
@@ -195,6 +196,21 @@ state includes a *metacontinuation,* sometimes known as a *semantic
 continuation.* The metacontinuation for a strict argument is exactly the
 StrictArg form in the MetaKont datatype.
 
+Note [StrictLet and StrictLamBind]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+GHC has just the one form of continuation, StrictBind, for either a strict let
+or a strict beta-redex. It's not clear that there's any good way for us to
+combine the two: StrictLet is used in simplCommand, which has a raw InCommand
+as an argument, and StrictLamBind is used in simplTermInCommand, in which the
+command has been split into frames and each has its scope attached. In order to
+combine the two continuations, we would need a common entry point that could go
+to either. We could always decompose the command argument to SimplCommand, but
+attaching static environments to its frames hits one major snag: We don't know
+the frames' static scope until after we've processed the let bindings! Absent
+some serious knot-tying or datatype abuse, we just have to use two different
+continuations.
+
 -}
 
 data MetaKont = SynKont { mk_frames :: [ScopedFrame]
@@ -205,9 +221,25 @@ data MetaKont = SynKont { mk_frames :: [ScopedFrame]
                           , mk_end     :: ScopedEnd
                           , mk_context :: CallCtxt
                           , mk_dup     :: !DupFlag }
+              | StrictLet { mk_env     :: StaticEnv
+                          , mk_binder  :: InBndr
+                          , mk_command :: InCommand } -- Never dupable
+                                                      -- Note [Duplicating StrictBind] in GHC Simplify
+              | StrictLamBind { mk_env      :: StaticEnv
+                              , mk_binder   :: InBndr
+                              , mk_term     :: InTerm
+                              , mk_coercion :: Maybe SubstedCoercion
+                              , mk_frames   :: [ScopedFrame]
+                              , mk_end      :: ScopedEnd 
+                              , mk_context  :: CallCtxt } -- Never dupable
 
 canDupMetaKont :: MetaKont -> Bool
-canDupMetaKont = (== OkToDup) . mk_dup
+canDupMetaKont mk
+  = case mk of
+      StrictLamBind {} -> False
+      StrictLet {}     -> False
+      _                -> mk_dup mk == OkToDup
+                       
 
 ---------------------
 -- Lexical scoping --
@@ -250,6 +282,7 @@ data DupFlag = NoDup | OkToDup
 type ScopedFrame = Scoped SeqCoreFrame
 type ScopedEnd   = Scoped SeqCoreEnd
 type ScopedPKont = Scoped SeqCorePKont
+type ScopedCommand = Scoped SeqCoreCommand
 
 openScoped :: SimplEnv -> Scoped a -> (SimplEnv, In a)
 openScoped env scoped
@@ -462,6 +495,11 @@ type OutPKontId = PKontId
 type OutVar     = Var
 type OutTyVar   = TyVar
 type OutCoVar   = CoVar
+
+-- Coercions have a third state, where substitution has been performed but not
+-- optimization. (It is hoped that coercions are not so large that making
+-- multiple passes like this is expensive.)
+type SubstedCoercion = Coercion
 
 -----------------
 -- Environment --
@@ -913,6 +951,11 @@ retType env
 
 getContext :: SimplEnv -> CallCtxt
 getContext = se_context
+
+-- FIXME Getter/setter pair gives off code smell. Setting the call context
+-- should probably be synchronous with entering or exiting a Compute.
+setContext :: SimplEnv -> CallCtxt -> SimplEnv
+setContext env ctxt = env { se_context = ctxt }
 
 staticPart :: SimplEnv -> StaticEnv
 staticPart = StaticEnv
@@ -1536,6 +1579,20 @@ instance Outputable MetaKont where
                  , mk_end = end })
     = hang (text "Strict argument to:") 2 $ pprDeeper $
         ppr ai $$ pprMultiScopedKont fs end
+  ppr (StrictLet { mk_binder  = bndr
+                 , mk_command = command })
+    = text "Strict let binding of:" <+> pprBndr LambdaBind bndr $$
+      hang (text "In command:") 2 (pprDeeper $ ppr command)
+  ppr (StrictLamBind { mk_binder   = bndr
+                     , mk_term     = term
+                     , mk_coercion = co_m
+                     , mk_frames   = fs
+                     , mk_end      = end })
+    = vcat [ text "Strict lambda-binding of:" <+> pprBndr LambdaBind bndr
+           , hang (text "In term:") 2 (pprDeeper $ ppr term)
+           , case co_m of Just co -> text "Coercion:" <+> ppr co
+                          Nothing -> empty
+           , hang (text "With continuation:") 2 (pprMultiScopedKont fs end) ]
 
 instance Outputable Definition where
   ppr (BoundTo { def_rhs = rhs, def_src = src, def_level = level, def_guidance = guid,
@@ -1556,7 +1613,7 @@ pprEither (Right x) = ppr x
 
 instance Outputable a => Outputable (Scoped a) where
   ppr (Incoming _ a) = text "<incoming>" <+> ppr a
-  ppr (Simplified _ dup a) = ppr dup <+> ppr a
+  ppr (Simplified dup _ a) = ppr dup <+> ppr a
 
 instance Outputable DupFlag where
   ppr OkToDup = text "<ok to dup>"
