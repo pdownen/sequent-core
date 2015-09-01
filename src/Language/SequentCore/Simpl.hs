@@ -933,12 +933,13 @@ simplTermInCommand env_v (Compute ty c) co_m fs end
 simplTermInCommand env_v v co_m (f : fs) end
   | (env', Cast co) <- openScoped env_v f
   = simplTermInCommand env_v v (combineCo co_m (substCo env' co)) fs end
-simplTermInCommand env_v v@(Coercion co) co_m fs end
+simplTermInCommand env_v (Coercion co) co_m fs end
   = simplTermInCommandDone env_v v' Nothing fs end
   where
+    co' = simplCoercion env_v co
     v' = case co_m of
-           Just co' -> Coercion (mkCoCast co co')
-           Nothing  -> v
+           Just coCo -> Coercion (mkCoCast coCo co')
+           Nothing   -> Coercion co'
 simplTermInCommand env_v v@(Lam x body) co_m (f : fs) end
   -- discard a non-counting tick on a lambda.  This may change the
   -- cost attribution slightly (moving the allocation of the
