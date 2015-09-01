@@ -6,8 +6,7 @@ module Main where
 {-# NOINLINE plusS #-}
 plusL, plusS :: Bool -> Int -> Int -> Int
 plusL b x y = if b then x + y else 0
-plusS _ x y = x `seq` y `seq` x + y -- TODO Implement rules so that + gets
-                                    -- specialized and the seqs aren't needed
+plusS _ x y = x + y
 
 lazyCall, strictCall, strictDupCall, lazyBotCall, strictBotCall ::
   Bool -> Int -> Int -> Int -> Int -> Int
