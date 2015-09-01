@@ -716,7 +716,7 @@ frameOk (Tick ti) = not (tickishCounts ti)
 frameOk (Cast _)  = True
 
 endOk :: (PrimOp -> Bool) -> End b -> Bool
-endOk _ Return = False
+endOk _ Return = True
 endOk primOpOk (Case _bndr alts)
   =  all (\(Alt _ _ rhs) -> commOk primOpOk rhs) alts
   && altsAreExhaustive
