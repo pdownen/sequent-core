@@ -268,9 +268,17 @@ lintCoreCut env term kont
 
 lintCoreJump :: LintEnv -> [SeqCoreArg] -> PKontId -> LintM ()
 lintCoreJump env args j
-  = do
-    ty <- kontIdTyOrError (termEnv env) j
-    go ty args
+  | Just j' <- lookupInScope (getTvInScope (kontEnv env)) j
+  = if | not (substTy (kontEnv env) (idType j) `eqType` idType j') ->
+           Left $ text "join variable" <+> pprBndr LetBind j <+> text "bound as"
+                                       <+> pprBndr LetBind j'
+       | isDeadBinder j' ->
+           Left $ text "occurrence of dead id" <+> pprBndr LetBind j'
+       | otherwise -> do
+           ty <- kontIdTyOrError (kontEnv env) j
+           go ty args
+  | otherwise
+  = Left $ text "not found in context:" <+> pprBndr LetBind j
   where
     topArgs = args
     
@@ -382,7 +390,7 @@ checkingType desc ex go
     unless (ex `eqType` act) $ mkError desc (ppr ex) (ppr act)
     return act
 
-kontIdTyOrError :: TermEnv -> PKontId -> LintM OutType
+kontIdTyOrError :: KontEnv -> PKontId -> LintM OutType
 kontIdTyOrError env k
   = case isKontTy_maybe (substTy env (idType k)) of
       Just arg -> return arg
