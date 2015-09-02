@@ -270,6 +270,10 @@ simplNonRecInCommand :: SimplEnv -> InVar -> StaticEnv -> InRhs
                      -> (SimplEnv -> SimplM (SimplEnv, OutCommand))
                         -- ^ Continuation to call if lazy or pre-inlined
                      -> SimplM (SimplEnv, OutCommand)
+simplNonRecInCommand env_x x env_v rhs mk_strict _
+  | tracing
+  , pprTraceShort "simplNonRecInCommand" (ppr env_x $$ ppr x $$ ppr env_v $$ ppr rhs $$ ppr mk_strict) False
+  = undefined
 simplNonRecInCommand env_x x env_v rhs _mk_strict k_lazy
   | isTyVar x
   , Left (Type ty) <- rhs
@@ -951,19 +955,24 @@ simplTermInCommand env_v v@(Lam x body) co_m (f : fs) end
   | App arg <- f'
   = do
     tick (BetaReduction x)
-    let (arg', co_m') | Just co <- co_m = let Just (arg', co') = castApp arg co
-                                            -- not Nothing because lambda must
-                                            -- have function/forall type
-                                          in (arg', Just co')
-                      | otherwise       = (arg, Nothing)
+    let (arg', co_m', env_k')
+          | Just co <- co_m = let -- Substitute now because arg is InTerm and
+                                  -- co is SubstedCoercion
+                                  arg_substed = substTerm (text "simplTermInCommand")
+                                                          env_k arg
+                                  Just (arg', co') = castApp arg_substed co
+                                    -- castApp is not Nothing because lambda must
+                                    -- have function/forall type
+                              in (arg', Just co', zapSubstEnvs env_k)
+          | otherwise       = (arg, Nothing, env_k)
         mk = StrictLamBind { mk_env      = staticPart env_v
                            , mk_context  = getContext env_v
                            , mk_binder   = x
                            , mk_term     = body
-                           , mk_coercion = co_m
+                           , mk_coercion = co_m'
                            , mk_frames   = fs
                            , mk_end      = end }
-    simplNonRecInCommand env_v x (staticPart env_k) (Left arg') mk $
+    simplNonRecInCommand env_v x (staticPart env_k') (Left arg') mk $
       \env_v' -> simplTermInCommand env_v' body co_m' fs end
   where
     (env_k, f') = openScoped env_v f
