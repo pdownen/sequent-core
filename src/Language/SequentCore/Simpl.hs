@@ -1116,7 +1116,7 @@ simplKontEnd env ai@(ArgInfo { ai_target = TermTarget (Var fun), ai_rules = rule
     case match_maybe of
       Just (ruleRhs, extraArgs) ->
         let simplFrames = map (Simplified NoDup Nothing) (map App extraArgs ++ extraFrames)
-        in simplTermInCommand env ruleRhs Nothing simplFrames (Incoming (staticPart env) end)
+        in simplTermInCommand (zapSubstEnvs env) ruleRhs Nothing simplFrames (Incoming (staticPart env) end)
       Nothing -> simplKontAfterRules env ai end    
 simplKontEnd env ai end
   = simplKontAfterRules env ai end
