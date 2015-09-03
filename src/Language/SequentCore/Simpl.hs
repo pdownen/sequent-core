@@ -1030,9 +1030,24 @@ simplKont env ai fs end
   = undefined
 simplKont env (ai@ArgInfo { ai_strs = [] }) fs end
   -- We've run out of strictness arguments, meaning the call is definitely bottom
-  | not (null fs && isReturn (unScope end)) -- Don't bother throwing away a trivial continuation
+  | hasTerm
+  , not trivialKont -- Don't bother throwing away a trivial continuation
   = simplKontDone env term (Case (mkWildValBinder ty) []) -- Skips invokeMetaKont
+  | not hasTerm
+  , not trivialKont
+  = warnPprTrace (not hasTerm) __FILE__ __LINE__
+      (hang (text "Join point bottoms out at less than apparent arity:") 2
+            (ppr ai $$ pprMultiScopedKont fs end)) $
+    simplKont env (ai { ai_strs = [False] }) fs end
   where
+    trivialKont | null fs
+                , (env', Return) <- openScoped env end
+                , Nothing <- substKv env'
+                = True
+                | otherwise
+                = False
+    
+    hasTerm = argInfoHasTerm ai
     term = argInfoToTerm ai
     ty = termType term
 simplKont env ai (Simplified _ _ f : fs) end
@@ -1062,8 +1077,8 @@ simplKontFrame env ai (App (Type tyArg)) fs end
     simplKont env (addFrameToArgInfo ai (App (Type ty'))) fs end
 simplKontFrame _ (ArgInfo { ai_discs = [] }) _ _ _
   = pprPanic "simplKontFrame" (text "out of discounts??")
-simplKontFrame _ (ArgInfo { ai_strs = [] }) _ _ _
-  = pprPanic "simplKontFrame" (text "should have dealt with bottom already")
+simplKontFrame _ ai@(ArgInfo { ai_strs = [] }) f _ _
+  = pprPanic "simplKontFrame" (text "should have dealt with bottom already" $$ ppr ai $$ ppr f)
 simplKontFrame env ai@(ArgInfo { ai_strs = str:_
                                , ai_discs = disc:_ }) (App arg) fs end
   | str
@@ -1133,6 +1148,10 @@ simplKontAfterRules :: SimplEnv -> ArgInfo
                     -> SimplM (SimplEnv, OutCommand)
 simplKontAfterRules _ (ArgInfo { ai_co = Just co }) _
   = pprPanic "simplKontAfterRules" (text "Leftover coercion:" <+> ppr co)
+simplKontAfterRules _ ai@(ArgInfo { ai_target = target }) end
+  | not (argInfoHasTerm ai)
+  = pprPanic "simplKontAfterRules" (text "Not a term target:" <+> ppr target $$
+                                    text "Continuation:" <+> ppr end)
 simplKontAfterRules env ai (Case x alts)
   | TermTarget (Lit lit) <- ai_target ai
   , not (litIsLifted lit)
@@ -1401,7 +1420,8 @@ simplJump env args j
           
            case rhs'_maybe of
              Nothing
-               -> simplKont env (mkJumpArgInfo env j' frames) frames end
+               -> simplKont env (mkJumpArgInfo env j' frames) frames
+                                (Simplified OkToDup Nothing Return)
                     -- Activate case 2 of simplKont (Note [simplKont invariants])
              Just (Right pk')
                -> do
@@ -1414,7 +1434,7 @@ simplJump env args j
         -> reduce (env `setStaticPart` stat') pk
   where
     frames = map (Incoming (termStaticPart env) . App) args
-    end    = Incoming (staticPart env) Return
+    end    = (Simplified OkToDup Nothing Return)
     reduce env_pk pk
       = simplKont env_pk (mkPKontArgInfo env_pk (Incoming (staticPart env_pk) pk) frames)
                           frames end
@@ -1858,6 +1878,7 @@ mkDupableKont env ty kont
           Just (SynKont { mk_frames = fs, mk_end = end })
                                  -> go env fs' ty fs end
           Just (mk@StrictArg { mk_argInfo = ai })
+                                  | argInfoHasTerm ai
                                  -> do
                                     let ty'  = funResultTy (termType (argInfoToTerm ai))
                                     (env', mk') <- mkDupableKont env ty' mk

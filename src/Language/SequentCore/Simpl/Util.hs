@@ -219,7 +219,7 @@ mkPKontArgInfo _env pk _fs
 
 idArgStrictnesses :: Var -> Int -> [Bool]
 idArgStrictnesses fun n_val_args
-  = case splitRealStrictness of
+  = case splitStrictSig (idStrictness fun) of
       (demands, result_info)
             | not (demands `lengthExceeds` n_val_args)
             ->      -- Enough args, use the strictness given.
@@ -240,16 +240,6 @@ idArgStrictnesses fun n_val_args
                vanilla_stricts
   where
     vanilla_stricts = repeat False
-    splitRealStrictness
-      | isPKontId fun -- Argument is always an unboxed tuple; need to look inside
-      = case splitStrictSig (idStrictness fun) of
-          (demands, result_info)
-            | [splitProdDmd_maybe -> Just demands'] <- demands
-            -> (demands', result_info)
-            | otherwise
-            -> ([], result_info)
-      | otherwise
-      = splitStrictSig (idStrictness fun)
 
 -- Add a frame to the ArgInfo. If it is an argument and the ArgInfo has a
 -- coercion pending, this will call 'castApp' to push the coercion past the
@@ -266,11 +256,17 @@ addFrameToArgInfo ai f
                             Nothing          -> (arg, swallowCoercion ai)
                         | otherwise
                         = (arg, ai)
+            strs'       | null (ai_strs ai)
+                        = warnPprTrace True __FILE__ __LINE__
+                            (text "Adding frame to bottoming ArgInfo" $$ ppr f $$ ppr ai)
+                            []
+                        | otherwise
+                        = tail (ai_strs ai)
             -- If the argument is a term, advance ai_strs and ai_discs
             ai2         | isTypeArg arg
                         = ai1
                         | otherwise
-                        = ai1 { ai_strs  = tail (ai_strs ai1)
+                        = ai1 { ai_strs  = strs'
                               , ai_discs = tail (ai_discs ai1) }
             -- Finally, add the (possibly modified) frame
             in ai2 { ai_frames = App arg' : ai_frames ai2 }
