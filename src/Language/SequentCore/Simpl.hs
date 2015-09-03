@@ -333,7 +333,7 @@ simplLazyOrPKontBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InRhs -> Top
 simplLazyOrPKontBind env_x x x' env_r r level recFlag
   = case r of
       Left term -> assert (not (isPKontId x)) $
-                   simplLazyBind env_x x x' env_r term level recFlag
+                   simplLazyBind env_x x x' (zapKontSubstEnvsStatic env_r) term level recFlag
       Right pk  -> assert (isPKontId x && isNotTopLevel level) $ do
                    env_r' <- ensureDupableKont (env_r `inDynamicScope` zapFloats env_x)
                      -- Note [Call ensureDupableKont around join point]
@@ -355,7 +355,7 @@ Nota bene:
        that should have been done already.
 -}
 
-simplLazyBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InTerm -> TopLevelFlag
+simplLazyBind :: SimplEnv -> InVar -> OutVar -> StaticTermEnv -> InTerm -> TopLevelFlag
               -> RecFlag -> SimplM SimplEnv
 simplLazyBind env_x x x' env_v v level recFlag
   | tracing
@@ -364,12 +364,12 @@ simplLazyBind env_x x x' env_v v level recFlag
   = undefined
   | isCoVar x
   , Coercion co <- assert (isCoArg v) v
-  = let co' = simplCoercion (env_v `inDynamicScope` env_x) co
+  = let co' = simplCoercion (env_v `inDynamicScopeForTerm` env_x) co
     in return $ extendCvSubst env_x x co'
   | otherwise
   = do
     -- TODO Handle floating type lambdas
-    let env_v' = zapFloats (env_v `inDynamicScope` env_x)
+    let env_v' = zapFloats (env_v `inDynamicScopeForTerm` env_x)
     (env_v'', v') <- simplTerm env_v' RhsCtxt v
     (env_v_final, v'') <- prepareRhsTerm env_v'' level x' v'
     (env_x', v''')
@@ -784,13 +784,13 @@ simplCommand env (Let (NonRec pair) comm)
     simplNonRecInCommand env x (staticPart env) rhs mk $
       \env' -> simplCommand env' comm
 simplCommand env (Eval term (Kont fs end))
-  = simplTermInCommand env term Nothing (map (Incoming stat) fs) (Incoming stat end)
-  where
-    stat = staticPart env
+  = simplTermInCommand (zapKontSubstEnvs env) term Nothing
+                       (Incoming (termStaticPart env) <$> fs)
+                       (Incoming (staticPart env) end)
 simplCommand env (Jump args j)
   = simplJump env args j
 
-simplTermNoFloats :: SimplEnv -> CallCtxt -> InTerm -> SimplM OutTerm
+simplTermNoFloats :: SimplTermEnv -> CallCtxt -> InTerm -> SimplM OutTerm
 simplTermNoFloats env ctxt (Compute ty comm)
   = do
     let (env', ty') = enterKontScope env ctxt ty
@@ -801,7 +801,7 @@ simplTermNoFloats env ctxt term
     (env', term') <- simplTerm (zapFloats env) ctxt term
     return $ wrapFloatsAroundTerm env' term'
 
-simplTerm :: SimplEnv -> CallCtxt -> InTerm -> SimplM (SimplEnv, OutTerm)
+simplTerm :: SimplTermEnv -> CallCtxt -> InTerm -> SimplM (SimplTermEnv, OutTerm)
 simplTerm env _ctxt (Type ty)
   = return (env, Type (substTy env ty))
 simplTerm env _ctxt (Coercion co)
@@ -830,21 +830,25 @@ Most interesting terms go through the following sequence of mutually
 tail-recursive functions. There are a few more in between, but these are the
 most important steps.
 
-simplTermInCommand     :: SimplEnv -> InTerm -> Maybe SubstedCoercion
+Note that the environment in most of these functions is a SimplTermEnv. This is
+because terms and frames are closed to continuations, so only the ScopedEnd has
+the relevant bindings.
+
+simplTermInCommand     :: SimplTermEnv -> InTerm -> Maybe SubstedCoercion
                        -> [ScopedFrame] -> ScopedEnd
                        -> SimplM (SimplEnv, OutCommand)
 
 Simplifies the term, based on its unsimplified context. Inlining and
 beta-reduction apply here, as does entering Compute terms.
 
-simplTermInCommandDone :: SimplEnv -> OutTerm -> Maybe SubstedCoercion
+simplTermInCommandDone :: SimplTermEnv -> OutTerm -> Maybe SubstedCoercion
                        -> [ScopedFrame] -> ScopedEnd
                        -> SimplM (SimplEnv, OutCommand)
 
 Called when simplTermInCommand finishes. Packages up the term and the (possible)
 coercion to build the initial ArgInfo, then continues onto simplKont.
 
-simplKont              :: SimplEnv -> ArgInfo
+simplKont              :: SimplTermEnv -> ArgInfo
                        -> [ScopedFrame] -> ScopedEnd
                        -> SimplM (SimplEnv, OutCommand)
 
@@ -869,13 +873,13 @@ metacontinuation or after all the branches of a Case are recursed into. Attaches
 the Term to the End and returns.
 -}
 
-simplTermInCommand     :: SimplEnv -> InTerm -> Maybe SubstedCoercion
+simplTermInCommand     :: SimplTermEnv -> InTerm -> Maybe SubstedCoercion
                        -> [ScopedFrame] -> ScopedEnd
                        -> SimplM (SimplEnv, OutCommand)
 simplTermInCommand env_v v co_m fs end
   | tracing
   , pprTraceShort "simplTermInCommand" (
-      ppr env_v $$ ppr v $$ maybe empty showCo co_m $$ pprMultiScopedKont fs end
+      pprTermEnv env_v $$ ppr v $$ maybe empty showCo co_m $$ pprMultiScopedKont fs end
     ) False
   = undefined
   where
@@ -910,7 +914,7 @@ simplTermInCommand env_v (Var x) co_m fs end
         -- don't do any substitutions when processing it again
         -> simplTermInCommand (zapSubstEnvs env_v) v co_m fs end
       Susp stat v
-        -> simplTermInCommand (env_v `setStaticPart` stat) v co_m fs end
+        -> simplTermInCommand (env_v `setStaticTermPart` stat) v co_m fs end
   where
     dump_inline dflags def fs end
       | not (tracing || dopt Opt_D_dump_inlinings dflags) = return ()
@@ -965,7 +969,7 @@ simplTermInCommand env_v v@(Lam x body) co_m (f : fs) end
                                     -- have function/forall type
                               in (arg', Just co', zapSubstEnvs env_k)
           | otherwise       = (arg, Nothing, env_k)
-        mk = StrictLamBind { mk_env      = staticPart env_v
+        mk = StrictLamBind { mk_termEnv  = termStaticPart env_v
                            , mk_context  = getContext env_v
                            , mk_binder   = x
                            , mk_term     = body
@@ -986,7 +990,7 @@ simplTermInCommand env_v term@(Lam {}) co_m fs end
 simplTermInCommand env_v term@(Lit {}) co_m fs end
   = simplTermInCommandDone env_v term co_m fs end
 
-simplTermInCommandDone :: SimplEnv -> OutTerm -> Maybe SubstedCoercion
+simplTermInCommandDone :: SimplTermEnv -> OutTerm -> Maybe SubstedCoercion
                        -> [ScopedFrame] -> ScopedEnd
                        -> SimplM (SimplEnv, OutCommand)
 
@@ -1012,7 +1016,10 @@ As a jump has a very specific form, case 2 has some invariants:
   - The end is a Return
 -}
 
-simplKont :: SimplEnv -> ArgInfo
+simplKont :: SimplTermEnv -- No continuation bindings! We'll end up using the
+                          -- ones in the ScopedEnd (frames are also
+                          -- continuation-closed).
+          -> ArgInfo
           -> [ScopedFrame] -> ScopedEnd
           -> SimplM (SimplEnv, OutCommand)
 simplKont env ai fs end
@@ -1037,7 +1044,7 @@ simplKont env ai [] end
   = case openScoped env end of
       (env', end') -> simplKontEnd env' ai end'
 
-simplKontFrame :: SimplEnv -> ArgInfo
+simplKontFrame :: SimplTermEnv -> ArgInfo
                -> InFrame -> [ScopedFrame] -> ScopedEnd
                -> SimplM (SimplEnv, OutCommand)
 simplKontFrame env ai (Cast co) fs end
@@ -1227,7 +1234,8 @@ invokeMetaKont env term
                       , mk_frames = fs
                       , mk_end = end
                       , mk_context = ctxt })
-        -> simplKont (env `setContext` ctxt) (addFrameToArgInfo ai' (App term)) fs end
+        -> simplKont (zapKontSubstEnvs env `setContext` ctxt)
+                     (addFrameToArgInfo ai' (App term)) fs end
       Just (StrictLet { mk_env = stat
                       , mk_binder = bndr
                       , mk_command = comm })
@@ -1235,7 +1243,7 @@ invokeMetaKont env term
            env' <- simplNonRecOut (stat `inDynamicScope` env) bndr term
            let env_final = env' `setContext` BoringCtxt
            simplCommand env_final comm
-      Just (StrictLamBind { mk_env = stat
+      Just (StrictLamBind { mk_termEnv = stat
                           , mk_binder = bndr
                           , mk_term = body
                           , mk_coercion = co_m
@@ -1243,7 +1251,7 @@ invokeMetaKont env term
                           , mk_end = end
                           , mk_context = ctxt })
         -> do
-           env' <- simplNonRecOut (stat `inDynamicScope` env) bndr term
+           env' <- simplNonRecOut (stat `inDynamicScopeForTerm` env) bndr term
            let env_final = env' `setContext` ctxt
            simplTermInCommand env_final body co_m fs end
 
@@ -1373,7 +1381,7 @@ simplVar env x
   = case substId env x of
     DoneId x' -> return $ Var x'
     Done v -> return v
-    Susp stat v -> simplTermNoFloats (env `setStaticPart` stat) BoringCtxt v
+    Susp stat v -> simplTermNoFloats (env `setStaticTermPart` stat) BoringCtxt v
 
 simplJump :: SimplEnv -> [InArg] -> InPKontId -> SimplM (SimplEnv, OutCommand)
 simplJump env args j
@@ -1405,12 +1413,11 @@ simplJump env args j
       Susp stat' pk
         -> reduce (env `setStaticPart` stat') pk
   where
-    stat   = staticPart env
-    frames = map (Incoming stat . App) args
-    end    = Incoming stat Return
+    frames = map (Incoming (termStaticPart env) . App) args
+    end    = Incoming (staticPart env) Return
     reduce env_pk pk
       = simplKont env_pk (mkPKontArgInfo env_pk (Incoming (staticPart env_pk) pk) frames)
-                  frames end
+                          frames end
 
 knownCon :: SimplEnv
          -> OutTerm                             -- The scrutinee
@@ -1807,7 +1814,7 @@ mkDupableKont env ty kont
       ppr ans $$ vcat (map ppr (getFloatBinds (getFloats env')))
     return (env `addFloats` env', ans)
   where
-    go :: SimplEnv -> RevList OutFrame -> OutType
+    go :: SimplTermEnv -> RevList OutFrame -> OutType
        -> [ScopedFrame] -> ScopedEnd
        -> SimplM (SimplEnv, [OutFrame], ScopedEnd)
     go env fs' ty (f : fs) end
@@ -1924,7 +1931,7 @@ mkDupableTerm env term
   --  | otherwise
   = do
     (env', bndr) <- mkFreshVar env (fsLit "triv") (substTy env (termType term))
-    env'' <- simplLazyBind env' bndr bndr (staticPart env') term NotTopLevel NonRecursive
+    env'' <- simplLazyBind env' bndr bndr (termStaticPart env') term NotTopLevel NonRecursive
     term_final <- simplVar env'' bndr
     return (env'', term_final)
 

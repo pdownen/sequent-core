@@ -1,8 +1,8 @@
-{-# LANGUAGE ViewPatterns, BangPatterns, ImpredicativeTypes, CPP #-}
+{-# LANGUAGE ViewPatterns, BangPatterns, CPP #-}
 
 module Language.SequentCore.Simpl.Env (
   -- * Simplifier context
-  SimplEnv, CallCtxt(..),
+  SimplEnv, SimplTermEnv, CallCtxt(..),
   initialEnv, getMode, updMode, dynFlags, getSimplRules, getFamEnvs,
   getUnfoldingInRuleMatch, activeRule, getInScopeSet,
   
@@ -16,17 +16,19 @@ module Language.SequentCore.Simpl.Env (
   retType, getContext, setContext,
   addBndrRules,
   getTvSubst, getCvSubst,
-  zapSubstEnvs, zapTermSubstEnvs,
+  zapSubstEnvs, zapKontSubstEnvs, zapKontSubstEnvsStatic,
   
   -- * Extracting the part of the context carrying lexically scoped information
-  StaticEnv,
-  staticPart, setStaticPart, inDynamicScope,
-  zapSubstEnvsStatic,
+  StaticEnv, StaticTermEnv,
+  staticPart, termStaticPart, narrowToStaticTermPart,
+  setStaticPart, setStaticTermPart,
+  inDynamicScope, inDynamicScopeForTerm,
+  emptyStaticEnv, emptyStaticTermEnv,
   
   -- * Objects with lexical scope information attached
   Scoped(..), DupFlag(..),
   ScopedFrame, ScopedEnd, ScopedPKont, ScopedCommand,
-  openScoped, decompScoped, unScope,
+  openScoped, unScope,
   okToDup,
   pprMultiScopedKont,
   
@@ -57,7 +59,10 @@ module Language.SequentCore.Simpl.Env (
   SubstedCoercion,
   
   -- * Term information
-  termIsHNF, termIsConLike, termIsConApp_maybe
+  termIsHNF, termIsConLike, termIsConApp_maybe,
+  
+  -- * Output
+  pprTermEnv
 ) where
 
 import Language.SequentCore.Arity
@@ -122,30 +127,35 @@ data SimplGlobalEnv
 
 data SimplEnv
   = SimplEnv    { se_idSubst :: SimplIdSubst   -- InId      |--> TermSubstAns (in/out)
-                , se_pvSubst :: SimplPvSubst   -- InPKontId |--> PKontSubstAns (in/out)
                 , se_tvSubst :: TvSubstEnv     -- InTyVar   |--> OutType
                 , se_cvSubst :: CvSubstEnv     -- InCoVar   |--> OutCoercion
+                --  ^^^ term static part ^^^  --
+                , se_pvSubst :: SimplPvSubst   -- InPKontId |--> PKontSubstAns (in/out)
                 , se_retTy   :: Maybe OutType
                 , se_retKont :: KontSubst      -- ()        |--> Scoped MetaKont (in/out)
                 --  ^^^ static part ^^^  --
+                --  (includes term static part)
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
                 , se_defs    :: IdDefEnv       -- OutId     |--> Definition (out)
                 , se_context :: CallCtxt
                 , se_floats  :: Floats
                 , se_global  :: SimplGlobalEnv }
 
-newtype StaticEnv = StaticEnv SimplEnv -- Ignore se_inScope, etc.
+type SimplTermEnv = SimplEnv -- Environment where continuation bindings aren't relevant
 
-type SimplSubst a = IdEnv (SubstAns a) -- InId |--> SubstAns a
-data SubstAns a
+newtype StaticEnv     = StaticEnv     SimplEnv -- Ignore dynamic-only part
+newtype StaticTermEnv = StaticTermEnv SimplEnv -- Also ignore cont bindings
+
+type SimplSubst env a = IdEnv (SubstAns env a) -- InId |--> SubstAns env a
+data SubstAns env a
   = Done (Out a)
   | DoneId OutId
-  | Susp StaticEnv (In a)
+  | Susp env (In a)
 
-type SimplIdSubst  = SimplSubst SeqCoreTerm
-type SimplPvSubst  = SimplSubst SeqCorePKont
-type TermSubstAns  = SubstAns SeqCoreTerm
-type PKontSubstAns = SubstAns SeqCorePKont
+type SimplIdSubst  = SimplSubst StaticTermEnv SeqCoreTerm
+type SimplPvSubst  = SimplSubst StaticEnv     SeqCorePKont
+type TermSubstAns  = SubstAns   StaticTermEnv SeqCoreTerm
+type PKontSubstAns = SubstAns   StaticEnv     SeqCorePKont
 type KontSubst     = Maybe MetaKont
 
 {-
@@ -225,7 +235,7 @@ data MetaKont = SynKont { mk_frames :: [ScopedFrame]
                           , mk_binder  :: InBndr
                           , mk_command :: InCommand } -- Never dupable
                                                       -- Note [Duplicating StrictBind] in GHC Simplify
-              | StrictLamBind { mk_env      :: StaticEnv
+              | StrictLamBind { mk_termEnv  :: StaticTermEnv
                               , mk_binder   :: InBndr
                               , mk_term     :: InTerm
                               , mk_coercion :: Maybe SubstedCoercion
@@ -274,40 +284,29 @@ value carries a Scoped MetaKont as its one remaining piece of context.
 -}
 
 -- TODO This is almost the same as SubstAns. Do we need both?
-data Scoped a = Incoming           StaticEnv (In  a)
-              | Simplified DupFlag KontSubst (Out a)
+data Scoped env a = Incoming           env       (In  a)
+                  | Simplified DupFlag KontSubst (Out a)
 data DupFlag = NoDup | OkToDup
   deriving (Eq)
 
-type ScopedFrame = Scoped SeqCoreFrame
-type ScopedEnd   = Scoped SeqCoreEnd
-type ScopedPKont = Scoped SeqCorePKont
-type ScopedCommand = Scoped SeqCoreCommand
+type ScopedFrame = Scoped StaticTermEnv SeqCoreFrame
+type ScopedEnd   = Scoped StaticEnv SeqCoreEnd
+type ScopedPKont = Scoped StaticEnv SeqCorePKont
+type ScopedCommand = Scoped StaticEnv SeqCoreCommand
 
-openScoped :: SimplEnv -> Scoped a -> (SimplEnv, In a)
+openScoped :: SimplEnvFragment env => SimplEnv -> Scoped env a -> (SimplEnv, In a)
 openScoped env scoped
   = case scoped of
-      Incoming     stat a -> (env `setStaticPart` stat, a)
+      Incoming     stat a -> (env `setEnvPart` stat, a)
       Simplified _ mk   a -> (zapSubstEnvs env `setKontSubst` mk, a)
 
--- | Decompose a scoped term into the term and its scope, represented as a
--- partially applied constructor for Scoped. Useful for copying an expression's
--- scope into its subexpressions:
---     case decompScoped cont of
---       (scope, Kont fs end) -> (map scope fs, scope end) }
-decompScoped :: Scoped a -> (forall b. b -> Scoped b, a)
-decompScoped scoped
-  = case scoped of
-      Incoming       stat a -> (Incoming stat,     a)
-      Simplified dup mk   a -> (Simplified dup mk, a)
-
-unScope :: Scoped a -> a
+unScope :: Scoped env a -> a
 unScope scoped
   = case scoped of
       Incoming   _ a   -> a
       Simplified _ _ a -> a
 
-okToDup :: Scoped a -> Bool
+okToDup :: Scoped env a -> Bool
 okToDup (Simplified OkToDup _ _) = True
 okToDup _                        = False
 
@@ -756,7 +755,7 @@ mkCoreSubst doc env@(SimplEnv { se_inScope = in_scope, se_tvSubst = tv_env, se_c
 
     fiddle (Done e)          = termToCoreExpr e
     fiddle (DoneId v)        = Core.Var v
-    fiddle (Susp (StaticEnv env') e) = termToCoreExpr (substTerm (text "mkCoreSubst" <+> doc) env' e)
+    fiddle (Susp (StaticTermEnv env') e) = termToCoreExpr (substTerm (text "mkCoreSubst" <+> doc) env' e)
                                                 -- Don't shortcut here
                                                 
     fiddlePKontVar x | isPKontId x = pKontIdToCore retTy x
@@ -790,7 +789,7 @@ doSubstT env (Var x)
   = case substId env x of
       DoneId x' -> Var x'
       Done term -> term
-      Susp stat term -> doSubstT (stat `inDynamicScope` env) term
+      Susp stat term -> doSubstT (stat `inDynamicScopeForTerm` env) term
 doSubstT env (Type ty)
   = Type (substTy env ty)
 doSubstT env (Coercion co)
@@ -878,7 +877,7 @@ extendPvSubst :: SimplEnv -> InVar -> PKontSubstAns -> SimplEnv
 extendPvSubst env x rhs
   = env { se_pvSubst = extendVarEnv (se_pvSubst env) x rhs }
 
-extendIdOrPvSubst :: SimplEnv -> InVar -> SubstAns SeqCoreRhs -> SimplEnv
+extendIdOrPvSubst :: SimplEnv -> InVar -> SubstAns StaticEnv SeqCoreRhs -> SimplEnv
 extendIdOrPvSubst env x rhs
   | isPKontId x
   = extendPvSubst env x $ case rhs of
@@ -890,7 +889,7 @@ extendIdOrPvSubst env x rhs
   = extendIdSubst env x $ case rhs of
                             Done (Left term) -> Done term
                             DoneId x'        -> DoneId x'
-                            Susp stat (Left term) -> Susp stat term
+                            Susp (StaticEnv stat) (Left term) -> Susp (termStaticPart stat) term
                             _                -> pprPanic "extendIdOrPvSubst" (ppr x <+> ppr rhs)
 
 extendTvSubst :: SimplEnv -> InTyVar -> OutType -> SimplEnv
@@ -913,11 +912,9 @@ pushKont :: SimplEnv -> InKont -> SimplEnv
 pushKont env (Kont frames end)
   -- Since invoking this metacontinuation will restore the current environment,
   -- the original metacontinuation will run after this one.
-  = env `setRetKont` (SynKont { mk_frames = Incoming stat <$> frames
-                              , mk_end    = Incoming stat end
-                              , mk_dup    = NoDup })
-  where
-    stat = staticPart env
+  = env `setRetKont` SynKont { mk_frames = Incoming (termStaticPart env) <$> frames
+                             , mk_end    = Incoming (staticPart env) end
+                             , mk_dup    = NoDup }
 
 zapSubstEnvs :: SimplEnv -> SimplEnv
 zapSubstEnvs env
@@ -927,12 +924,14 @@ zapSubstEnvs env
         , se_cvSubst = emptyVarEnv
         , se_retKont = Nothing }
 
-zapTermSubstEnvs :: SimplEnv -> SimplEnv
-zapTermSubstEnvs env
-  = env { se_idSubst = emptyVarEnv
-        , se_pvSubst = emptyVarEnv
-        , se_tvSubst = emptyVarEnv
-        , se_cvSubst = emptyVarEnv }
+zapKontSubstEnvs :: SimplEnv -> SimplTermEnv
+zapKontSubstEnvs env
+  = env { se_pvSubst = emptyVarEnv
+        , se_retKont = Nothing }
+
+zapKontSubstEnvsStatic :: StaticEnv -> StaticTermEnv
+zapKontSubstEnvsStatic (StaticEnv env)
+  = StaticTermEnv (zapKontSubstEnvs env)
 
 setSubstEnvs :: SimplEnv -> [OutBindPair] -> SimplEnv
 setSubstEnvs env pairs
@@ -960,23 +959,77 @@ setContext env ctxt = env { se_context = ctxt }
 staticPart :: SimplEnv -> StaticEnv
 staticPart = StaticEnv
 
+termStaticPart :: SimplEnv -> StaticTermEnv
+termStaticPart = StaticTermEnv
+
+narrowToStaticTermPart :: StaticEnv -> StaticTermEnv
+narrowToStaticTermPart (StaticEnv env) = StaticTermEnv env
+
 setStaticPart :: SimplEnv -> StaticEnv -> SimplEnv
 setStaticPart dest (StaticEnv !src)
   = dest { se_idSubst = se_idSubst src
-         , se_pvSubst = se_pvSubst src
          , se_tvSubst = se_tvSubst src
          , se_cvSubst = se_cvSubst src
-         , se_retTy   = se_retTy   src
-         , se_retKont = se_retKont src }
+         , se_pvSubst = se_pvSubst src
+         , se_retKont = se_retKont src
+         , se_retTy   = se_retTy   src }
+
+setStaticTermPart :: SimplEnv -> StaticTermEnv -> SimplTermEnv
+setStaticTermPart dest (StaticTermEnv !src)
+  = dest { se_idSubst = se_idSubst src
+         , se_tvSubst = se_tvSubst src
+         , se_cvSubst = se_cvSubst src
+         , se_pvSubst = emptyVarEnv 
+         , se_retKont = Nothing
+         , se_retTy   = Nothing }
 
 inDynamicScope :: StaticEnv -> SimplEnv -> SimplEnv
 inDynamicScope = flip setStaticPart
 
--- This effectively clears everything but the retTy, since it's the only static
--- part that won't get zapped
-zapSubstEnvsStatic :: StaticEnv -> StaticEnv
-zapSubstEnvsStatic (StaticEnv env)
-  = StaticEnv $ zapSubstEnvs env
+inDynamicScopeForTerm :: StaticTermEnv -> SimplEnv -> SimplTermEnv
+inDynamicScopeForTerm = flip setStaticTermPart
+
+class SimplEnvFragment a where
+  envPart :: SimplEnv -> a
+  setEnvPart :: SimplEnv -> a -> SimplEnv
+
+instance SimplEnvFragment StaticEnv where
+  envPart = staticPart
+  setEnvPart = setStaticPart
+
+instance SimplEnvFragment StaticTermEnv where
+  envPart = termStaticPart
+  setEnvPart = setStaticTermPart
+
+emptyStaticEnv :: StaticEnv
+emptyStaticEnv
+  = StaticEnv $ SimplEnv { se_idSubst = emptyVarEnv
+                         , se_tvSubst = emptyVarEnv
+                         , se_cvSubst = emptyVarEnv
+                         , se_pvSubst = emptyVarEnv
+                         , se_retKont = Nothing
+                         , se_context = na
+                         , se_inScope = na
+                         , se_retTy   = na
+                         , se_defs    = na
+                         , se_floats  = na
+                         , se_global  = na }
+  where na = panic "emptyStaticEnv"
+
+emptyStaticTermEnv :: StaticTermEnv
+emptyStaticTermEnv
+  = StaticTermEnv $ SimplEnv { se_idSubst = emptyVarEnv
+                             , se_tvSubst = emptyVarEnv
+                             , se_cvSubst = emptyVarEnv
+                             , se_pvSubst = na
+                             , se_retKont = na
+                             , se_context = na
+                             , se_inScope = na
+                             , se_retTy   = na
+                             , se_defs    = na
+                             , se_floats  = na
+                             , se_global  = na }
+  where na = panic "emptyStaticTermEnv"
 
 ------------
 -- Floats --
@@ -1538,35 +1591,66 @@ termIsConApp_maybe env id_unf term
 ----------------
 
 pprMultiScopedKont :: [ScopedFrame] -> ScopedEnd -> SDoc
-pprMultiScopedKont frames end = sep $ punctuate semi (map ppr frames ++ [ppr end])
+pprMultiScopedKont frames end = sep $ punctuate semi (map ppr frames ++ [pprEnd end])
+  where
+    pprEnd end = ppr end <+> whereClause
+    
+    whereClause
+      | Just mk <- findMetaKont end
+      = hang (text "where") 2 (text "ret" <+> equals <+> ppr mk)
+      | otherwise
+      = empty
+    
+    findMetaKont (Incoming (StaticEnv env) _) = substKv env
+    findMetaKont (Simplified _ mk_m _) = mk_m
 
 instance Outputable SimplEnv where
   ppr env
     =  text "<InScope =" <+> braces (fsep (map ppr (varEnvElts (getInScopeVars (se_inScope env)))))
 --    $$ text " Defs      =" <+> ppr defs
     $$ text " IdSubst   =" <+> ppr (se_idSubst env)
-    $$ text " PvSubst   =" <+> ppr (se_pvSubst env)
     $$ text " TvSubst   =" <+> ppr (se_tvSubst env)
     $$ text " CvSubst   =" <+> ppr (se_cvSubst env)
-    $$ text " RetTy     =" <+> ppr (se_retTy env)
+    $$ text " PvSubst   =" <+> ppr (se_pvSubst env)
     $$ text " RetKont   =" <+> ppr (se_retKont env)
+    $$ text " RetTy     =" <+> ppr (se_retTy env)
     $$ text " Context   =" <+> ppr (se_context env)
     $$ text " Floats    =" <+> ppr floatBndrs
      <> char '>'
     where
       floatBndrs  = bindersOfBinds (getFloatBinds (se_floats env))
 
+pprTermEnv :: SimplTermEnv -> SDoc
+pprTermEnv env
+  =  text "<InScope =" <+> braces (fsep (map ppr (varEnvElts (getInScopeVars (se_inScope env)))))
+--    $$ text " Defs      =" <+> ppr defs
+  $$ text " IdSubst   =" <+> ppr (se_idSubst env)
+  $$ text " TvSubst   =" <+> ppr (se_tvSubst env)
+  $$ text " CvSubst   =" <+> ppr (se_cvSubst env)
+  $$ text " Context   =" <+> ppr (se_context env)
+  $$ text " Floats    =" <+> ppr floatBndrs
+   <> char '>'
+  where
+    floatBndrs  = bindersOfBinds (getFloatBinds (se_floats env))
+
+
 instance Outputable StaticEnv where
   ppr (StaticEnv env)
     =  text "<IdSubst   =" <+> ppr (se_idSubst env)
-    $$ text " KvSubst   =" <+> ppr (se_pvSubst env)
     $$ text " TvSubst   =" <+> ppr (se_tvSubst env)
     $$ text " CvSubst   =" <+> ppr (se_cvSubst env)
-    $$ text " RetTy     =" <+> ppr (se_retTy env)
+    $$ text " PvSubst   =" <+> ppr (se_pvSubst env)
     $$ text " RetKont   =" <+> ppr (se_retKont env)
      <> char '>'
 
-instance Outputable a => Outputable (SubstAns a) where
+instance Outputable StaticTermEnv where
+  ppr (StaticTermEnv env)
+    =  text "<IdSubst   =" <+> ppr (se_idSubst env)
+    $$ text " TvSubst   =" <+> ppr (se_tvSubst env)
+    $$ text " CvSubst   =" <+> ppr (se_cvSubst env)
+     <> char '>'
+
+instance Outputable a => Outputable (SubstAns env a) where
   ppr (Done v) = brackets (text "Done:" <+> ppr v)
   ppr (DoneId x) = brackets (text "Id:" <+> ppr x)
   ppr (Susp _env v) = brackets $ hang (text "Suspended:") 2 (pprDeeper (ppr v))
@@ -1611,7 +1695,7 @@ pprEither :: (Outputable a, Outputable b) => Either a b -> SDoc
 pprEither (Left x)  = ppr x
 pprEither (Right x) = ppr x
 
-instance Outputable a => Outputable (Scoped a) where
+instance Outputable a => Outputable (Scoped env a) where
   ppr (Incoming _ a) = text "<incoming>" <+> ppr a
   ppr (Simplified dup _ a) = ppr dup <+> ppr a
 
