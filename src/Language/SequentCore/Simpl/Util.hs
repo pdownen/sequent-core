@@ -234,7 +234,9 @@ idArgStrictnesses fun n_val_args
                else
                     map isStrictDmd demands ++ vanilla_stricts
            | otherwise
-           -> warnPprTrace True __FILE__ __LINE__ 
+           -> warnPprTrace (not (isPKontId fun && idArity fun == 0)) __FILE__ __LINE__
+                             -- Don't warn about nullary join points, which we see as
+                             -- arity 0 but translate to Core as arity 1
                            (text "More demands than arity" <+> pprBndr LetBind fun <+> ppr (idArity fun)
                             <+> ppr n_val_args <+> ppr demands )
                vanilla_stricts

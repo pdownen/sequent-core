@@ -1,4 +1,4 @@
-{-# LANGUAGE ParallelListComp, TupleSections, MultiWayIf, ViewPatterns #-}
+{-# LANGUAGE ParallelListComp, TupleSections, MultiWayIf, ViewPatterns, LambdaCase #-}
 
 -- | 
 -- Module      : Language.SequentCore.Translate
@@ -28,6 +28,7 @@ import qualified CoreUtils as Core
 import qualified CoreFVs as Core
 import FastString
 import Id
+import IdInfo
 import Maybes
 import qualified MkCore as Core
 import MkId
@@ -37,6 +38,7 @@ import TysPrim
 import TysWiredIn
 import UniqFM     ( intersectUFM_C )
 import Unique
+import Util       ( count )
 import VarEnv
 import VarSet
 
@@ -605,7 +607,10 @@ data KontType = KTExists TyVar KontType | KTTuple [KontType] | KTType Type
 idToPKontId :: Id -> KontCallConv -> PKontId
 idToPKontId p (ByJump fixed)
   = p `setIdType` kontTypeToType (go (idType p) fixed)
+      `setIdInfo` (idInfo p `setArityInfo` valArgCount)
   where
+    valArgCount = count (\case { ValArg {} -> True; _ -> False }) fixed
+    
     go _  [] = KTTuple []
     go ty (FixedType tyArg : fixed')
       | Just (tyVar, ty') <- splitForAllTy_maybe ty
@@ -953,9 +958,11 @@ endToCoreExpr retTy k =
     Return               -> \e -> e
 
 pKontIdToCore :: Type -> PKontId -> Id
-pKontIdToCore retTy j = j `setIdType` kontTyToCoreTy argTy retTy
+pKontIdToCore retTy j = maybeAddArity $ j `setIdType` kontTyToCoreTy argTy retTy
   where
     argTy = isKontTy_maybe (idType j) `orElse` pprPanic "pKontIdToCore" (pprBndr LetBind j)
+    maybeAddArity j' | idArity j' == 0 = j' `setIdInfo` (idInfo j' `setArityInfo` 1)
+                     | otherwise       = j'
 
 kontTyToCoreTy :: Type -> Type -> Type
 kontTyToCoreTy ty retTy
