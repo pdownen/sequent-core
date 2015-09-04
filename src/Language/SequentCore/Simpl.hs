@@ -778,11 +778,12 @@ simplCommand env (Let (NonRec pair) comm)
         stat = staticPart env
         -- If the binding is strict, we tail-recurse into the term, so we need
         -- a metacontinuation to resume
-        mk = StrictLet { mk_env = stat
-                       , mk_binder = x
-                       , mk_command = comm }
-    simplNonRecInCommand env x (staticPart env) rhs mk $
-      \env' -> simplCommand env' comm
+        mk_if_strict = StrictLet { mk_env = stat
+                                 , mk_binder = x
+                                 , mk_command = comm }
+    simplNonRecInCommand env x (staticPart env) rhs mk_if_strict $
+      \env' -> simplCommand env' comm -- Called if the binding is lazy or gets
+                                      -- pre-inlined
 simplCommand env (Eval term (Kont fs end))
   = simplTermInCommand (zapKontSubstEnvs env) term Nothing
                        (Incoming (termStaticPart env) <$> fs)
@@ -969,15 +970,18 @@ simplTermInCommand env_v v@(Lam x body) co_m (f : fs) end
                                     -- have function/forall type
                               in (arg', Just co', zapSubstEnvs env_k)
           | otherwise       = (arg, Nothing, env_k)
-        mk = StrictLamBind { mk_termEnv  = termStaticPart env_v
-                           , mk_context  = getContext env_v
-                           , mk_binder   = x
-                           , mk_term     = body
-                           , mk_coercion = co_m'
-                           , mk_frames   = fs
-                           , mk_end      = end }
-    simplNonRecInCommand env_v x (staticPart env_k') (Left arg') mk $
+        -- If the argument is strict, we'll tail-recurse into it; this
+        -- metacontinuation will then resume here
+        mk_if_strict = StrictLamBind { mk_termEnv  = termStaticPart env_v
+                                     , mk_context  = getContext env_v
+                                     , mk_binder   = x
+                                     , mk_term     = body
+                                     , mk_coercion = co_m'
+                                     , mk_frames   = fs
+                                     , mk_end      = end }
+    simplNonRecInCommand env_v x (staticPart env_k') (Left arg') mk_if_strict $
       \env_v' -> simplTermInCommand env_v' body co_m' fs end
+        -- Called if the argument is lazy or gets pre-inlined
   where
     (env_k, f') = openScoped env_v f
 simplTermInCommand env_v term@(Lam {}) co_m fs end
