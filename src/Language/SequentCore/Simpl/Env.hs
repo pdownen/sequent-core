@@ -39,7 +39,7 @@ module Language.SequentCore.Simpl.Env (
   -- * Sequent Core definitions (unfoldings) of identifiers
   IdDefEnv, Definition(..), Guidance(..),
   mkBoundTo, mkBoundToWithGuidance, mkBoundToDFun, inlineBoringOk, mkDef,
-  findDef, setDef, activeUnfolding,
+  findDef, findRealDef, setDef, activeUnfolding,
   defIsCheap, defIsConLike, defIsEvald, defIsSmallEnoughToInline, defIsStable,
   
   -- * Definitions floating outward
@@ -86,7 +86,7 @@ import CoreMonad  ( SimplifierMode(..) )
 import qualified CoreSubst
 import CoreSyn    ( Tickish(Breakpoint)
                   , Unfolding(..), UnfoldingGuidance(..), UnfoldingSource(..)
-                  , isCompulsoryUnfolding, isStableSource, mkOtherCon
+                  , hasSomeUnfolding, isCompulsoryUnfolding, isStableSource, mkOtherCon
                   , tickishCounts, tickishIsCode )
 import qualified CoreSyn as Core
 import CoreUnfold ( CallCtxt(..), mkCoreUnfolding, mkDFunUnfolding )
@@ -103,7 +103,7 @@ import Pair
 import Rules      ( RuleBase )
 import TyCon
 import Type       ( Type, TvSubstEnv, TvSubst
-                  , eqType, splitTyConApp_maybe, tyVarsOfType
+                  , eqType, seqType, splitTyConApp_maybe, tyVarsOfType
                   , mkTvSubst, mkTyConApp )
 import qualified Type
 import UniqSupply
@@ -575,10 +575,17 @@ enterRecScopes :: SimplEnv -> [InId] -> (SimplEnv, [OutId])
 enterRecScopes = enterScopes
 
 enterLamScope :: SimplEnv -> InVar -> (SimplEnv, OutVar)
-enterLamScope = enterScope
+enterLamScope env bndr
+  | isId bndr && hasSomeUnfolding old_unf = seqId id2 `seq` (env2, id2) -- Special case
+  | otherwise                             = enterScope env bndr         -- Normal case
+  where
+    old_unf = idUnfolding bndr
+    (env1, id1) = enterIdScope env bndr
+    id2  = id1 `setIdUnfolding` CoreSubst.substUnfolding (mkCoreSubst (text "enterLamScope") env) old_unf
+    env2 = modifyInScope env1 id2
 
 enterLamScopes :: SimplEnv -> [InVar] -> (SimplEnv, [OutVar])
-enterLamScopes = enterScopes
+enterLamScopes = mapAccumL enterLamScope
 
 enterIdScope :: SimplEnv -> InId -> (SimplEnv, OutId)
 enterIdScope env bndr
@@ -651,6 +658,19 @@ mkFreshVar env name ty
     let x'   = uniqAway (se_inScope env) x
         env' = env { se_inScope = extendInScopeSet (se_inScope env) x' }
     return (env', x')
+
+---------------------------
+-- Id-handling utilities --
+---------------------------
+
+seqId :: Id -> ()
+seqId id = seqType (idType id)  `seq`
+           idInfo id            `seq`
+           ()
+           
+------------------
+-- Substitution --
+------------------
 
 substId :: SimplEnv -> InId -> TermSubstAns
 substId (SimplEnv { se_idSubst = ids, se_inScope = ins }) x
@@ -1237,6 +1257,10 @@ findDef :: SimplEnv -> OutId -> Definition
 findDef env var
   = findDefBy env var idUnfolding
 
+findRealDef :: SimplEnv -> OutId -> Definition
+findRealDef env var
+  = lookupVarEnv (se_defs env) var `orElse` unfoldingToDef (realIdUnfolding var)
+
 expandDef_maybe :: Definition -> Maybe SeqCoreRhs
 expandDef_maybe (BoundTo { def_isExpandable = True, def_rhs = rhs }) = Just rhs
 expandDef_maybe _ = Nothing
@@ -1297,8 +1321,8 @@ defToUnfolding NoDefinition    = NoUnfolding
 defToUnfolding (NotAmong cons) = mkOtherCon cons
 defToUnfolding (BoundTo { def_rhs = Right _pkont })
   = NoUnfolding -- TODO Can we do better? Translating requires knowing the outer linear cont.
-defToUnfolding (BoundTo { def_rhs = Left term, def_level = lev, def_guidance = guid })
-  = mkCoreUnfolding InlineRhs (isTopLevel lev) (termToCoreExpr term)
+defToUnfolding (BoundTo { def_src = src, def_rhs = Left term, def_level = lev, def_guidance = guid })
+  = mkCoreUnfolding src (isTopLevel lev) (termToCoreExpr term)
       (termArity term) (guidanceToUnfGuidance guid)
 defToUnfolding (BoundToDFun { dfun_bndrs = bndrs, dfun_dataCon = con, dfun_args = args})
   = mkDFunUnfolding bndrs con (map termToCoreExpr args)

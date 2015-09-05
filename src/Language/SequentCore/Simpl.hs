@@ -35,7 +35,7 @@ import CoreMonad   ( Plugin(..), SimplifierMode(..), Tick(..), CoreToDo(..),
                    )
 import CoreSyn     ( CoreVect(..), CoreRule(..), UnfoldingSource(..)
                    , evaldUnfolding
-                   , isRuntimeVar, isStableSource
+                   , isRuntimeVar, isStableSource, isStableUnfolding
                    , tickishCounts
                    , ruleArity )
 import DataCon
@@ -584,7 +584,7 @@ completeBind env x x' v level
   | otherwise
   = do
     (newArity, v') <- tryEtaExpandRhs env x' v
-    let oldDef = findDef env x
+    let oldDef = findRealDef env x
     newDef <- simplDef env level x v' oldDef
     postInline <- postInlineUnconditionally env (mkBindPair x v') level newDef
     if postInline
@@ -593,24 +593,23 @@ completeBind env x x' v level
         -- Nevermind about substituting x' for x; we'll substitute v' instead
         return $ extendIdOrPvSubst env x (Done v')
       else do
-        let def = mkDef env level v'
-            info1 = idInfo x' `setArityInfo` newArity
-            (env', x'') = setDef env (x' `setIdInfo` info1) def
+        let info1 = idInfo x' `setArityInfo` newArity
+            (env', x'') = setDef env (x' `setIdInfo` info1) newDef
             info2 = idInfo x''
               -- Demand info: Note [Setting the demand info] in GHC Simplify
               --
               -- We also have to nuke demand info if for some reason
               -- eta-expansion *reduces* the arity of the binding to less
               -- than that of the strictness sig. This can happen: see Note [Arity decrease].
-            info3 | defIsEvald def
+            info3 | defIsEvald newDef
                     || (case strictnessInfo info2 of
                           StrictSig dmd_ty -> newArity < dmdTypeDepth dmd_ty)
                   = zapDemandInfo info2 `orElse` info2
                   | otherwise
                   = info2
-            x_final = x' `setIdInfo` info3
+            x_final = x'' `setIdInfo` info3
         
-        when tracing $ liftCoreM $ putMsg (text "defined" <+> ppr x_final <+> equals <+> ppr def)
+        when tracing $ liftCoreM $ putMsg (text "defined" <+> ppr x_final <+> equals <+> ppr newDef)
         return $ addNonRecFloat env' (mkBindPair x_final v')
 
 -- (from Simplify.simplUnfolding)
@@ -1345,7 +1344,7 @@ simplAlt env scrut' _ case_bndr' (Alt (DataAlt con) vs rhs)
   = do  {       -- Deal with the pattern-bound variables
                 -- Mark the ones that are in ! positions in the
                 -- data constructor as certainly-evaluated.
-                -- NB: simplLamBinders preserves this eval info
+                -- NB: enterLamScopes preserves this eval info
         ; let vs_with_evals = add_evals (dataConRepStrictness con)
         ; let (env', vs') = enterLamScopes env vs_with_evals
 
@@ -1561,10 +1560,9 @@ preInlineUnconditionally env_x _env_rhs pair level
   
     go mode dflags
       | not active                              = False
+      | isStableUnfolding (idUnfolding x)       = False  -- Note [InlineRule and preInlineUnconditionally] in GHC SimplUtils
       | not enabled                             = False
       | TopLevel <- level, isBottomingId x      = False
-      -- TODO Somehow GHC can pre-inline an exported thing? We can't, anyway
-      | isExportedId x                          = False
       | isCoVar x                               = False
       | otherwise = case idOccInfo x of
                       IAmDead                  -> True
