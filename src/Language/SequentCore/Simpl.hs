@@ -926,7 +926,7 @@ simplTermInCommand env_v (Var x) co_m fs end
       = liftIO $ printInfoForUser dflags alwaysQualify $
            sep [text "Inlining done: " <> ppr x,
                 nest 4 (vcat [text "Inlined fn: " <+> nest 2 (ppr def),
-                              text "Cont:  " <+> pprMultiScopedKont fs end])]
+                              text "Cont:  " <+> nest 2 (pprMultiScopedKont fs end)])]
 
 simplTermInCommand env_v (Compute ty c) co_m fs end
   = do
@@ -1408,7 +1408,7 @@ simplVar env x
 simplJump :: SimplEnv -> [InArg] -> InPKontId -> SimplM (SimplEnv, OutCommand)
 simplJump env args j
   | tracing
-  , pprTraceShort "simplJump" (ppr env $$ parens (pprWithCommas ppr args) $$ ppr j)
+  , pprTraceShort "simplJump" (ppr env $$ parens (pprWithCommas ppr args) $$ pprBndr LetBind j)
     False
   = undefined
 simplJump env args j
@@ -1429,6 +1429,7 @@ simplJump env args j
              Just (Right pk')
                -> do
                   tick (UnfoldingDone j')
+                  dump_inline (dynFlags env) pk'
                   reduce (zapSubstEnvs env) pk'
              _ -> pprPanic "simplJump" (ppr j $$ ppr rhs'_maybe)
       Done pk
@@ -1441,6 +1442,18 @@ simplJump env args j
     reduce env_pk pk
       = simplKont env_pk (mkPKontArgInfo env_pk (Incoming (staticPart env_pk) pk) frames)
                           frames end
+    
+    dump_inline dflags def
+      | not (tracing || dopt Opt_D_dump_inlinings dflags) = return ()
+      | not (tracing || dopt Opt_D_verbose_core2core dflags)
+      = when (isExternalName (idName j)) $
+            liftIO $ printInfoForUser dflags alwaysQualify $
+                sep [text "Inlining done:", nest 4 (ppr j)]
+      | otherwise
+      = liftIO $ printInfoForUser dflags alwaysQualify $
+           sep [text "Inlining done: " <> ppr j,
+                nest 4 (vcat [text "Inlined join point: " <+> nest 2 (ppr def),
+                              text "Args:  " <+> ppr args])]
 
 knownCon :: SimplEnv
          -> OutTerm                             -- The scrutinee
@@ -1684,7 +1697,7 @@ callSiteInline env id active_unfolding lone_variable fs end
 
 -- Impedence mismatch between Sequent Core code and logic from CoreUnfold.
 distillKont :: SimplEnv -> [ScopedFrame] -> ScopedEnd -> ([ArgSummary], CallCtxt)
-distillKont env fs end = (mapMaybe (doFrame . unScope) fs, doEnd (unScope end))
+distillKont env fs end = (mapMaybe (doFrame . substScoped env) fs, doEnd (substScoped env end))
   where
     doFrame (App v)    | not (isTypeArg v)
                        = Just (interestingArg v)
@@ -1744,11 +1757,14 @@ tryUnfolding dflags id lone_variable
       = case cont_info' of
           CaseCtxt   -> not (lone_variable && is_wf)  -- Note [Lone variables]
           ValAppCtxt -> True                          -- Note [Cast then apply]
-          RuleArgCtxt -> uf_arity > 0  -- See Note [Unfold info lazy contexts]
-          DiscArgCtxt -> uf_arity > 0  --
-          RhsCtxt     -> uf_arity > 0  --
-          _           -> not is_top && uf_arity > 0   -- Note [Nested functions]
+          RuleArgCtxt -> is_function  -- See Note [Unfold info lazy contexts]
+          DiscArgCtxt -> is_function  --
+          RhsCtxt     -> is_function  --
+          _           -> not is_top && is_function    -- Note [Nested functions]
                                                       -- Note [Inlining in ArgCtxt]
+
+    is_function | Right {} <- unf_template = True -- Join points are always functions
+                | otherwise = uf_arity > 0
 
     (yes_or_no, extra_doc)
       = case guidance of

@@ -1,4 +1,4 @@
-{-# LANGUAGE ViewPatterns, BangPatterns, CPP #-}
+{-# LANGUAGE ViewPatterns, BangPatterns, FlexibleInstances, CPP #-}
 
 module Language.SequentCore.Simpl.Env (
   -- * Simplifier context
@@ -7,7 +7,7 @@ module Language.SequentCore.Simpl.Env (
   getUnfoldingInRuleMatch, activeRule, getInScopeSet,
   
   -- * Substitution and lexical scope
-  SubstAns(..), KontSubst,
+  SubstAns(..), KontSubst, Substable(..),
   substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar, lookupRecBndr,
   substTerm, substKont, substFrame, substEnd, substPKont, substCommand,
   extendIdSubst, extendPvSubst, extendIdOrPvSubst, extendTvSubst, extendCvSubst,
@@ -28,7 +28,7 @@ module Language.SequentCore.Simpl.Env (
   -- * Objects with lexical scope information attached
   Scoped(..), DupFlag(..),
   ScopedFrame, ScopedEnd, ScopedPKont, ScopedCommand,
-  openScoped, unScope,
+  openScoped, unScope, substScoped,
   okToDup,
   pprMultiScopedKont,
   
@@ -310,6 +310,10 @@ okToDup :: Scoped env a -> Bool
 okToDup (Simplified OkToDup _ _) = True
 okToDup _                        = False
 
+substScoped :: (SimplEnvFragment env, Substable a)
+            => SimplEnv -> Scoped env a -> a
+substScoped env scoped = case openScoped env scoped of (env', a) -> subst env' a
+
 -----------------
 -- Definitions --
 -----------------
@@ -381,9 +385,9 @@ mkBoundToWithGuidance env (Right pk) src level arity guid
             , def_level        = level
             , def_guidance     = guid
             , def_arity        = arity
-            , def_isExpandable = pKontIsExpandable pk
-            , def_isValue      = pKontIsHNF env pk
-            , def_isWorkFree   = pKontIsCheap pk
+            , def_isExpandable = True -- For inlining decisions, pkonts are all lambdas
+            , def_isValue      = True
+            , def_isWorkFree   = True 
             , def_isConLike    = pKontIsConLike env pk
             }
 
@@ -888,6 +892,16 @@ doSubstB env bind
   where
     doRhs env' (Left term) = Left  (doSubstT env' term)
     doRhs env' (Right pk)  = Right (doSubstP env' pk)
+    
+class Substable a where
+  subst :: SimplEnv -> a -> a
+
+instance Substable SeqCoreTerm where subst = doSubstT
+instance Substable SeqCoreKont where subst = doSubstK
+instance Substable SeqCoreFrame where subst = doSubstF
+instance Substable SeqCoreEnd where subst = doSubstE
+instance Substable SeqCorePKont where subst = doSubstP
+instance Substable SeqCoreCommand where subst = doSubstC
 
 extendIdSubst :: SimplEnv -> InVar -> TermSubstAns -> SimplEnv
 extendIdSubst env x rhs
@@ -1251,7 +1265,7 @@ findDefBy env var id_unf
   | isStrongLoopBreaker (idOccInfo var)
   = NoDefinition
   | otherwise
-  = lookupVarEnv (se_defs env) var `orElse` unfoldingToDef (id_unf var)
+  = lookupVarEnv (se_defs env) var `orElse` unfoldingToDef var (id_unf var)
 
 findDef :: SimplEnv -> OutId -> Definition
 findDef env var
@@ -1259,7 +1273,7 @@ findDef env var
 
 findRealDef :: SimplEnv -> OutId -> Definition
 findRealDef env var
-  = lookupVarEnv (se_defs env) var `orElse` unfoldingToDef (realIdUnfolding var)
+  = lookupVarEnv (se_defs env) var `orElse` unfoldingToDef var (realIdUnfolding var)
 
 expandDef_maybe :: Definition -> Maybe SeqCoreRhs
 expandDef_maybe (BoundTo { def_isExpandable = True, def_rhs = rhs }) = Just rhs
@@ -1282,10 +1296,11 @@ getUnfoldingInRuleMatch env
      | not (sm_rules mode) = active_unfolding_minimal id
      | otherwise           = isActive (sm_phase mode) (idInlineActivation id)
 
-unfoldingToDef :: Unfolding -> Definition
-unfoldingToDef NoUnfolding     = NoDefinition
-unfoldingToDef (OtherCon cons) = NotAmong cons
-unfoldingToDef unf@(CoreUnfolding {})
+unfoldingToDef :: Var -> Unfolding -> Definition
+unfoldingToDef var _ | isPKontId var = NoDefinition -- Can't translate a pkont in isolation
+unfoldingToDef _ NoUnfolding     = NoDefinition
+unfoldingToDef _ (OtherCon cons) = NotAmong cons
+unfoldingToDef _ unf@(CoreUnfolding {})
   = BoundTo { def_rhs          = Left (termFromCoreExpr (uf_tmpl unf))
             , def_src          = uf_src unf
             , def_level        = if uf_is_top unf then TopLevel else NotTopLevel
@@ -1295,7 +1310,7 @@ unfoldingToDef unf@(CoreUnfolding {})
             , def_isConLike    = uf_is_conlike unf
             , def_isWorkFree   = uf_is_work_free unf
             , def_isExpandable = uf_expandable unf }
-unfoldingToDef unf@(DFunUnfolding {})
+unfoldingToDef _ unf@(DFunUnfolding {})
   = BoundToDFun { dfun_bndrs    = df_bndrs unf
                 , dfun_dataCon  = df_con unf
                 , dfun_args     = map (occurAnalyseTerm . termFromCoreExpr)
