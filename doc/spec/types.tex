@@ -97,11 +97,33 @@
 \label{fig:dual-fc-syntax}
 \end{figure}
 
-The syntax for Dual System FC are shown in Figure~\ref{fig:dual-fc-syntax}.
-Types, kinds, coercions, and declarations are unchanged by the sequent calculus
+The syntax for Sequent Core is shown in Figure~\ref{fig:dual-fc-syntax}.  Types,
+kinds, coercions, and declarations are unchanged by the sequent calculus
 representation, so they are elided here.  Note that data constructors, written
 $K$, are treated as a special sort of variable in the syntax, and additionally
 type constructors, written $T$, are treated as a special sort of type variable.
+To keep the similarity with Core, types are included in terms, but can only
+appear in certain contexts.  In particular, we have the frame that instantiates
+a polymorphic term by application to a type, $\inst{\ty}$, as well as binding a
+type to a variable, $\bindv{a:\ki}{\ty}$.  In all other contexts, types as terms
+are disallowed, like in the ill-formed term $\fn{\ann{x}{Bool}}Int$.
+
+A note about the scope of bindings: terms can only reference value bindings
+($\bindv{\ann{x}{\ty}}{\tm}$) and cannot reference continuation bindings
+($\bindk{\ann{j}{\ty}}{\fnk{\vect[n]{\ann{x_n}{\ty_n}}}\cmd}$).  There are some
+consequences to the structure of $\Let$-bindings due to this scoping
+restriction:
+\begin{itemize}
+\item Continuation bindings can reference value bindings and other continuation
+  bindings, but value bindings can only reference other value bindings.
+\item In any sequence of bindings, all value bindings can always be placed
+  before all continuation bindings.
+\item Value and continuation bindings cannot be mutually recursive.  Any
+  minimal, mutually recursive $\rec{\vect[n]{\bp_n}}$ block will consist of only
+  value bindings or only continuation bindings.
+\end{itemize}
+More details about scoping are discussed in Section~\ref{sec:scope-analysis}.
+
 We use some conventional shorthands to make programs easier to read:
 \begin{itemize}
 \item If the type annotations on variables, \emph{ie} the $\ty$ in $\ann x \ty$,
