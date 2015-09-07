@@ -17,16 +17,18 @@ module Language.SequentCore.Syntax (
     SeqCoreCommand, SeqCoreBind, SeqCoreBindPair, SeqCoreRhs, SeqCoreBndr,
     SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
-  mkCommand, mkVarTerm, mkLambdas, mkCompute, mkComputeEval,
-  mkAppTerm, mkCast, mkCastMaybe, castBottomTerm, mkConstruction, mkImpossibleCommand,
+  mkCommand, mkVarArg, mkLambdas, mkCompute, mkComputeEval,
+  mkAppTerm, mkAppCommand, mkConstruction, mkConstructionCommand,
+  mkCast, mkCastMaybe, castBottomTerm, mkImpossibleCommand,
   addLets, addLetsToTerm, addNonRec, consFrame, addFrames,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
+  splitCastTerm, splitCastCommand,
   spanTypes, spanTypeArgs,
   flattenCommand,
   isValueArg, isTypeArg, isCoArg, isTyCoArg, isAppFrame, isValueAppFrame,
-  isTrivial, isTrivialTerm, isTrivialKont, isTrivialPKont, isReturnKont, isReturn,
-  isDefaultAlt,
+  isTrivial, isTrivialTerm, isTrivialKont, isTrivialPKont, isTrivialRhs,
+  isReturnKont, isReturn, isDefaultAlt,
   termIsConstruction, termAsConstruction, splitConstruction,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
   binderOfPair, setPairBinder, rhsOfPair, mkBindPair, destBindPair,
@@ -37,8 +39,8 @@ module Language.SequentCore.Syntax (
   needsCaseBinding,
   termOkForSpeculation, commandOkForSpeculation, kontOkForSpeculation,
   termOkForSideEffects, commandOkForSideEffects, kontOkForSideEffects,
-  termIsCheap, kontIsCheap, commandIsCheap, rhsIsCheap,
-  termIsExpandable, kontIsExpandable, commandIsExpandable, rhsIsExpandable,
+  termIsCheap, kontIsCheap, commandIsCheap, pKontIsCheap, rhsIsCheap,
+  termIsExpandable, kontIsExpandable, commandIsExpandable, pKontIsExpandable, rhsIsExpandable,
   CheapAppMeasure, isCheapApp, isExpandableApp,
   termIsCheapBy, kontIsCheapBy, commandIsCheapBy, rhsIsCheapBy,
   -- * Continuation ids
@@ -46,6 +48,7 @@ module Language.SequentCore.Syntax (
   -- * Values
   Value(..), SeqCoreValue, splitValue, valueToTerm, valueToCommandWith,
   -- * Alpha-equivalence
+  cheapEqTerm, cheapEqKont, cheapEqFrame, cheapEqCommand,
   (=~=), AlphaEq(..), AlphaEnv, HasId(..)
 ) where
 
@@ -53,7 +56,8 @@ import {-# SOURCE #-} Language.SequentCore.Pretty ()
 import Language.SequentCore.Util
 import Language.SequentCore.WiredIn
 
-import Coercion  ( Coercion, coercionKind, coercionType, isCoVar, isCoVarType
+import Coercion  ( Coercion, coercionKind, coercionType, coreEqCoercion
+                 , isCoVar, isCoVarType
                  , isReflCo, mkCoCast, mkCoVarCo, mkTransCo )
 import CoreSyn   ( AltCon(..), Tickish, tickishCounts, isRuntimeVar
                  , isEvaldUnfolding )
@@ -65,11 +69,11 @@ import IdInfo    ( IdDetails(..) )
 import Literal   ( Literal, isZeroLit, litIsTrivial, literalType, mkMachString )
 import MkCore    ( rUNTIME_ERROR_ID, mkWildValBinder )
 import Outputable
-import Pair      ( pSnd )
+import Pair      ( Pair(..), pSnd )
 import PrimOp    ( PrimOp(..), primOpOkForSpeculation, primOpOkForSideEffects
                  , primOpIsCheap )
 import TyCon
-import Type      ( Type, KindOrType )
+import Type      ( Type, KindOrType, eqType )
 import qualified Type
 import TysPrim
 import Var       ( Var, isId )
@@ -211,10 +215,10 @@ mkCommand binds (Compute _ comm) kont
 mkCommand binds term kont
   = foldr Let (Eval term kont) binds
 
-mkVarTerm :: Var -> SeqCoreTerm
-mkVarTerm x | Type.isTyVar x = Type (Type.mkTyVarTy x)
-            | Coercion.isCoVar x = Coercion (mkCoVarCo x)
-            | otherwise = Var x
+mkVarArg :: Var -> Arg b
+mkVarArg x | Type.isTyVar x = Type (Type.mkTyVarTy x)
+           | Coercion.isCoVar x = Coercion (mkCoVarCo x)
+           | otherwise = Var x
 
 mkLambdas :: [b] -> Term b -> Term b
 mkLambdas = flip (foldr Lam)
@@ -234,13 +238,16 @@ mkComputeEval v fs = mkCompute ty (Eval v (Kont fs Return))
   where
     ty = foldl frameType (termType v) fs
 
-mkAppTerm :: SeqCoreTerm -> [SeqCoreTerm] -> SeqCoreTerm
-mkAppTerm fun args = mkCompute retTy (Eval fun (Kont (map App args) Return))
+mkAppTerm :: HasId b => Term b -> [Term b] -> Term b
+mkAppTerm fun args = mkCompute retTy (mkAppCommand fun args)
   where
     (tyArgs, _) = spanTypes args
     (_, retTy) = Type.splitFunTys $ Type.applyTys (termType fun) tyArgs
 
-mkCast :: SeqCoreTerm -> Coercion -> SeqCoreTerm
+mkAppCommand :: Term b -> [Term b] -> Command b
+mkAppCommand fun args = Eval fun (Kont (map App args) Return)
+
+mkCast :: Term b -> Coercion -> Term b
 mkCast term co | isReflCo co = term
 mkCast (Coercion termCo) co | isCoVarType (pSnd (coercionKind co))
                             = Coercion (mkCoCast termCo co)
@@ -267,9 +274,13 @@ castBottomTerm v ty | termTy `Type.eqType` ty = v
     termTy = termType v
     wild = mkWildValBinder termTy
 
-mkConstruction :: DataCon -> [Type] -> [SeqCoreTerm] -> SeqCoreTerm
+mkConstruction :: HasId b => DataCon -> [Type] -> [Term b] -> Term b
 mkConstruction dc tyArgs valArgs
   = mkAppTerm (Var (dataConWorkId dc)) (map Type tyArgs ++ valArgs)
+
+mkConstructionCommand :: DataCon -> [Type] -> [Term b] -> Command b
+mkConstructionCommand dc tyArgs valArgs
+  = mkAppCommand (Var (dataConWorkId dc)) (map Type tyArgs ++ valArgs)
 
 mkImpossibleCommand :: Type -> SeqCoreCommand
 mkImpossibleCommand ty
@@ -375,6 +386,26 @@ flattenCommand = go []
     go binds (Eval term kont)  = (reverse binds, Left (term, kont))
     go binds (Jump args j)   = (reverse binds, Right (args, j))
 
+-- TODO Since this function has to look at the end of a list that could be long
+-- (namely the list of frames in the continuation), we should try and find ways
+-- around needing it.
+splitCastTerm :: Term b -> (Term b, Maybe Coercion)
+splitCastTerm (Compute _ty comm)
+  | (comm', Just co) <- splitCastCommand comm
+  , let Pair fromTy _toTy = coercionKind co
+  = (mkCompute fromTy comm', Just co)
+splitCastTerm term = (term, Nothing)
+
+splitCastCommand :: Command b -> (Command b, Maybe Coercion)
+splitCastCommand (Eval term (Kont fs Return))
+  | not (null fs)
+  , Cast co <- last fs
+  = (Eval term (Kont (init fs) Return), Just co)
+splitCastCommand (Let b comm)
+  | (comm', Just co) <- splitCastCommand comm
+  = (Let b comm', Just co)
+splitCastCommand comm = (comm, Nothing)
+
 -- | True if the given term constitutes a value argument rather than a type
 -- argument (see 'Type').
 isValueArg :: Term b -> Bool
@@ -438,6 +469,9 @@ isTrivialFrame (Tick _) = False
 isTrivialPKont :: HasId b => PKont b -> Bool
 isTrivialPKont (PKont xs comm) = all (not . isRuntimeVar) (identifiers xs)
                               && isTrivial comm
+
+isTrivialRhs :: HasId b => Rhs b -> Bool
+isTrivialRhs = either isTrivialTerm isTrivialPKont
 
 -- | True if the given continuation is a return continuation, @Kont [] (Return _)@.
 isReturnKont :: Kont b -> Bool
@@ -682,7 +716,7 @@ frameOk (Tick ti) = not (tickishCounts ti)
 frameOk (Cast _)  = True
 
 endOk :: (PrimOp -> Bool) -> End b -> Bool
-endOk _ Return = False
+endOk _ Return = True
 endOk primOpOk (Case _bndr alts)
   =  all (\(Alt _ _ rhs) -> commOk primOpOk rhs) alts
   && altsAreExhaustive
@@ -735,6 +769,10 @@ commandIsCheap, commandIsExpandable :: HasId b => Command b -> Bool
 commandIsCheap      = commCheap isCheapApp
 commandIsExpandable = commCheap isExpandableApp
 
+pKontIsCheap, pKontIsExpandable :: HasId b => PKont b -> Bool
+pKontIsCheap      = pKontCheap isCheapApp
+pKontIsExpandable = pKontCheap isExpandableApp
+
 rhsIsCheap, rhsIsExpandable :: HasId b => Rhs b -> Bool
 rhsIsCheap      = rhsCheap isCheapApp
 rhsIsExpandable = rhsCheap isExpandableApp
@@ -770,9 +808,12 @@ commCheap appCheap (Eval term kont)
 commCheap appCheap (Jump args j)
   = appCheap j (length (filter isValueArg args))
   
+pKontCheap :: HasId b => CheapAppMeasure -> PKont b -> Bool
+pKontCheap appCheap (PKont _ comm) = commCheap appCheap comm
+
 rhsCheap :: HasId b => CheapAppMeasure -> Rhs b -> Bool
 rhsCheap appCheap (Left term) = termCheap appCheap term
-rhsCheap appCheap (Right (PKont _ comm)) = commCheap appCheap comm
+rhsCheap appCheap (Right pk) = pKontCheap appCheap pk
 
 bindPairCheap :: HasId b => CheapAppMeasure -> BindPair b -> Bool
 bindPairCheap appCheap = rhsCheap appCheap . rhsOfPair
@@ -800,6 +841,7 @@ cutCheap appCheap (Var fid) kont@(Kont (App {} : _) _)
     selCheap [arg]      = termCheap appCheap arg
     selCheap _          = False
     primOpCheap op args = primOpIsCheap op && all (termCheap appCheap) args
+cutCheap appCheap _ (Kont [] end) = endCheap appCheap end
 cutCheap _ _ _ = False
     
 isCheapApp, isExpandableApp :: CheapAppMeasure
@@ -875,6 +917,29 @@ valueToCommandWith (ConsVal dc tys vs) kont = mkCommand [] (Var (dataConWorkId d
 --------------------------------------------------------------------------------
 -- Alpha-Equivalence
 --------------------------------------------------------------------------------
+
+cheapEqTerm    :: Term b -> Term b -> Bool
+cheapEqKont    :: Kont b -> Kont b -> Bool
+cheapEqFrame   :: Frame b -> Frame b -> Bool
+cheapEqCommand :: Command b -> Command b -> Bool
+
+cheapEqTerm (Var v1)   (Var v2)   = v1==v2
+cheapEqTerm (Lit lit1) (Lit lit2) = lit1 == lit2
+cheapEqTerm (Type t1)  (Type t2)  = t1 `eqType` t2
+cheapEqTerm (Coercion c1) (Coercion c2) = c1 `coreEqCoercion` c2
+cheapEqTerm _             _             = False
+
+cheapEqFrame (App a1) (App a2)   = a1 `cheapEqTerm` a2
+cheapEqFrame (Cast t1) (Cast t2) = t1 `coreEqCoercion` t2
+cheapEqFrame _ _ = False
+
+cheapEqKont (Kont fs1 Return) (Kont fs2 Return) = and $ zipWith cheapEqFrame fs1 fs2
+cheapEqKont _                 _                 = False
+
+cheapEqCommand (Eval v1 k1) (Eval v2 k2)
+  = cheapEqTerm v1 v2 && cheapEqKont k1 k2
+cheapEqCommand _            _
+  = False
 
 -- | A class of types that contain an identifier. Useful so that we can compare,
 -- say, elements of @Command b@ for any @b@ that wraps an identifier with

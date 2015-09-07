@@ -1,4 +1,4 @@
-{-# LANGUAGE ParallelListComp, TupleSections, MultiWayIf, ViewPatterns #-}
+{-# LANGUAGE ParallelListComp, TupleSections, MultiWayIf, ViewPatterns, LambdaCase #-}
 
 -- | 
 -- Module      : Language.SequentCore.Translate
@@ -12,7 +12,8 @@ module Language.SequentCore.Translate (
   -- $txn
   fromCoreModule, termFromCoreExpr,
   bindsToCore,
-  commandToCoreExpr, termToCoreExpr, CoreContext, kontToCoreExpr,
+  commandToCoreExpr, termToCoreExpr, pKontToCoreExpr, pKontIdToCore,
+  CoreContext, kontToCoreExpr,
   onCoreExpr, onSequentCoreTerm
 ) where
 
@@ -27,6 +28,7 @@ import qualified CoreUtils as Core
 import qualified CoreFVs as Core
 import FastString
 import Id
+import IdInfo
 import Maybes
 import qualified MkCore as Core
 import MkId
@@ -36,6 +38,7 @@ import TysPrim
 import TysWiredIn
 import UniqFM     ( intersectUFM_C )
 import Unique
+import Util       ( count )
 import VarEnv
 import VarSet
 
@@ -604,7 +607,10 @@ data KontType = KTExists TyVar KontType | KTTuple [KontType] | KTType Type
 idToPKontId :: Id -> KontCallConv -> PKontId
 idToPKontId p (ByJump fixed)
   = p `setIdType` kontTypeToType (go (idType p) fixed)
+      `setIdInfo` (idInfo p `setArityInfo` valArgCount)
   where
+    valArgCount = count (\case { ValArg {} -> True; _ -> False }) fixed
+    
     go _  [] = KTTuple []
     go ty (FixedType tyArg : fixed')
       | Just (tyVar, ty') <- splitForAllTy_maybe ty
@@ -915,6 +921,20 @@ termToCoreExpr val =
     Coercion co  -> Core.Coercion co
     Compute kb c -> commandToCoreExpr kb c
 
+pKontToCoreExpr :: Type -> SeqCorePKont -> Core.CoreExpr
+pKontToCoreExpr = pKontToCoreExpr' NonRecursive
+
+pKontToCoreExpr' :: RecFlag -> Type -> SeqCorePKont -> Core.CoreExpr
+pKontToCoreExpr' recFlag retTy (PKont xs comm)
+  = Core.mkCoreLams (maybeOneShots xs') (commandToCoreExpr retTy comm)
+  where
+    xs'   | null xs   = [ voidArgId ]
+          | otherwise = xs
+    maybeOneShots xs | isNonRec recFlag = map setOneShotLambdaIfId xs
+                     | otherwise        = xs
+    setOneShotLambdaIfId x | isId x = setOneShotLambda x
+                           | otherwise = x
+
 type CoreContext = Core.CoreExpr -> Core.CoreExpr
 
 -- | Translates a continuation into a function that will wrap a Core expression
@@ -938,9 +958,11 @@ endToCoreExpr retTy k =
     Return               -> \e -> e
 
 pKontIdToCore :: Type -> PKontId -> Id
-pKontIdToCore retTy j = j `setIdType` kontTyToCoreTy argTy retTy
+pKontIdToCore retTy j = maybeAddArity $ j `setIdType` kontTyToCoreTy argTy retTy
   where
     argTy = isKontTy_maybe (idType j) `orElse` pprPanic "pKontIdToCore" (pprBndr LetBind j)
+    maybeAddArity j' | idArity j' == 0 = j' `setIdInfo` (idInfo j' `setArityInfo` 1)
+                     | otherwise       = j'
 
 kontTyToCoreTy :: Type -> Type -> Type
 kontTyToCoreTy ty retTy
@@ -966,20 +988,12 @@ bindToCore retTy_maybe bind =
 
 bindPairToCore :: Maybe Type -> RecFlag -> SeqCoreBindPair
                -> (Core.CoreBndr, Core.CoreExpr)
-bindPairToCore retId_maybe recFlag pair =
+bindPairToCore retTy_maybe recFlag pair =
   case pair of
     BindTerm b v -> (b, termToCoreExpr v)
-    BindPKont b (PKont xs c) -> (b', Core.mkCoreLams (maybeOneShots xs')
-                                                     (commandToCoreExpr retId c))
+    BindPKont b pk -> (pKontIdToCore retTy b, pKontToCoreExpr' recFlag retTy pk)
       where
-        b'    = pKontIdToCore retId b
-        xs'   | null xs   = [ voidArgId ]
-              | otherwise = xs
-        maybeOneShots xs | isNonRec recFlag = map setOneShotLambdaIfId xs
-                         | otherwise        = xs
-        setOneShotLambdaIfId x | isId x = setOneShotLambda x
-                               | otherwise = x
-        retId = retId_maybe `orElse` panic "bindToCore: top-level cont"
+        retTy = retTy_maybe `orElse` panic "bindPairToCore: top-level cont"
 
 -- | Translates a list of top-level bindings into Core.
 bindsToCore :: [SeqCoreBind] -> [Core.CoreBind]

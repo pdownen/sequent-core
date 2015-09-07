@@ -110,6 +110,7 @@ termArity e = goT e
                            = (goF v fs e - 1) `max` 0
         -- See Note [termArity for applications]
         -- NB: coercions count as a value argument
+    goF v [] Return        = goT v
     goF _ _ _              = 0
 
     trim_arity :: Arity -> Type -> Arity
@@ -908,7 +909,7 @@ etaInfoApp :: SeqCoreTerm -> [EtaInfo] -> Type -> SeqCoreTerm
 etaInfoApp v eis ty
   = mkCompute ty (Eval v (Kont (map frame eis) Return))
   where
-    frame (EtaVar v) = App (Var v)
+    frame (EtaVar v) = App (mkVarArg v)
     frame (EtaCo co) = Cast co
 
 --------------

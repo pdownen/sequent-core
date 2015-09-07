@@ -1,3 +1,5 @@
+{-# LANGUAGE MultiWayIf #-}
+
 module Language.SequentCore.Lint ( lintCoreBindings, lintTerm ) where
 
 import Language.SequentCore.Syntax
@@ -90,7 +92,10 @@ eitherToMaybe (Left a)  = Just a
 eitherToMaybe (Right _) = Nothing
 
 lintCoreBindings :: [SeqCoreBind] -> Maybe SDoc
-lintCoreBindings binds = eitherToMaybe $ foldM lintCoreTopBind emptyTermEnv binds
+lintCoreBindings binds = eitherToMaybe $ foldM lintCoreTopBind initEnv binds
+  where
+    -- All top-level bindings are considered visible (see CoreLint.lintCoreBindings)
+    initEnv = extendTermEnvList emptyTermEnv (flattenBinds binds)
 
 lintTerm :: TvSubst -> SeqCoreTerm -> Maybe SDoc
 lintTerm env term = eitherToMaybe $ lintCoreTerm env term 
@@ -205,10 +210,12 @@ lintCoreTerm env (Var x)
   | not (isLocalId x)
   = return (idType x)
   | Just x' <- lookupInScope (getTvInScope env) x
-  = if substTy env (idType x) `eqType` idType x'
-      then return $ idType x'
-      else Left $ text "variable" <+> pprBndr LetBind x <+> text "bound as"
+  = if | not (substTy env (idType x) `eqType` idType x') ->
+           Left $ text "variable" <+> pprBndr LetBind x <+> text "bound as"
                                   <+> pprBndr LetBind x'
+       | isDeadBinder x' ->
+           Left $ text "occurrence of dead id" <+> pprBndr LetBind x'
+       | otherwise -> return $ idType x'
   | otherwise
   = Left $ text "not found in context:" <+> pprBndr LetBind x
 
@@ -261,9 +268,17 @@ lintCoreCut env term kont
 
 lintCoreJump :: LintEnv -> [SeqCoreArg] -> PKontId -> LintM ()
 lintCoreJump env args j
-  = do
-    ty <- kontIdTyOrError (termEnv env) j
-    go ty args
+  | Just j' <- lookupInScope (getTvInScope (kontEnv env)) j
+  = if | not (substTy (kontEnv env) (idType j) `eqType` idType j') ->
+           Left $ text "join variable" <+> pprBndr LetBind j <+> text "bound as"
+                                       <+> pprBndr LetBind j'
+       | isDeadBinder j' ->
+           Left $ text "occurrence of dead id" <+> pprBndr LetBind j'
+       | otherwise -> do
+           ty <- kontIdTyOrError (kontEnv env) j
+           go ty args
+  | otherwise
+  = Left $ text "not found in context:" <+> pprBndr LetBind j
   where
     topArgs = args
     
@@ -375,7 +390,7 @@ checkingType desc ex go
     unless (ex `eqType` act) $ mkError desc (ppr ex) (ppr act)
     return act
 
-kontIdTyOrError :: TermEnv -> PKontId -> LintM OutType
+kontIdTyOrError :: KontEnv -> PKontId -> LintM OutType
 kontIdTyOrError env k
   = case isKontTy_maybe (substTy env (idType k)) of
       Just arg -> return arg
