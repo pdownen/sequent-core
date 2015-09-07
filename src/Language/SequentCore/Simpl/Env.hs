@@ -376,7 +376,7 @@ mkBoundToWithGuidance env (Left term) src level arity guid
             , def_arity        = arity
             , def_isExpandable = termIsExpandable term
             , def_isValue      = termIsHNF env term
-            , def_isWorkFree   = termIsCheap term
+            , def_isWorkFree   = termIsWorkFree term
             , def_isConLike    = termIsConLike env term
             }
 mkBoundToWithGuidance env (Right pk) src level arity guid
