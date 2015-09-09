@@ -120,12 +120,7 @@ import Data.List           ( mapAccumL )
 
 infixl 1 `setStaticPart`, `inDynamicScope`, `setRetKont`
 
-data SimplGlobalEnv
-  = SimplGlobalEnv { sge_dflags   :: DynFlags
-                   , sge_mode     :: SimplifierMode
-                   , sge_ruleBase :: RuleBase
-                   , sge_fams     :: (FamInstEnv, FamInstEnv) }
-
+-- | The context of a piece of code.
 data SimplEnv
   = SimplEnv    { se_idSubst :: SimplIdSubst   -- InId      |--> TermSubstAns (in/out)
                 , se_tvSubst :: TvSubstEnv     -- InTyVar   |--> OutType
@@ -133,13 +128,20 @@ data SimplEnv
                 --  ^^^ term static part ^^^  --
                 , se_pvSubst :: SimplPvSubst   -- InPKontId |--> PKontSubstAns (in/out)
                 , se_retTy   :: Maybe OutType
-                , se_retKont :: KontSubst      -- ()        |--> Scoped MetaKont (in/out)
+                , se_retKont :: KontSubst      -- ()        |--> MetaKont (in/out)
                 --  ^^^ static part ^^^  --
                 --  (includes term static part)
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
                 , se_defs    :: IdDefEnv       -- OutId     |--> Definition (out)
                 , se_context :: CallCtxt
                 , se_global  :: SimplGlobalEnv }
+
+-- | Parts of the environment that seldom change.
+data SimplGlobalEnv
+  = SimplGlobalEnv { sge_dflags   :: DynFlags
+                   , sge_mode     :: SimplifierMode
+                   , sge_ruleBase :: RuleBase
+                   , sge_fams     :: (FamInstEnv, FamInstEnv) }
 
 type SimplTermEnv = SimplEnv -- Environment where continuation bindings aren't relevant
 
@@ -271,7 +273,7 @@ A scoped value can be in two different states:
     need to keep around the environment under which it needs to be simplified.
   
   - Simplified: This is a value that has already been simplified. It may in
-    addition be *duplicable*; mkDupableKont is in charge of putting values in
+    addition be *duplicable*; mkDupableKont is in charge of putting things in
     the duplicable state. In either case, as term substitution has already been
     performed, most of the static environment is no longer needed.
     
@@ -279,7 +281,7 @@ One further wrinkle is metacontinuations (see Note [Metacontinuations]). Most of
 the bindings carried in the environment can be substituted directly into a
 Sequent Core expression, but a metacontinuation cannot in general. Hence even a
 fully-simplified expression isn't necessarily "closed," and so a Simplified
-value carries a Scoped MetaKont as its one remaining piece of context.
+value carries a Maybe MetaKont as its one remaining piece of context.
 
 -}
 
@@ -320,7 +322,9 @@ substScoped env scoped = case openScoped env scoped of (env', a) -> subst env' a
 
 -- The original simplifier uses the IdDetails stored in a Var to store unfolding
 -- info. We store similar data externally instead. (This is based on the Secrets
--- paper, section 6.3.)
+-- paper, section 6.3.) Note that we do update the unfoldings as well (see
+-- setDef), but this requires translating expressions between Core and Sequent
+-- Core; keeping our own data saves having to translate.
 type IdDefEnv = IdEnv Definition
 data Definition
   = NoDefinition
@@ -989,9 +993,27 @@ getContext = se_context
 setContext :: SimplEnv -> CallCtxt -> SimplEnv
 setContext env ctxt = env { se_context = ctxt }
 
+---------------------------
+-- Environment fragments --
+---------------------------
+
+-- | Extract the part of the environment relating to lexical scope, such as
+-- substitutions being performed. These are the values that need to be stored
+-- in any kind of closure. What's *not* included is data that might change
+-- between when a binding is first encountered and where it's actually
+-- processed; in particular, there may be more variables in scope or they may
+-- have different states (because we have gone into a Case on a variable, say).
+--
+-- The only use for a StaticEnv is to attach it to a SimplEnv that provides
+-- information about the dynamic context; see 'setStaticPart' and
+-- 'inDynamicScope'.
 staticPart :: SimplEnv -> StaticEnv
 staticPart = StaticEnv
 
+-- | Like 'staticPart', but also leave out information about bound continuations
+-- (both join points and the "ret" continuation). Appropriate for closing values
+-- that are "continuation-closed", like terms and frames, and hence cannot have
+-- free occurrences of continuation variables.
 termStaticPart :: SimplEnv -> StaticTermEnv
 termStaticPart = StaticTermEnv
 
