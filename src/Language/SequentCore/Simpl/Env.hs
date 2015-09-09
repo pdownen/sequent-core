@@ -44,10 +44,11 @@ module Language.SequentCore.Simpl.Env (
   
   -- * Definitions floating outward
   Floats,
-  emptyFloats, addNonRecFloat, addRecFloats, zapFloats, zapKontFloats,
-  mapFloats, extendFloats, addFloats, wrapFloats, wrapKontFloats, wrapFloatsAroundTerm,
-  isEmptyFloats, hasNoKontFloats,
-  doFloatFromRhs, getFloatBinds, getFloats,
+  emptyFloats, unitFloat, addNonRecFloat, addRecFloats, addFloats, catFloats, addingFloats,
+  mapFloats, extendFloats, wrapFloats, wrapKontFloats, wrapFloatsAroundTerm,
+  isEmptyFloats, hasNoKontFloats, zapKontFloats,
+  doFloatFromRhs, getFloatBinds,
+  augmentFromFloats,
   
   -- * Type synonyms distinguishing incoming (unsubstituted) syntax from outgoing
   In, InCommand, InTerm, InArg, InKont, InFrame, InEnd, InPKont,
@@ -138,7 +139,6 @@ data SimplEnv
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
                 , se_defs    :: IdDefEnv       -- OutId     |--> Definition (out)
                 , se_context :: CallCtxt
-                , se_floats  :: Floats
                 , se_global  :: SimplGlobalEnv }
 
 type SimplTermEnv = SimplEnv -- Environment where continuation bindings aren't relevant
@@ -520,7 +520,6 @@ initialEnv dflags mode rules famEnvs
              , se_context = BoringCtxt
              , se_inScope = emptyInScopeSet
              , se_defs    = emptyVarEnv
-             , se_floats  = emptyFloats
              , se_global  = initialGlobalEnv dflags mode rules famEnvs }
              
 initialGlobalEnv :: DynFlags -> SimplifierMode -> RuleBase -> (FamInstEnv, FamInstEnv)
@@ -1046,7 +1045,6 @@ emptyStaticEnv
                          , se_inScope = na
                          , se_retTy   = na
                          , se_defs    = na
-                         , se_floats  = na
                          , se_global  = na }
   where na = panic "emptyStaticEnv"
 
@@ -1061,7 +1059,6 @@ emptyStaticTermEnv
                              , se_inScope = na
                              , se_retTy   = na
                              , se_defs    = na
-                             , se_floats  = na
                              , se_global  = na }
   where na = panic "emptyStaticTermEnv"
 
@@ -1095,6 +1092,9 @@ andFF FltOkSpec  FltCareful = FltCareful
 andFF FltOkSpec  _          = FltOkSpec
 andFF FltLifted  flt        = flt
 
+allFF :: [FloatFlag] -> FloatFlag
+allFF = foldr andFF FltLifted
+
 classifyFF :: SeqCoreBind -> FloatFlag
 classifyFF (NonRec (BindTerm bndr rhs))
   | not (isStrictId bndr)    = FltLifted
@@ -1102,9 +1102,9 @@ classifyFF (NonRec (BindTerm bndr rhs))
   | otherwise                = FltCareful
 classifyFF _ = FltLifted
 
-doFloatFromRhs :: TopLevelFlag -> RecFlag -> Bool -> OutTerm -> SimplEnv -> Bool
+doFloatFromRhs :: TopLevelFlag -> RecFlag -> Bool -> OutTerm -> Floats -> Bool
 -- If you change this function look also at FloatIn.noFloatFromRhs
-doFloatFromRhs lvl rc str rhs (SimplEnv {se_floats = Floats fs ff})
+doFloatFromRhs lvl rc str rhs (Floats fs ff)
   =  not (isNilOL fs) && want_to_float && can_float
   where
      want_to_float = isTopLevel lvl || termIsCheap rhs || termIsExpandable rhs 
@@ -1120,13 +1120,13 @@ emptyFloats = Floats nilOL FltLifted
 unitFloat :: OutBind -> Floats
 unitFloat bind = Floats (unitOL bind) (classifyFF bind)
 
-addNonRecFloat :: SimplEnv -> OutBindPair -> SimplEnv
+addNonRecFloat :: SimplEnv -> OutBindPair -> (Floats, SimplEnv)
 addNonRecFloat env pair
   = id `seq`   -- This seq forces the Id, and hence its IdInfo,
                -- and hence any inner substitutions
-    env { se_floats = se_floats env `addFlts` unitFloat (NonRec pair),
-          se_inScope = extendInScopeSet (se_inScope env) id }
+    (flts, env `augmentFromFloats` flts)
   where
+    flts = unitFloat (NonRec pair)
     id = binderOfPair pair
 
 mapBinds :: Functor f => (BindPair b -> BindPair b) -> f (Bind b) -> f (Bind b)
@@ -1135,38 +1135,39 @@ mapBinds f pairs = fmap app pairs
     app (NonRec pair) = NonRec (f pair)
     app (Rec pair)    = Rec (map f pair)
 
-mapFloats :: SimplEnv -> (OutBindPair -> OutBindPair) -> SimplEnv
-mapFloats env@SimplEnv { se_floats = Floats fs ff } fun
-   = env { se_floats = Floats (mapBinds fun fs) ff }
+mapFloats :: (OutBindPair -> OutBindPair) -> Floats -> Floats
+mapFloats fun (Floats fs ff)
+   = Floats (mapBinds fun fs) ff
 
-extendFloats :: SimplEnv -> OutBind -> SimplEnv
--- Add these bindings to the floats, and extend the in-scope env too
-extendFloats env bind
-  = env { se_floats  = se_floats env `addFlts` unitFloat bind,
-          se_inScope = extendInScopeSetList (se_inScope env) bndrs }
+extendFloats :: OutBind -> Floats -> Floats
+-- Add these bindings to the floats
+extendFloats bind flts
+  = flts `addFloats` unitFloat bind
+
+augmentFromFloats :: SimplEnv -> Floats -> SimplEnv
+-- Add the floats to the environment's in-scope set
+-- We might want to add to se_defs as well, but those are inessential (we can
+-- recover the same information from the translated unfolding) and we would have
+-- to carry around Definitions along with Floats.
+augmentFromFloats env (Floats fs _)
+  | isNilOL fs
+  = env
+  | otherwise
+  = env { se_inScope = extendInScopeSetList (se_inScope env) bndrs }
   where
-    bndrs = bindersOf bind
-
-addFloats :: SimplEnv -> SimplEnv -> SimplEnv
--- Add the floats for env2 to env1;
--- *plus* the in-scope set for env2, which is bigger
--- than that for env1
-addFloats env1 env2
-  = env1 {se_floats = se_floats env1 `addFlts` se_floats env2,
-          se_inScope = se_inScope env2,
-          se_defs = se_defs env2 }
+    bndrs = bindersOfBinds (fromOL fs)
 
 wrapBind :: SeqCoreBind -> SeqCoreCommand -> SeqCoreCommand
 wrapBind bind@(Rec {}) cmd = Let bind cmd
 wrapBind (NonRec pair) cmd = addNonRec pair cmd
 
-wrapFloats, wrapKontFloats :: SimplEnv -> OutCommand -> OutCommand
-wrapFloats env cmd = foldrOL wrapBind cmd (floatBinds (se_floats env))
+wrapFloats, wrapKontFloats :: Floats -> OutCommand -> OutCommand
+wrapFloats flts cmd = foldrOL wrapBind cmd (floatBinds flts)
 
-wrapKontFloats env cmd
+wrapKontFloats flts cmd
   = foldr wrapBind cmd (mapMaybe onlyKonts binds)
   where
-    binds = fromOL (floatBinds (se_floats env))
+    binds = fromOL (floatBinds flts)
     onlyKonts bind@(NonRec pair) | bindsKont pair = Just bind
                                  | otherwise      = Nothing
     onlyKonts (Rec pairs)        | let pairs' = filter bindsKont pairs
@@ -1199,30 +1200,36 @@ trying to float up past a compute, something has gone very wrong, so we check
 for this condition and warn.
 -}
 
-wrapFloatsAroundTerm :: SimplEnv -> OutTerm -> OutTerm
-wrapFloatsAroundTerm env term
-  | isEmptyFloats env
+wrapFloatsAroundTerm :: Floats -> OutTerm -> OutTerm
+wrapFloatsAroundTerm flts term
+  | isEmptyFloats flts
   = term
-wrapFloatsAroundTerm env (Compute p comm)
+wrapFloatsAroundTerm flts (Compute p comm)
   -- See Note [Wrap around compute]
-  = warnPprTrace (not $ hasNoKontFloats env) __FILE__ __LINE__
+  = warnPprTrace (not $ hasNoKontFloats flts) __FILE__ __LINE__
       (text "cont floats escaping body of command:" <+> ppr comm $$
        text "floats:" <+> brackets (pprWithCommas (ppr . bindersOf)
-                                                  (getFloatBinds (getFloats env)))) $
-    Compute p (wrapFloats (zapKontFloats env) comm)
-wrapFloatsAroundTerm env term
-  = mkCompute (termType term) $ wrapFloats env (mkCommand [] term (Kont [] Return))
+                                                  (getFloatBinds flts))) $
+    Compute p (wrapFloats (zapKontFloats flts) comm)
+wrapFloatsAroundTerm flts term
+  = mkCompute (termType term) $ wrapFloats flts (mkCommand [] term (Kont [] Return))
 
-addFlts :: Floats -> Floats -> Floats
-addFlts (Floats bs1 l1) (Floats bs2 l2)
+addFloats :: Floats -> Floats -> Floats
+addFloats (Floats bs1 l1) (Floats bs2 l2)
   = Floats (bs1 `appOL` bs2) (l1 `andFF` l2)
 
-zapFloats :: SimplEnv -> SimplEnv
-zapFloats  env = env { se_floats  = emptyFloats  }
+catFloats :: [Floats] -> Floats
+catFloats fltss = Floats (concatOL [ fs | Floats fs _ <- fltss ])
+                         (allFF    [ ff | Floats _ ff <- fltss ])
 
-zapKontFloats :: SimplEnv -> SimplEnv
-zapKontFloats env@(SimplEnv { se_floats = Floats fs ff })
-  = env { se_floats = Floats fs' ff }
+addingFloats :: Monad m => Floats -> m (Floats, a) -> m (Floats, a)
+addingFloats flts m | isEmptyFloats flts = m
+                    | otherwise          = do (flts', ans) <- m
+                                              return (flts `addFloats` flts', ans)
+
+zapKontFloats :: Floats -> Floats
+zapKontFloats (Floats fs ff)
+  = Floats fs' ff
   where
     fs' = toOL . mapMaybe removeKonts . fromOL $ fs
     removeKonts (Rec pairs) | not (null pairs') = Just (Rec pairs')
@@ -1230,14 +1237,14 @@ zapKontFloats env@(SimplEnv { se_floats = Floats fs ff })
     removeKonts bind@(NonRec (BindTerm {}))     = Just bind
     removeKonts _                               = Nothing
 
-addRecFloats :: SimplEnv -> SimplEnv -> SimplEnv
--- Flattens the floats from env2 into a single Rec group,
--- prepends the floats from env1, and puts the result back in env2
+addRecFloats :: SimplEnv -> Floats -> (Floats, SimplEnv)
 -- This is all very specific to the way recursive bindings are
 -- handled; see Simpl.simplRecBind
-addRecFloats env1 env2@(SimplEnv {se_floats = Floats bs ff})
+addRecFloats env (Floats bs ff)
   = assert (case ff of { FltLifted -> True; _ -> False })
-  $ env2 {se_floats = se_floats env1 `addFlts` unitFloat (Rec (flattenBinds (fromOL bs)))}
+  $ (flt, env `augmentFromFloats` flt)
+  where
+    flt = unitFloat (Rec (flattenBinds (fromOL bs)))
 
 getFloatBinds :: Floats -> [OutBind]
 getFloatBinds = fromOL . floatBinds
@@ -1245,16 +1252,12 @@ getFloatBinds = fromOL . floatBinds
 floatBinds :: Floats -> OrdList OutBind
 floatBinds (Floats bs _) = bs
 
-getFloats :: SimplEnv -> Floats
-getFloats = se_floats
+isEmptyFloats :: Floats -> Bool
+isEmptyFloats = isNilOL . floatBinds
 
-isEmptyFloats :: SimplEnv -> Bool
-isEmptyFloats = isNilOL . floatBinds . se_floats
-
--- XXX Should we cache this?
-hasNoKontFloats :: SimplEnv -> Bool
+hasNoKontFloats :: Floats -> Bool
 hasNoKontFloats = foldrOL (&&) True . mapOL (all bindsTerm . flattenBind)
-                                    . floatBinds . se_floats
+                                    . floatBinds
 
 -----------------------------
 -- Definitions (continued) --
@@ -1654,10 +1657,7 @@ instance Outputable SimplEnv where
     $$ text " RetKont   =" <+> ppr (se_retKont env)
     $$ text " RetTy     =" <+> ppr (se_retTy env)
     $$ text " Context   =" <+> ppr (se_context env)
-    $$ text " Floats    =" <+> ppr floatBndrs
      <> char '>'
-    where
-      floatBndrs  = bindersOfBinds (getFloatBinds (se_floats env))
 
 pprTermEnv :: SimplTermEnv -> SDoc
 pprTermEnv env
@@ -1667,11 +1667,7 @@ pprTermEnv env
   $$ text " TvSubst   =" <+> ppr (se_tvSubst env)
   $$ text " CvSubst   =" <+> ppr (se_cvSubst env)
   $$ text " Context   =" <+> ppr (se_context env)
-  $$ text " Floats    =" <+> ppr floatBndrs
    <> char '>'
-  where
-    floatBndrs  = bindersOfBinds (getFloatBinds (se_floats env))
-
 
 instance Outputable StaticEnv where
   ppr (StaticEnv env)
