@@ -787,16 +787,23 @@ fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
       Core.Let bs e      ->
         let (env', bs')   = fromCoreBind env (Just (Kont fs end)) bs
         in go (bs' : binds) env' e fs end
-      Core.Case e (Marked x _) ty as
+      Core.Case e (Marked x _) _ as
         -- If the continuation is just a return, copy it into the branches
-        | null fs, Return {} <- end ->
-        let (subst_rhs, x') = substBndr subst x
-            env_rhs = env { fce_subst = subst_rhs }
-        in go binds env e [] (Case x' $ map (fromCoreAlt env_rhs (Kont fs end)) as)
+        | null fs, Return {} <- end -> go binds env e [] end'
         -- Otherwise be more careful. In the simplifier, we get clever and
         -- split the continuation into a duplicable part and a non-duplicable
         -- part (see splitDupableKont); for now just share the whole thing.
-        | otherwise -> done $ fromCoreCaseAsTerm env e x ty as
+        | otherwise -> 
+        let join_arg  = mkKontArgId (idType x')
+            join_rhs  = PKont [join_arg] (Eval (Var join_arg) (Kont [] end'))
+            join_ty   = mkKontTy (mkTupleTy UnboxedTuple [idType x'])
+            join_bndr = mkInlinablePKontBinder join_ty
+            join_bind = NonRec (BindPKont join_bndr join_rhs)
+        in go (join_bind : binds) env e [] (Case join_arg [Alt DEFAULT [] (Jump [Var join_arg] join_bndr)])
+        where
+          (subst_rhs, x') = substBndr subst x
+          env_rhs = env { fce_subst = subst_rhs }
+          end'    = Case x' $ map (fromCoreAlt env_rhs (Kont fs end)) as
       Core.Coercion co   -> done $ Coercion (substCo subst co)
       Core.Cast e co     -> go binds env e (Cast (substCo subst co) : fs) end
       Core.Tick ti e     -> go binds env e (Tick (substTickish subst ti) : fs) end
@@ -831,24 +838,6 @@ fromCoreLams env (Marked x _) expr
     (subst', xs') = substBndrs (fce_subst env) (x : map unmark xs)
     env' = env { fce_subst = subst' }
     ty  = substTy subst' (Core.exprType (unmarkExpr body))
-
-fromCoreCaseAsTerm :: FromCoreEnv -> Core.Expr MarkedVar -> Core.CoreBndr -> Type
-                   -> [Core.Alt MarkedVar] -> SeqCoreTerm
-fromCoreCaseAsTerm env scrut bndr ty alts
-  -- Translating a case naively can duplicate lots of code. Rather than
-  -- copy the continuation for each branch, we bind it to a variable and
-  -- copy only a Return to that binding (c.f. makeTrivial in Simpl.hs)
-  --
-  -- The basic plan of action (taken together with the Case clause in fromCoreExpr):
-  --   [[ case e of alts ]]_k = < compute p. [[e]]_(case of [[alts]]_p) | k >
-  = Compute ty' body
-  where
-    subst   = fce_subst env
-    ty'     = substTy subst ty
-    (subst_rhs, bndr') = substBndr subst bndr
-    env_rhs = env { fce_subst = subst_rhs }
-    alts'   = map (fromCoreAlt env_rhs (Kont [] Return)) alts
-    body    = fromCoreExpr env scrut (Kont [] (Case bndr' alts'))
 
 fromCoreExprAsTerm :: FromCoreEnv -> Core.Expr MarkedVar -> SeqCoreTerm
 fromCoreExprAsTerm env expr
