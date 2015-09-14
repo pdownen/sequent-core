@@ -112,11 +112,10 @@ bodySize dflags cap topArgs expr
     size (T (Var x))        = sizeCall x [] 0
     size (T (Compute _ comm)) = size (C comm)
     size (T (Lit lit))      = sizeN (litSize lit)
-    size (T term@(Lam {}))  | erased    = size (T body)
-                            | otherwise = lamScrutDiscount dflags (size (T body))
-      where 
-        (xs, body)          = lambdas term
-        erased              = all (\x -> not (isId x) || isRealWorldId x) xs
+    size (T (Lam x body))   | isId x, not (isRealWorldId x)
+                            = lamScrutDiscount dflags (size (T body) `addSizeN` 10)
+                            | otherwise
+                            = size (T body)
     
     size (K (Kont fs end))  = foldr addSizeNSD (sizeEnd end) (map sizeFrame fs)
 

@@ -793,9 +793,11 @@ arityType = goT
       where
         env' = env { ae_bndrs = x : ae_bndrs env }
     
-    goT env v@(Compute _ c) | termOkForSpeculation v = AOkSpec
-                            | otherwise              = goC env c
-    
+    goT env v@(Compute _ c)
+      = case goC env c of 
+          ATop | termOkForSpeculation v -> AOkSpec
+               | otherwise              -> ATop
+          other                         -> other
     goT _ _ = ATop
     
     goC env (Eval v k) = let at = goT env v

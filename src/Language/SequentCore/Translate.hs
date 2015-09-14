@@ -1,4 +1,5 @@
-{-# LANGUAGE ParallelListComp, TupleSections, MultiWayIf, ViewPatterns, LambdaCase #-}
+{-# LANGUAGE ParallelListComp, TupleSections, MultiWayIf, ViewPatterns,
+             LambdaCase, BangPatterns, CPP #-}
 
 -- | 
 -- Module      : Language.SequentCore.Translate
@@ -10,7 +11,7 @@
 
 module Language.SequentCore.Translate (
   -- $txn
-  fromCoreModule, termFromCoreExpr,
+  fromCoreModule, termFromCoreExpr, pKontFromCoreExprByKontType,
   bindsToCore,
   commandToCoreExpr, termToCoreExpr, pKontToCoreExpr, pKontIdToCore,
   CoreContext, kontToCoreExpr,
@@ -23,6 +24,8 @@ import Language.SequentCore.WiredIn
 import BasicTypes ( Arity, RecFlag(..), TopLevelFlag(..), TupleSort(..)
                   , isNonRec, isNotTopLevel )
 import CoreSubst
+import CoreSyn   ( Unfolding(..), UnfoldingGuidance(..) )
+import CoreUnfold
 import qualified CoreSyn as Core
 import qualified CoreUtils as Core
 import qualified CoreFVs as Core
@@ -72,9 +75,18 @@ termFromCoreExpr expr
   = fromCoreExprAsTerm env markedExpr
   where
     markedExpr = runEscM (escAnalExpr expr)
-    env = initFromCoreEnv { fce_subst = freeVarSet }
-    freeVarSet = mkSubst (mkInScopeSet (Core.exprFreeVars expr))
-                   emptyVarEnv emptyVarEnv emptyVarEnv
+    env = initFromCoreEnvForExpr expr
+
+-- | Translates a single Core expression as a Sequent Core parameterized
+-- continuation, given the continuation type it should translate to. Used in
+-- translating unfoldings on PKontIds, since we have the Sequent Core type
+-- already in that case.
+pKontFromCoreExprByKontType :: Type -> Core.CoreExpr -> SeqCorePKont
+pKontFromCoreExprByKontType ty expr
+  = fromCoreExprAsPKont env (Kont [] Return) (argDescsForKontTy ty) markedExpr
+  where
+    markedExpr = runEscM (escAnalExpr expr)
+    env = initFromCoreEnvForExpr expr
 
 ---------------------------------------
 -- Phase 1: Escape-analyse Core code --
@@ -346,6 +358,8 @@ data MarkedVar  = Marked Var KontOrFunc
 unmark :: MarkedVar -> Var
 unmark (Marked var _) = var
 
+instance HasId MarkedVar where identifier = unmark
+
 -- | Decide whether a variable should be contified, returning the marked
 -- variable and a flag (True if contifying).
 markVar :: Id -> CallInfo -> (MarkedVar, Bool)
@@ -418,6 +432,30 @@ mkArgDescs x ty (CI { ci_arity = arity, ci_args = call, ci_scope = scope })
                            pprPanic "mkArgDescs" (ppr ty <+> ppr arg)
                            
     go _ [] = Just []
+
+argDescsForKontTy :: Type -> [ArgDesc]
+argDescsForKontTy kontTy
+  | Just ty <- isKontTy_maybe kontTy
+  = go ty []
+  | otherwise
+  = pprPanic "argDescsForKontTy" (ppr kontTy)
+  where
+    go ty acc | Just (tyVar, retTy) <- isUbxExistsTy_maybe ty
+              = go retTy (TyArg tyVar : acc)
+              | isUnboxedTupleType ty
+              , Just (_, tyArgs) <- splitTyConApp_maybe ty
+              = goTuple tyArgs acc
+              | otherwise
+              = pprPanic "argDescsForKontTy" (ppr kontTy)
+    
+    goTuple [] acc       = done (FixedVoidArg : acc)
+    goTuple [ty] acc     | Just (tyVar, retTy) <- isUbxExistsTy_maybe ty
+                         = go retTy (TyArg tyVar : acc)
+                         | otherwise
+                         = done (ValArg ty : acc)
+    goTuple (ty:tys) acc = goTuple tys (ValArg ty : acc)
+    
+    done acc = reverse acc
     
 splitPiTyN :: Type -> TotalArity -> ([Maybe TyVar], Type)
 splitPiTyN ty n
@@ -605,9 +643,10 @@ data KontType = KTExists TyVar KontType | KTTuple [KontType] | KTType Type
 -- | Convert an id to the id of a parameterized continuation, changing its type
 -- according to the given calling convention.
 idToPKontId :: Id -> KontCallConv -> PKontId
-idToPKontId p (ByJump fixed)
+idToPKontId p conv@(ByJump fixed)
   = p `setIdType` kontTypeToType (go (idType p) fixed)
       `setIdInfo` (idInfo p `setArityInfo` valArgCount)
+      `tweakUnfolding` conv
   where
     valArgCount = count (\case { ValArg {} -> True; _ -> False }) fixed
     
@@ -652,18 +691,73 @@ filterArgs xs (ByJump fixed)
     doArg x (TyArg _)   = Just x
     doArg _ _           = Nothing
 
+-- | Alter an id's unfolding according to the given calling convention.
+tweakUnfolding :: Id -> KontCallConv -> Id
+tweakUnfolding id (ByJump descs)
+  = case unf of
+      Core.CoreUnfolding {} ->
+        let expr = uf_tmpl unf
+            env = initFromCoreEnvForExpr expr
+            (env', bndrs, body) = etaExpandForPKontBody env descs expr
+            bndrs' | noValArgs = bndrs ++ [voidPrimId]
+                   | otherwise = bndrs
+            expr' = substExpr (text "tweakUnfolding") (fce_subst env') (Core.mkLams bndrs' body)
+            arity' = valArgCount `min` 1
+        in id `setIdUnfolding`
+             mkCoreUnfolding (uf_src unf) (uf_is_top unf) (simpleOptExpr expr')
+                             arity' (fixGuid (uf_guidance unf))
+      _ -> id
+  where
+    unf = realIdUnfolding id
+    
+    isValArgDesc (ValArg {}) = True
+    isValArgDesc _           = False
+    
+    valArgCount = count isValArgDesc descs
+    noValArgs = valArgCount == 0
+    
+    fixGuid guid@(UnfIfGoodArgs { ug_args = args })
+      | noValArgs
+      = guid { ug_args = [0] } -- We keep a single Void# lambda in the unfolding
+      | otherwise
+      = guid { ug_args = fixArgs args descs }
+    fixGuid guid = guid
+    
+    fixArgs [] [] = []
+    fixArgs [] (ValArg _ : _)
+      = warnPprTrace True __FILE__ __LINE__
+          (text "Out of value discounts" $$
+           text "Unfolding:" <+> ppr unf $$
+           text "Arg descs:" <+> ppr descs)
+        []
+    fixArgs args []
+      = warnPprTrace True __FILE__ __LINE__
+          (text "Leftover arg discounts:" <+> ppr args $$
+           text "Unfolding:" <+> ppr unf $$
+           text "Arg descs:" <+> ppr descs)
+        []
+    fixArgs (arg:args) (ValArg _ : descs)
+      = arg : fixArgs args descs
+    fixArgs (_:args) (FixedVoidArg : descs)
+      = fixArgs args descs
+    fixArgs args (_ : descs) -- Type argument (fixed or variable)
+      = fixArgs args descs
+
 -- Environment for Core -> Sequent Core translation --
 
 data FromCoreEnv
   = FCE { fce_subst :: Subst
-        , fce_currentKontTy :: Maybe Type
-        , fce_boundKonts :: IdEnv KontCallConv
-        }
+        , fce_boundKonts :: IdEnv KontCallConv }
 
 initFromCoreEnv :: FromCoreEnv
 initFromCoreEnv = FCE { fce_subst = emptySubst
-                      , fce_currentKontTy = Nothing
                       , fce_boundKonts = emptyVarEnv }
+
+initFromCoreEnvForExpr :: Core.CoreExpr -> FromCoreEnv
+initFromCoreEnvForExpr expr = initFromCoreEnv { fce_subst = freeVarSet }
+  where
+    freeVarSet = mkSubst (mkInScopeSet (Core.exprFreeVars expr))
+                   emptyVarEnv emptyVarEnv emptyVarEnv
 
 bindAsPKont :: FromCoreEnv -> PKontId -> KontCallConv -> FromCoreEnv
 bindAsPKont env p conv
@@ -671,9 +765,6 @@ bindAsPKont env p conv
 
 bindAsPKonts :: FromCoreEnv -> [(PKontId, KontCallConv)] -> FromCoreEnv
 bindAsPKonts env ps = foldr (\(p, conv) env' -> bindAsPKont env' p conv) env ps
-
-bindCurrentKontTy :: FromCoreEnv -> Type -> FromCoreEnv
-bindCurrentKontTy env ty = env { fce_currentKontTy = Just ty }
 
 kontCallConv :: FromCoreEnv -> Var -> Maybe KontCallConv
 kontCallConv env var = lookupVarEnv (fce_boundKonts env) var
@@ -696,16 +787,23 @@ fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
       Core.Let bs e      ->
         let (env', bs')   = fromCoreBind env (Just (Kont fs end)) bs
         in go (bs' : binds) env' e fs end
-      Core.Case e (Marked x _) ty as
+      Core.Case e (Marked x _) _ as
         -- If the continuation is just a return, copy it into the branches
-        | null fs, Return {} <- end ->
-        let (subst_rhs, x') = substBndr subst x
-            env_rhs = env { fce_subst = subst_rhs }
-        in go binds env e [] (Case x' $ map (fromCoreAlt env_rhs (Kont fs end)) as)
+        | null fs, Return {} <- end -> go binds env e [] end'
         -- Otherwise be more careful. In the simplifier, we get clever and
         -- split the continuation into a duplicable part and a non-duplicable
         -- part (see splitDupableKont); for now just share the whole thing.
-        | otherwise -> done $ fromCoreCaseAsTerm env e x ty as
+        | otherwise -> 
+        let join_arg  = mkKontArgId (idType x')
+            join_rhs  = PKont [join_arg] (Eval (Var join_arg) (Kont [] end'))
+            join_ty   = mkKontTy (mkTupleTy UnboxedTuple [idType x'])
+            join_bndr = mkInlinablePKontBinder join_ty
+            join_bind = NonRec (BindPKont join_bndr join_rhs)
+        in go (join_bind : binds) env e [] (Case join_arg [Alt DEFAULT [] (Jump [Var join_arg] join_bndr)])
+        where
+          (subst_rhs, x') = substBndr subst x
+          env_rhs = env { fce_subst = subst_rhs }
+          end'    = Case x' $ map (fromCoreAlt env_rhs (Kont fs end)) as
       Core.Coercion co   -> done $ Coercion (substCo subst co)
       Core.Cast e co     -> go binds env e (Cast (substCo subst co) : fs) end
       Core.Tick ti e     -> go binds env e (Tick (substTickish subst ti) : fs) end
@@ -738,48 +836,40 @@ fromCoreLams env (Marked x _) expr
     bodyComm = fromCoreExpr env' body (Kont [] Return)
     body' = mkCompute ty bodyComm
     (subst', xs') = substBndrs (fce_subst env) (x : map unmark xs)
-    env' = env { fce_subst = subst' } `bindCurrentKontTy` ty
+    env' = env { fce_subst = subst' }
     ty  = substTy subst' (Core.exprType (unmarkExpr body))
-
-fromCoreCaseAsTerm :: FromCoreEnv -> Core.Expr MarkedVar -> Core.CoreBndr -> Type
-                   -> [Core.Alt MarkedVar] -> SeqCoreTerm
-fromCoreCaseAsTerm env scrut bndr ty alts
-  -- Translating a case naively can duplicate lots of code. Rather than
-  -- copy the continuation for each branch, we bind it to a variable and
-  -- copy only a Return to that binding (c.f. makeTrivial in Simpl.hs)
-  --
-  -- The basic plan of action (taken together with the Case clause in fromCoreExpr):
-  --   [[ case e of alts ]]_k = < compute p. [[e]]_(case of [[alts]]_p) | k >
-  = Compute ty' body
-  where
-    subst   = fce_subst env
-    ty'     = substTy subst ty
-    (subst_rhs, bndr') = substBndr subst bndr
-    env_rhs = bindCurrentKontTy (env { fce_subst = subst_rhs }) ty'
-    alts'   = map (fromCoreAlt env_rhs (Kont [] Return)) alts
-    body    = fromCoreExpr env scrut (Kont [] (Case bndr' alts'))
 
 fromCoreExprAsTerm :: FromCoreEnv -> Core.Expr MarkedVar -> SeqCoreTerm
 fromCoreExprAsTerm env expr
   = mkCompute ty body
   where
-    body = fromCoreExpr env' expr (Kont [] Return)
+    body = fromCoreExpr env expr (Kont [] Return)
     subst = fce_subst env
     ty = substTy subst (Core.exprType (unmarkExpr expr))
-    env' = env `bindCurrentKontTy` ty
 
 fromCoreExprAsPKont :: FromCoreEnv -> SeqCoreKont -> [ArgDesc]
                     -> Core.Expr MarkedVar
                     -> SeqCorePKont
 fromCoreExprAsPKont env kont descs expr
   = --pprTrace "fromCoreExprAsPKont" (ppr descs $$ ppr bndrs $$ ppr bndrs_final)
-    result
+    PKont bndrs comm
+  where
+    -- Eta-expand the body *before* translating to Sequent Core so that the
+    -- parameterized continuation has all the arguments it should get
+    (env', bndrs, etaBody) = etaExpandForPKontBody env descs expr
+    comm = fromCoreExpr env' etaBody kont
+
+etaExpandForPKontBody :: HasId b
+                      => FromCoreEnv -> [ArgDesc] -> Core.Expr b
+                      -> (FromCoreEnv, [Var], Core.Expr b)
+etaExpandForPKontBody env descs expr
+  = (env', bndrs_final, etaBody)
   where
     subst = fce_subst env
-    
+
     -- Calculate outer binders (existing ones from expr, minus fixed args)
     (bndrs, body) = collectNBinders (length descs) expr
-    bndrs_unmarked = map unmark bndrs
+    bndrs_unmarked = identifiers bndrs
     (subst', bndr_maybes) = mapAccumL doBndr subst (zip bndrs_unmarked descs)
     bndrs' = catMaybes bndr_maybes
 
@@ -789,15 +879,10 @@ fromCoreExprAsPKont env kont descs expr
       = mapAccumL mkEtaBndr subst' (zip [1..] extraArgs)
     etaBndrs = catMaybes etaBndr_maybes
     
-    -- Eta-expand the body *before* translating to Sequent Core so that the
-    -- parameterized continuation has all the arguments it should get
+    env' = env { fce_subst = subst'' }
+    bndrs_final = bndrs' ++ etaBndrs
     etaBody | null extraArgs = body
             | otherwise      = Core.mkApps body etaArgs
-    
-    env' = env { fce_subst = subst'' }
-    comm = fromCoreExpr env' etaBody kont
-    bndrs_final = bndrs' ++ etaBndrs
-    result = PKont bndrs_final comm
     
     -- Process a binder, possibly dropping it, and return a new subst
     doBndr :: Subst -> (Var, ArgDesc) -> (Subst, Maybe Var)
@@ -823,10 +908,10 @@ fromCoreExprAsPKont env kont descs expr
       = (subst', Just bndr')
       where
         (subst', bndr') = substBndr subst bndr
-    
+
     -- From an ArgDesc, generate an argument to apply and (possibly) a parameter
     -- to the eta-expanded function
-    mkEtaBndr :: Subst -> (Int, ArgDesc) -> (Subst, (Maybe Var, Core.Expr MarkedVar))
+    mkEtaBndr :: Subst -> (Int, ArgDesc) -> (Subst, (Maybe Var, Core.Expr b))
     mkEtaBndr subst (_, FixedType ty)
       = (subst, (Nothing, Core.Type (substTy subst ty)))
     mkEtaBndr subst (_, FixedVoidArg)
@@ -846,7 +931,7 @@ fromCoreExprAsPKont env kont descs expr
         go acc 0 e              = (reverse acc, e)
         go acc n (Core.Lam x e) = go (x:acc) (n-1) e
         go acc _ e              = (reverse acc, e)
-    
+
 -- | Translates a Core case alternative into Sequent Core.
 fromCoreAlt :: FromCoreEnv -> SeqCoreKont -> Core.Alt MarkedVar
             -> SeqCoreAlt

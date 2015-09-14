@@ -37,6 +37,7 @@ module Language.SequentCore.Syntax (
   termType, frameType, applyTypeToArg, applyTypeToArgs, applyTypeToFrames,
   termIsBottom, commandIsBottom,
   needsCaseBinding,
+  termIsWorkFree, commandIsWorkFree,
   termOkForSpeculation, commandOkForSpeculation, kontOkForSpeculation,
   termOkForSideEffects, commandOkForSideEffects, kontOkForSideEffects,
   termIsCheap, kontIsCheap, commandIsCheap, pKontIsCheap, rhsIsCheap,
@@ -76,8 +77,11 @@ import TyCon
 import Type      ( Type, KindOrType, eqType )
 import qualified Type
 import TysPrim
+import Util      ( count )
 import Var       ( Var, isId )
 import VarEnv
+
+import Control.Monad ( guard )
 
 import Data.Maybe
 
@@ -670,6 +674,44 @@ commandIsBottom (Eval (Var x) (Kont fs _))
       go n []              = n >= idArity x
 commandIsBottom (Jump _ j) = isBottomingId j
 commandIsBottom _          = False
+
+termIsWorkFree    :: HasId b => Term    b -> Bool
+commandIsWorkFree :: HasId b => Command b -> Bool
+
+termIsWorkFree    = termWF 0
+commandIsWorkFree = commWF 0
+
+termWF :: HasId b => Int -> Term b -> Bool
+  -- termWF n v == is v work-free when its continuation applies n value args?
+termWF _ (Lit {})              = True
+termWF _ (Type {})             = True
+termWF _ (Coercion {})         = True
+termWF n (Var x)               = isCheapApp x n
+termWF n (Lam x v) | isRuntimeVar (identifier x)
+                               = n == 0 || termWF (n-1) v
+                   | otherwise = termWF n v
+termWF n (Compute _ c)         = commWF n c
+
+kontWF :: HasId b => Int -> Kont b -> Maybe Int
+  -- kontWF n k == if ret is bound to a continuation that applies n value args,
+  -- is k work-free, and if so, how many value args does it apply?
+kontWF n (Kont fs end)
+  = guard (endWF n end) >> Just (n + count isValueAppFrame fs)
+
+endWF :: HasId b => Int -> End b -> Bool
+  -- endWF n e == is e work-free when ret is bound to a continuation that
+  -- applies n value args?
+endWF _ Return        = True
+endWF n (Case _ alts) = and [ commWF n c | Alt _ _ c <- alts ]
+
+commWF :: HasId b => Int -> Command b -> Bool
+  -- commWF n c == is c work-free when ret is bound to a continuation that
+  -- applies n value args?
+commWF _ (Let {})   = False
+commWF _ (Jump {})  = False
+commWF n (Eval v k) = case kontWF n k of
+                             Just n' -> termWF n' v
+                             Nothing -> False
 
 -- | Decide whether a term should be bound using @case@ rather than @let@.
 -- See 'CoreUtils.needsCaseBinding'.
