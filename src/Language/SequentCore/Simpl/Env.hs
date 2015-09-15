@@ -52,10 +52,10 @@ module Language.SequentCore.Simpl.Env (
   
   -- * Type synonyms distinguishing incoming (unsubstituted) syntax from outgoing
   In, InCommand, InTerm, InArg, InKont, InFrame, InEnd, InPKont,
-  InAlt, InBind, InBndr, InBindPair, InRhs, InValue,
+  InAlt, InBind, InBndr, InBindPair, InRhs,
   InType, InCoercion, InId, InPKontId, InVar, InTyVar, InCoVar,
   Out, OutCommand, OutTerm, OutArg, OutKont, OutFrame, OutEnd, OutPKont,
-  OutAlt, OutBind, OutBndr, OutBindPair, OutRhs, OutValue,
+  OutAlt, OutBind, OutBndr, OutBindPair, OutRhs,
   OutType, OutCoercion, OutId, OutPKontId, OutVar, OutTyVar, OutCoVar,
   SubstedCoercion,
   
@@ -389,7 +389,7 @@ mkBoundToWithGuidance env (Left term) src level arity guid
             , def_isWorkFree   = termIsWorkFree term
             , def_isConLike    = termIsConLike env term
             }
-mkBoundToWithGuidance env (Right pk) src level arity guid
+mkBoundToWithGuidance _env (Right pk) src level arity guid
   = BoundTo { def_rhs          = Right (occurAnalysePKont pk)
             , def_src          = src
             , def_level        = level
@@ -398,7 +398,7 @@ mkBoundToWithGuidance env (Right pk) src level arity guid
             , def_isExpandable = True -- For inlining decisions, pkonts are all lambdas
             , def_isValue      = True
             , def_isWorkFree   = True 
-            , def_isConLike    = pKontIsConLike env pk
+            , def_isConLike    = True
             }
 
 mkBoundToDFun :: [OutBndr] -> DataCon -> [OutArg] -> Definition
@@ -478,7 +478,6 @@ type InBind     = SeqCoreBind
 type InBndr     = SeqCoreBndr
 type InBindPair = SeqCoreBindPair
 type InRhs      = SeqCoreRhs
-type InValue    = SeqCoreValue
 type InType     = Type
 type InCoercion = Coercion
 type InId       = Id
@@ -500,7 +499,6 @@ type OutBind    = SeqCoreBind
 type OutBndr    = SeqCoreBndr
 type OutBindPair = SeqCoreBindPair
 type OutRhs     = SeqCoreRhs
-type OutValue   = SeqCoreValue
 type OutType    = Type
 type OutCoercion = Coercion
 type OutId      = Id
@@ -1385,18 +1383,12 @@ guidanceToUnfGuidance (Sometimes { guSize = size, guArgDiscounts = args, guResul
 -- evaluated.
 
 termIsHNF, termIsConLike :: SimplEnv -> SeqCoreTerm -> Bool
-termIsHNF     env = rhsIsHNFLike isDataConWorkId defIsEvald env . Left
-termIsConLike env = rhsIsHNFLike isConLikeId defIsConLike env   . Left
+termIsHNF     env = termIsHNFLike isDataConWorkId defIsEvald env
+termIsConLike env = termIsHNFLike isConLikeId defIsConLike env
 
-pKontIsHNF, pKontIsConLike :: SimplEnv -> SeqCorePKont -> Bool
-pKontIsHNF     env = rhsIsHNFLike isDataConWorkId defIsEvald env . Right
-pKontIsConLike env = rhsIsHNFLike isConLikeId defIsConLike env   . Right
-
-rhsIsHNFLike :: (Var -> Bool) -> (Definition -> Bool) -> SimplEnv -> SeqCoreRhs -> Bool
-rhsIsHNFLike isCon isHNFDef env rhs
-  = case rhs of
-      Left term -> isHNFLike term []
-      Right pk  -> isHNFLikePKont pk
+termIsHNFLike :: (Var -> Bool) -> (Definition -> Bool) -> SimplEnv -> SeqCoreTerm -> Bool
+termIsHNFLike isCon isHNFDef env term
+  = isHNFLike term []
   where
     isHNFLike _                fs | hasTick fs = False
     isHNFLike (Var id)         fs = isCon id
@@ -1413,8 +1405,6 @@ rhsIsHNFLike isCon isHNFDef env rhs
     isHNFLikeComm (Eval v k)    = case k of
                                     Kont _ (Case {}) -> False
                                     Kont fs Return   -> isHNFLike v fs
-    
-    isHNFLikePKont (PKont xs comm) = any isId xs || isHNFLikeComm comm
     
     isRuntimeApp (App (Type _)) = False
     isRuntimeApp (App _)        = True

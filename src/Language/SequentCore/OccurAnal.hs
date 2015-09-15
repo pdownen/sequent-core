@@ -1540,16 +1540,6 @@ wrapProxy enable_binder_swap (Just (scrut_var, rhs)) case_bndr body_usg body
     
 wrapProxy _ _ _ body_usg body 
   = (body_usg, body)
-  
-occAnalValue :: OccEnv -> SeqCoreValue -> (UsageDetails, SeqCoreValue)
-occAnalValue _env val@(LitVal _) = (emptyDetails, val)
-occAnalValue env (LamVal xs body)
-  = case occAnalTerm env (mkLambdas xs body) of { (usage, term') ->
-    let (xs', body') = lambdas term'
-    in (usage, LamVal xs' body') }
-occAnalValue env (ConsVal con tys args)
-  = case mapAndUnzip (occAnalTerm env) args of { (arg_usages, args') ->
-    (foldl (+++) emptyDetails arg_usages, ConsVal con tys args') }
 
 {-
 %************************************************************************

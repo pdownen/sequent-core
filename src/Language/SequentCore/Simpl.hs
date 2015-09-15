@@ -21,6 +21,7 @@ import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Simpl.Monad
 import Language.SequentCore.Simpl.Util
 import Language.SequentCore.Syntax
+import Language.SequentCore.Syntax.Util
 import Language.SequentCore.Translate
 import Language.SequentCore.Util
 import Language.SequentCore.WiredIn
@@ -1170,13 +1171,13 @@ simplKontAfterRules env ai (Case x alts)
   , null (ai_frames ai) -- TODO There could be ticks here; deal with them
   = do
     tick (KnownBranch x)
-    case matchCase env (LitVal lit) alts of
+    case findAlt (LitAlt lit) alts of
       Nothing -> missingAlt env x alts
       Just (Alt _ binds rhs) -> bindCaseBndr binds rhs
   | Just (dc, tyArgs, valArgs) <- termIsConApp_maybe env (getUnfoldingInRuleMatch env) scrut
   = do
     tick (KnownBranch x)
-    case matchCase env (ConsVal dc tyArgs valArgs) alts of
+    case findAlt (DataAlt dc) alts of
       Nothing -> missingAlt env x alts
       Just (Alt DEFAULT binds rhs) -> bindCaseBndr binds rhs
       Just (Alt _       binds rhs) -> knownCon env scrut dc tyArgs valArgs x binds rhs 

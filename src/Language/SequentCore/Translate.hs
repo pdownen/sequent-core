@@ -331,9 +331,10 @@ at them is unhelpful.
 
 For instance:
 
-    let rec { rep :: forall a. Int -> a -> [a] -> [a]
-              rep @a n x xs = case n <= 0 of True  -> xs
-                                             False -> rep @a (n-1) (x:xs) }
+    let rec { replicate :: forall a. Int -> a -> [a] -> [a]
+              replicate @a n x xs =
+                case n <= 0 of True  -> xs
+                               False -> rep @a (n-1) (x:xs) }
     in case q of True  -> rep @Char 4 'a' []
                  False -> rep @Char 3 'b' []
 
@@ -566,7 +567,7 @@ escAnalExpr expr@(Core.Lam {})
     -- Remove value binders from the environment in case of shadowing - we
     -- won't report them as free vars
     body' <- withoutCandidates valBndrs $
-             -- Lambdas ruin contification, so pretend the free vars escape
+             -- Lambdas ruin contification, so the free vars escape
              filterAnalysis markAllAsEscaping $
              escAnalExpr body
     let bndrs' = [ Marked bndr MakeFunc | bndr <- tyBndrs ++ valBndrs ]
@@ -643,31 +644,31 @@ data KontType = KTExists TyVar KontType | KTTuple [KontType] | KTType Type
 -- | Convert an id to the id of a parameterized continuation, changing its type
 -- according to the given calling convention.
 idToPKontId :: Id -> KontCallConv -> PKontId
-idToPKontId p conv@(ByJump fixed)
-  = p `setIdType` kontTypeToType (go (idType p) fixed)
+idToPKontId p conv@(ByJump descs)
+  = p `setIdType` kontTypeToType (go (idType p) descs)
       `setIdInfo` (idInfo p `setArityInfo` valArgCount)
       `tweakUnfolding` conv
   where
-    valArgCount = count (\case { ValArg {} -> True; _ -> False }) fixed
+    valArgCount = count (\case { ValArg {} -> True; _ -> False }) descs
     
     go _  [] = KTTuple []
-    go ty (FixedType tyArg : fixed')
+    go ty (FixedType tyArg : descs')
       | Just (tyVar, ty') <- splitForAllTy_maybe ty
-      = go (substTyWith [tyVar] [tyArg] ty') fixed'
-    go ty (FixedVoidArg : fixed')
+      = go (substTyWith [tyVar] [tyArg] ty') descs'
+    go ty (FixedVoidArg : descs')
       | Just (argTy, retTy) <- splitFunTy_maybe ty
       = assert (argTy `eqType` voidPrimTy) $
-        go retTy fixed'
-    go ty (TyArg tyVar : fixed')
+        go retTy descs'
+    go ty (TyArg tyVar : descs')
       | Just (tyVar', ty') <- splitForAllTy_maybe ty
       = assert (tyVar == tyVar') $
-        KTExists tyVar (go ty' fixed')
-    go ty (ValArg argTy : fixed')
+        KTExists tyVar (go ty' descs')
+    go ty (ValArg argTy : descs')
       | Just (argTy', retTy) <- splitFunTy_maybe ty
       = assert (argTy `eqType` argTy') $
-        argTy `consKT` go retTy fixed'
+        argTy `consKT` go retTy descs'
     go _ _
-      = pprPanic "idToPKontId" (pprBndr LetBind p $$ ppr fixed)
+      = pprPanic "idToPKontId" (pprBndr LetBind p $$ ppr descs)
 
     kontTypeToType :: KontType -> Type
     kontTypeToType = mkKontTy . go
@@ -683,13 +684,13 @@ idToPKontId p conv@(ByJump fixed)
 
 -- | Remove from a list the elements corresponding to fixed arguments according
 -- to the given calling convention.
-filterArgs :: [a] -> KontCallConv -> [a]
-filterArgs xs (ByJump fixed)
-  = catMaybes (zipWith doArg xs fixed)
+removeFixedArgs :: [a] -> KontCallConv -> [a]
+removeFixedArgs args (ByJump descs)
+  = [ arg | (arg, desc) <- zip args descs, keep desc ]
   where
-    doArg x (ValArg _)  = Just x
-    doArg x (TyArg _)   = Just x
-    doArg _ _           = Nothing
+    keep (FixedType _) = False
+    keep FixedVoidArg  = False
+    keep _             = True
 
 -- | Alter an id's unfolding according to the given calling convention.
 tweakUnfolding :: Id -> KontCallConv -> Id
@@ -813,9 +814,9 @@ fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
         done term = mkCommand (reverse binds) term (Kont fs end)
         
         goApp x args = case conv_maybe of
-          Just conv@(ByJump fixed)
-            -> assert (length args == length fixed) $
-               doneJump (filterArgs args' conv) p
+          Just conv@(ByJump descs)
+            -> assert (length args == length descs) $
+               doneJump (removeFixedArgs args' conv) p
           Nothing
             -> doneEval (Var x') (Kont (map App args' ++ fs) end)
           where
@@ -969,10 +970,10 @@ fromCoreBindPair :: FromCoreEnv -> Maybe SeqCoreKont -> Var -> KontOrFunc
                  -> Core.Expr MarkedVar -> (Maybe KontCallConv, SeqCoreBindPair)
 fromCoreBindPair env kont_maybe x mark rhs
   = case mark of
-      MakeKont fixed -> let Just kont = kont_maybe
-                            pkont = fromCoreExprAsPKont env kont fixed rhs
-                        in (Just (ByJump fixed),
-                            BindPKont (idToPKontId x (ByJump fixed)) pkont)
+      MakeKont descs -> let Just kont = kont_maybe
+                            pkont = fromCoreExprAsPKont env kont descs rhs
+                        in (Just (ByJump descs),
+                            BindPKont (idToPKontId x (ByJump descs)) pkont)
       MakeFunc       -> (Nothing, BindTerm x $ fromCoreExprAsTerm env rhs)
 
 fromCoreBinds :: [Core.Bind MarkedVar] -> [SeqCoreBind]

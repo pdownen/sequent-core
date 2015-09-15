@@ -46,8 +46,6 @@ module Language.SequentCore.Syntax (
   termIsCheapBy, kontIsCheapBy, commandIsCheapBy, rhsIsCheapBy,
   -- * Continuation ids
   isPKontId, Language.SequentCore.WiredIn.mkKontTy, kontTyArg,
-  -- * Values
-  Value(..), SeqCoreValue, splitValue, valueToTerm, valueToCommandWith,
   -- * Alpha-equivalence
   cheapEqTerm, cheapEqKont, cheapEqFrame, cheapEqCommand,
   (=~=), AlphaEq(..), AlphaEnv, HasId(..)
@@ -922,40 +920,6 @@ isPKontId x = isKontTy (idType x)
 
 kontTyArg :: Type -> Type
 kontTyArg ty = isKontTy_maybe ty `orElse` pprPanic "kontTyArg" (ppr ty)
-
---------------------------------------------------------------------------------
--- Values
---------------------------------------------------------------------------------
-
-data Value b
-  = LitVal Literal
-  | LamVal [b] (Term b)
-  | ConsVal DataCon [Type] [Term b]
-  
-type SeqCoreValue = Value SeqCoreBndr
-  
-splitValue :: Term b -> Kont b -> Maybe (Value b, Kont b)
-splitValue (Lit lit) kont = Just (LitVal lit, kont)
-splitValue term@(Lam {}) kont = Just (uncurry LamVal (lambdas term), kont)
-splitValue (Var fid) kont
-  | Just dc <- isDataConWorkId_maybe fid
-  , length valArgs == dataConRepArity dc
-  = Just (ConsVal dc tyArgs valArgs, kont')
-  where
-    (tyArgs, valArgs, kont') = collectTypeAndOtherArgs kont
-splitValue _ _               = Nothing
-
-valueToTerm :: SeqCoreValue -> SeqCoreTerm
-valueToTerm (LitVal lit)          = Lit lit
-valueToTerm (LamVal xs t)         = mkLambdas xs t
-valueToTerm (ConsVal dc tys vals) = mkConstruction dc tys vals
-
-valueToCommandWith :: SeqCoreValue -> SeqCoreKont -> SeqCoreCommand
-valueToCommandWith (LitVal lit) kont        = mkCommand [] (Lit lit) kont
-valueToCommandWith (LamVal xs v) kont       = mkCommand [] (foldr Lam v xs) kont
-valueToCommandWith (ConsVal dc tys vs) kont = mkCommand [] (Var (dataConWorkId dc))
-                                                           (addFrames (map App (map Type tys ++ vs))
-                                                            kont)
 
 --------------------------------------------------------------------------------
 -- Alpha-Equivalence

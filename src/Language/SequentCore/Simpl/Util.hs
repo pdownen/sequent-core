@@ -18,7 +18,7 @@ module Language.SequentCore.Simpl.Util (
   castApp, combineCo, consCastMaybe, simplCoercion, simplOutCoercion,
   
   -- * Cases
-  matchCase, mkCase, prepareAlts,
+  mkCase, prepareAlts,
   
   -- * Lambda construction
   mkLam
@@ -412,23 +412,6 @@ Just co `consCastMaybe` fs = Cast co : fs
 -----------
 -- Cases --
 -----------
-
-matchCase :: SimplEnv -> InValue -> [InAlt] -> Maybe InAlt
-matchCase _env_v (LitVal lit) (alt@(Alt (LitAlt lit') xs _) : _alts)
-  | assert (null xs) True
-  , lit == lit'
-  = Just alt
-matchCase _env_v (ConsVal ctor _tyArgs valArgs) (alt@(Alt (DataAlt ctor') xs _) : _alts)
-  | ctor == ctor'
-  , assert (length valArgs == length xs) True
-  = Just alt
-matchCase env_v value (alt@(Alt DEFAULT xs _) : alts)
-  | assert (null xs) True
-  = Just $ matchCase env_v value alts `orElse` alt
-matchCase env_v value (_ : alts)
-  = matchCase env_v value alts
-matchCase _ _ []
-  = Nothing
 
 {-
 %************************************************************************
