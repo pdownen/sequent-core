@@ -15,7 +15,7 @@ core expression with (hopefully) improved usage information.
 {-# LANGUAGE CPP, BangPatterns, ViewPatterns #-}
 module Language.SequentCore.OccurAnal (
         occurAnalysePgm, occurAnalyseTerm, occurAnalyseTerm_NoBinderSwap,
-        occurAnalysePKont
+        occurAnalyseJoin
     ) where
 
 import Language.SequentCore.Syntax
@@ -112,9 +112,9 @@ occurAnalyseTerm' enable_binder_swap term
     -- To be conservative, we say that all inlines and rules are active
     all_active_rules = \_ -> True
 
-occurAnalysePKont :: SeqCorePKont -> SeqCorePKont
-occurAnalysePKont pk
-  = snd (occAnalPKont env pk)
+occurAnalyseJoin :: SeqCoreJoin -> SeqCoreJoin
+occurAnalyseJoin pk
+  = snd (occAnalJoin env pk)
   where
     env = initOccEnv all_active_rules
     all_active_rules = \_ -> True
@@ -902,7 +902,7 @@ reOrderNodes depth bndr_set weak_fvs (node : nodes) binds
 
         | is_con_app rhs = 5  -- Data types help with cases: Note [Constructor applications]
 
-        | either isTrivialTerm isTrivialPKont rhs = 10  -- Practically certain to be inlined
+        | either isTrivialTerm isTrivialJoin rhs = 10  -- Practically certain to be inlined
                 -- Used to have also: && not (isExportedId bndr)
                 -- But I found this sometimes cost an extra iteration when we have
                 --      rec { d = (a,b); a = ...df...; b = ...df...; df = d }
@@ -1178,8 +1178,8 @@ occAnal :: OccEnv
         -> SeqCoreRhs
         -> (UsageDetails,
             SeqCoreRhs)
-occAnal env (Left term)   = let (details, term')  = occAnalTerm env term   in (details, Left term')
-occAnal env (Right pkont) = let (details, pkont') = occAnalPKont env pkont in (details, Right pkont')
+occAnal env (Left term)  = let (details, term') = occAnalTerm env term in (details, Left term')
+occAnal env (Right join) = let (details, join') = occAnalJoin env join in (details, Right join')
 
 occAnalTerm :: OccEnv
             -> SeqCoreTerm
@@ -1285,11 +1285,11 @@ occAnalKont env usage (Kont (Cast co : frames) end)
 occAnalKont _env uds kont@(Kont [] Return)
   = (uds, kont)
 
-occAnalPKont :: OccEnv
-             -> SeqCorePKont
+occAnalJoin :: OccEnv
+             -> SeqCoreJoin
              -> (UsageDetails,
-                 SeqCorePKont)
-occAnalPKont env (PKont bndrs body)
+                 SeqCoreJoin)
+occAnalJoin env (Join bndrs body)
   -- TODO Too much C&P from occAnalTerm/Lam
   = case occAnalCommand env_body body of { ( body_usage, body' ) ->
     let
@@ -1298,9 +1298,9 @@ occAnalPKont env (PKont bndrs body)
           | all isOneShotBndr valBndrs' = final_usage
           | otherwise = mapVarEnv markInsideLam final_usage
     in
-    (really_final_usage, PKont (tyBndrs ++ tagged_valBndrs) body') }
+    (really_final_usage, Join (tyBndrs ++ tagged_valBndrs) body') }
   where
-    (tyBndrs, valBndrs)   = span isTyVar bndrs -- types always first in PKont
+    (tyBndrs, valBndrs)   = span isTyVar bndrs -- types always first in Join
     -- It's tempting to say that we should just one-shot everything, since this
     -- is a join point, but a *recursive* join point can be called more than
     -- once.
@@ -1357,7 +1357,7 @@ occAnalCut env term kont
 
 occAnalJump :: OccEnv
             -> [SeqCoreArg]
-            -> PKontId
+            -> JoinId
             -> (UsageDetails,
                 SeqCoreCommand)
 occAnalJump env args j

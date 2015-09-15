@@ -234,10 +234,10 @@ specInEnd _ Return
 specInRhs :: ScEnv -> SeqCoreRhs -> CoreM (ScUsage, SeqCoreRhs)
 specInRhs env (Left term)
   = second Left <$> specInTerm env term
-specInRhs env (Right (PKont xs comm))
+specInRhs env (Right (Join xs comm))
   = do
     (usage, comm') <- specInCommand env comm
-    return (usage, Right (PKont xs comm'))
+    return (usage, Right (Join xs comm'))
 
 specInAlt :: ScEnv -> SeqCoreAlt -> CoreM (ScUsage, SeqCoreAlt)
 specInAlt env (Alt ac xs c)
@@ -308,7 +308,7 @@ specBind env (Rec bs)
       case rhs of
         Left  term -> map (uncurry BindTerm) <$>
                         specialize env' totalUsages (bndr, term)
-        Right pk   -> return [BindPKont bndr pk]
+        Right join -> return [BindJoin bndr join]
     return (totalUsages, env', Rec (concat bindss))
   where 
     env'  = env { sc_how_bound = hb' }

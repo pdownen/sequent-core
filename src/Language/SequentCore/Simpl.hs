@@ -297,18 +297,18 @@ simplRecOrTopPair env old_bndr new_bndr rhs top_lvl is_rec
        if preInline
            then do tick (PreInlineUnconditionally old_bndr)
                    return (emptyFloats, extendIdOrPvSubst env old_bndr (Susp (staticPart env) rhs))
-           else simplLazyOrPKontBind env old_bndr new_bndr (staticPart env) rhs top_lvl is_rec
+           else simplLazyOrJoinBind env old_bndr new_bndr (staticPart env) rhs top_lvl is_rec
 
-simplLazyOrPKontBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InRhs -> TopLevelFlag
-                     -> RecFlag -> SimplM (Floats, SimplEnv)
-simplLazyOrPKontBind env_x x x' env_r r level recFlag
+simplLazyOrJoinBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InRhs -> TopLevelFlag
+                    -> RecFlag -> SimplM (Floats, SimplEnv)
+simplLazyOrJoinBind env_x x x' env_r r level recFlag
   = case r of
-      Left term -> assert (not (isPKontId x)) $
+      Left term -> assert (not (isJoinId x)) $
                    simplLazyBind env_x x x' (zapKontSubstEnvsStatic env_r) term level recFlag
-      Right pk  -> assert (isPKontId x && isNotTopLevel level) $ do
+      Right pk  -> assert (isJoinId x && isNotTopLevel level) $ do
                    (flts, env_r') <- ensureDupableKont (env_r `inDynamicScope` env_x)
                      -- Note [Call ensureDupableKont around join point]
-                   addingFloats flts $ simplPKontBind (env_x `augmentFromFloats` flts) x x' (staticPart env_r') pk recFlag
+                   addingFloats flts $ simplJoinBind (env_x `augmentFromFloats` flts) x x' (staticPart env_r') pk recFlag
 
 {-
 simplLazyBind is used for
@@ -402,7 +402,7 @@ simplNonRecInCommand env_x x env_v rhs mk_strict k_lazy
        -> do
           let (env_x',  x')  = enterScope env_x x
               (env_x'', x'') = addBndrRules env_x' x x'
-          (flts, env_final) <- simplLazyOrPKontBind env_x'' x x'' env_v rhs
+          (flts, env_final) <- simplLazyOrJoinBind env_x'' x x'' env_v rhs
                                                     NotTopLevel NonRecursive
           addingFloats flts $ k_lazy (env_final `augmentFromFloats` flts)
 
@@ -534,9 +534,9 @@ prepareRhsTerm _ _ _ term
   = return (emptyFloats, term)
 
 {-
-simplPKontBind is used for
-  * [simplRecOrTopPair] recursive pkont bindings
-  * [simplNonRec]       non-recursive pkont bindings
+simplJoinBind is used for
+  * [simplRecOrTopPair] recursive join bindings
+  * [simplNonRec]       non-recursive join bindings
 
 Nota bene:
     1. It assumes that the binder is *already* simplified,
@@ -545,23 +545,23 @@ Nota bene:
     2. It does not check for pre-inline-unconditionallly;
        that should have been done already.
 -}
-simplPKontBind :: SimplEnv -> InPKontId -> OutPKontId -> StaticEnv -> InPKont
-               -> RecFlag -> SimplM (Floats, SimplEnv)
-simplPKontBind _env_j j j' _env_pk pk recFlag
+simplJoinBind :: SimplEnv -> InJoinId -> OutJoinId -> StaticEnv -> InJoin
+              -> RecFlag -> SimplM (Floats, SimplEnv)
+simplJoinBind _env_j j j' _env_pk pk recFlag
   | tracing
-  , pprTraceShort "simplPKontBind" (ppr j <+> (if j == j' then empty else darrow <+> ppr j') <+>
+  , pprTraceShort "simplJoinBind" (ppr j <+> (if j == j' then empty else darrow <+> ppr j') <+>
                                     ppr recFlag $$ ppr pk) False
   = undefined
-simplPKontBind env_j j j' env_pk pk _recFlag
+simplJoinBind env_j j j' env_pk pk _recFlag
   = do
     let env_pk' = env_pk `inDynamicScope` env_j
-    (flts, pk') <- simplPKont env_pk' pk
+    (flts, pk') <- simplJoin env_pk' pk
     env_j' <-
       if isEmptyFloats flts
          then    return env_j
          else do tick LetFloatFromLet -- Can always float through a cont binding
                                       -- (If the cont has parameters, the floats
-                                      -- won't make it here; see simplPKont.)
+                                      -- won't make it here; see simplJoin.)
                  return $ env_j `augmentFromFloats` flts
     addingFloats flts $ completeBind env_j' j j' (Right pk') NotTopLevel
 
@@ -580,27 +580,27 @@ might cause an extra iteration if mkDupableKont creates bindings that are only
 used once.
 -}
 
-simplPKont :: SimplEnv -> InPKont -> SimplM (Floats, OutPKont)
-simplPKont env pk
+simplJoin :: SimplEnv -> InJoin -> SimplM (Floats, OutJoin)
+simplJoin env pk
   = case pk of
       -- Can only float bindings out if there are no parameters
-      PKont [] comm -> do
+      Join [] comm -> do
         (flts, comm') <- simplCommand env comm
-        return (flts, PKont [] comm')
+        return (flts, Join [] comm')
       _ -> do
-        pk' <- simplPKontNoFloats env pk
+        pk' <- simplJoinNoFloats env pk
         return (emptyFloats, pk')
 
-simplPKontNoFloats :: SimplEnv -> InPKont -> SimplM OutPKont
-simplPKontNoFloats env (PKont xs comm)
+simplJoinNoFloats :: SimplEnv -> InJoin -> SimplM OutJoin
+simplJoinNoFloats env (Join xs comm)
   = do
     let (env', xs') = enterLamScopes env xs
     comm' <- simplCommandNoFloats env' comm
-    return $ PKont xs' comm'
+    return $ Join xs' comm'
 
 simplRhsNoFloats :: SimplEnv -> InRhs -> SimplM OutRhs
-simplRhsNoFloats env (Left term) = Left  <$> simplTermNoFloats  env RhsCtxt term
-simplRhsNoFloats env (Right pk)  = Right <$> simplPKontNoFloats env pk
+simplRhsNoFloats env (Left term)  = Left  <$> simplTermNoFloats env RhsCtxt term
+simplRhsNoFloats env (Right join) = Right <$> simplJoinNoFloats env join
 
 completeBind :: SimplEnv -> InVar -> OutVar -> OutRhs
              -> TopLevelFlag -> SimplM (Floats, SimplEnv)
@@ -709,7 +709,7 @@ tryEtaExpandRhs :: SimplEnv -> OutId -> OutRhs -> SimplM (Arity, OutRhs)
 tryEtaExpandRhs env x (Left v)
   = do (arity, v') <- tryEtaExpandRhsTerm env x v
        return (arity, Left v')
-tryEtaExpandRhs _ _ (Right pk@(PKont xs _))
+tryEtaExpandRhs _ _ (Right pk@(Join xs _))
   = return (length (filter isId xs), Right pk)
       -- TODO Somehow take into account the arity of the outer context
 
@@ -1131,10 +1131,10 @@ by a Return from an actual Eval command). Thus we skip out here.
 simplKontEnd _env (ArgInfo { ai_target = JumpTarget j, ai_frames = fs }) end
   = assert (isReturn end && all isAppFrame fs) $ -- Note [simplKont invariants]
     return (emptyFloats, Jump [ arg | App arg <- reverse fs ] j)
-simplKontEnd env (ArgInfo { ai_target = PKontTarget pk, ai_frames = fs }) end
+simplKontEnd env (ArgInfo { ai_target = JoinTarget pk, ai_frames = fs }) end
   = assert (isReturn end && all isAppFrame fs) $ -- Note [simplKont invariants]
     do
-    let (env', PKont xs comm) = openScoped env pk
+    let (env', Join xs comm) = openScoped env pk
         args = [ arg | App arg <- reverse fs ]
     (env'', flts) <- mapAccumLM (\env (x, v) -> swap <$> simplNonRecOut env x v) env' (zip xs args)
     addingFloats (catFloats flts) $ simplCommand env'' comm
@@ -1305,7 +1305,7 @@ simplKontDone env term end
 -- Jumps --
 -----------
 
-simplJump :: SimplEnv -> [InArg] -> InPKontId -> SimplM (Floats, OutCommand)
+simplJump :: SimplEnv -> [InArg] -> InJoinId -> SimplM (Floats, OutCommand)
 simplJump env args j
   | tracing
   , pprTraceShort "simplJump" (ppr env $$ parens (pprWithCommas ppr args) $$ pprBndr LetBind j)
@@ -1339,7 +1339,7 @@ simplJump env args j
     frames = map (Incoming (termStaticPart env) . App) args
     end    = Simplified OkToDup Nothing Return
     reduce env_pk pk
-      = simplKont env_pk (mkPKontArgInfo env_pk (Incoming (staticPart env_pk) pk) frames)
+      = simplKont env_pk (mkJoinArgInfo env_pk (Incoming (staticPart env_pk) pk) frames)
                           frames end
     
     dump_inline dflags def
@@ -1631,7 +1631,7 @@ postInlineUnconditionally env pair level def
       | isExportedId x              = False
       | isTopLevel level            = False
       | defIsStable def             = False
-      | either isTrivialTerm isTrivialPKont rhs = True
+      | either isTrivialTerm isTrivialJoin rhs = True
       | otherwise
       = case occ_info of
           OneOcc in_lam _one_br int_cxt
@@ -1970,9 +1970,9 @@ mkDupableKont env ty kont
         (env', j) <- mkFreshVar env name kontTy
         let (env'', x) = enterScope env' (mkKontArgId ty)
             env_rhs   = env'' `setRetKont` mk
-            join_rhs  = PKont [x] (Eval (Var x) (Kont [] Return))
+            join_rhs  = Join [x] (Eval (Var x) (Kont [] Return))
             join_kont = Case x [Alt DEFAULT [] (Jump [Var x] j)]
-        (flts, env_final) <- simplPKontBind env'' j j (staticPart env_rhs) join_rhs NonRecursive
+        (flts, env_final) <- simplJoinBind env'' j j (staticPart env_rhs) join_rhs NonRecursive
         return (flts, env_final, join_kont)
     
 mkDupableTerm :: SimplEnv -> InTerm
@@ -2017,7 +2017,7 @@ mkDupableAlt env caseBndr alt@(Alt altCon bndrs rhs)
         
         (_, join_bndr) <- mkFreshVar env (fsLit "*j") (mkKontTy argTy)
         
-        let join_rhs  = PKont used_bndrs rhs
+        let join_rhs  = Join used_bndrs rhs
             join_args = map (Type . mkTyVarTy) tyBndrs ++ map Var valBndrs
             join_comm = Jump join_args join_bndr
         
@@ -2026,7 +2026,7 @@ mkDupableAlt env caseBndr alt@(Alt altCon bndrs rhs)
                   ppr join_rhs $$
                   ppr (Alt altCon bndrs join_comm))
         
-        (flts, env') <- addPolyBind env NotTopLevel (NonRec (BindPKont join_bndr join_rhs))
+        (flts, env') <- addPolyBind env NotTopLevel (NonRec (BindJoin join_bndr join_rhs))
         return (flts, env', Alt altCon bndrs join_comm)
             
 commandIsDupable :: DynFlags -> SeqCoreCommand -> Bool

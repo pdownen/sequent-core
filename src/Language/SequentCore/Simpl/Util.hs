@@ -6,7 +6,7 @@ module Language.SequentCore.Simpl.Util (
 
   -- * State of argument processing
   RevList, ArgInfo(..), Target(..),
-  mkArgInfo, mkJumpArgInfo, mkPKontArgInfo, addFrameToArgInfo,
+  mkArgInfo, mkJumpArgInfo, mkJoinArgInfo, addFrameToArgInfo,
   addFramesToArgInfo, swallowCoercion,
   argInfoToTerm, argInfoHasTerm, argInfoSpanArgs,
   
@@ -89,8 +89,8 @@ data ArgInfo
     }
 
 data Target = TermTarget OutTerm
-            | JumpTarget OutPKontId
-            | PKontTarget ScopedPKont
+            | JumpTarget OutJoinId
+            | JoinTarget ScopedJoin
 
 mkArgInfo :: SimplEnv -> OutTerm -> Maybe SubstedCoercion
           -> [ScopedFrame] -> ScopedEnd -> ArgInfo
@@ -162,7 +162,7 @@ argInfoHasTerm :: ArgInfo -> Bool
 argInfoHasTerm (ArgInfo { ai_target = TermTarget {} }) = True
 argInfoHasTerm _ = False
 
-mkJumpArgInfo :: SimplEnv -> OutPKontId -> [ScopedFrame] -> ArgInfo
+mkJumpArgInfo :: SimplEnv -> OutJoinId -> [ScopedFrame] -> ArgInfo
 mkJumpArgInfo _env j fs
   = ArgInfo { ai_target = JumpTarget j, ai_frames = [], ai_co = Nothing
             , ai_rules = []
@@ -206,16 +206,16 @@ mkJumpArgInfo _env j fs
         goTupleArgs (ty:tys) (str:strs)
           = (str || isStrictType ty) : goTupleArgs tys strs
 
-mkPKontArgInfo :: SimplEnv -> ScopedPKont -> [ScopedFrame] -> ArgInfo
-mkPKontArgInfo _env pk _fs
-  = ArgInfo { ai_target = PKontTarget pk, ai_frames = [], ai_co = Nothing
+mkJoinArgInfo :: SimplEnv -> ScopedJoin -> [ScopedFrame] -> ArgInfo
+mkJoinArgInfo _env pk _fs
+  = ArgInfo { ai_target = JoinTarget pk, ai_frames = [], ai_co = Nothing
             , ai_rules = []
             , ai_encl  = False
             , ai_strs  = stricts ++ repeat False
             , ai_discs = repeat 0
             , ai_dup   = NoDup }
   where
-    stricts = case unScope pk of PKont xs _ -> map isStrictId xs
+    stricts = case unScope pk of Join xs _ -> map isStrictId xs
 
 idArgStrictnesses :: Var -> Int -> [Bool]
 idArgStrictnesses fun n_val_args
@@ -234,7 +234,7 @@ idArgStrictnesses fun n_val_args
                else
                     map isStrictDmd demands ++ vanilla_stricts
            | otherwise
-           -> warnPprTrace (not (isPKontId fun && idArity fun == 0)) __FILE__ __LINE__
+           -> warnPprTrace (not (isJoinId fun && idArity fun == 0)) __FILE__ __LINE__
                              -- Don't warn about nullary join points, which we see as
                              -- arity 0 but translate to Core as arity 1
                            (text "More demands than arity" <+> pprBndr LetBind fun <+> ppr (idArity fun)
@@ -817,8 +817,8 @@ instance Outputable ArgInfo where
                                      , strictDoc ]
     where
       targetLabel = case target of TermTarget {}  -> text "Term:"
-                                   JumpTarget {}  -> text "Join point id:"
-                                   PKontTarget {} -> text "Inlining join point:"
+                                   JumpTarget {}  -> text "Join id:"
+                                   JoinTarget {}  -> text "Inlining join:"
       strictDoc = case strs of []        -> text "Expression is bottom"
                                True  : _ -> text "Next argument strict"
                                False : _ -> text "Next argument lazy"
@@ -826,4 +826,4 @@ instance Outputable ArgInfo where
 instance Outputable Target where
   ppr (TermTarget term) = ppr term
   ppr (JumpTarget j)    = ppr j
-  ppr (PKontTarget pk)  = ppr pk
+  ppr (JoinTarget join) = ppr join

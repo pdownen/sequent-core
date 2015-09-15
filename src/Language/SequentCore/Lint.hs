@@ -73,19 +73,16 @@ extendTermEnvList ent pairs
   = foldr (\(BindTerm x rhs) ent -> extendTermEnv ent x rhs) ent pairs
 
 extendLintEnv :: LintEnv -> BindPair Var -> LintEnv
-extendLintEnv env (BindTerm bndr _term)
-  = mapTermLintEnv (\ent -> extendTvInScope ent bndr) env
-extendLintEnv env (BindPKont bndr _pk)
-  = mapKontLintEnv (\enk -> extendTvInScope enk bndr) env
+extendLintEnv (ent, enk, retTy) (BindTerm bndr _term)
+  = (extendTvInScope ent bndr, enk, retTy)
+extendLintEnv (ent, enk, retTy) (BindJoin bndr _pk)
+  = (ent, extendTvInScope enk bndr, retTy)
 
 extendLintEnvList :: LintEnv -> [BindPair Var] -> LintEnv
 extendLintEnvList = foldr (flip extendLintEnv)
 
 mapTermLintEnv :: (TermEnv -> TermEnv) -> LintEnv -> LintEnv
 mapTermLintEnv f env = mkLintEnv (f (termEnv env)) (kontEnv env) (retTy env)
-
-mapKontLintEnv :: (KontEnv -> KontEnv) -> LintEnv -> LintEnv
-mapKontLintEnv f env = mkLintEnv (termEnv env) (f (kontEnv env)) (retTy env)
 
 eitherToMaybe :: Either a b -> Maybe a
 eitherToMaybe (Left a)  = Just a
@@ -170,7 +167,7 @@ lintCoreBindPair env (BindTerm bndr term)
   = do
     termTy <- lintCoreTerm (termEnv env) term
     checkRhsType bndr (idType bndr) termTy
-lintCoreBindPair env (BindPKont bndr (PKont xs comm))
+lintCoreBindPair env (BindJoin bndr (Join xs comm))
   = do
     lintKontBndrTypes (termEnv env) bndr xs
     let (ent, _) = mapAccumL lintBindInTermEnv (termEnv env) xs
@@ -266,7 +263,7 @@ lintCoreCut env term kont
     ty <- lintCoreTerm (termEnv env) term
     lintCoreKont (text "in continuation of" <+> ppr term) env ty kont
 
-lintCoreJump :: LintEnv -> [SeqCoreArg] -> PKontId -> LintM ()
+lintCoreJump :: LintEnv -> [SeqCoreArg] -> JoinId -> LintM ()
 lintCoreJump env args j
   | Just j' <- lookupInScope (getTvInScope (kontEnv env)) j
   = if | not (substTy (kontEnv env) (idType j) `eqType` idType j') ->
@@ -390,7 +387,7 @@ checkingType desc ex go
     unless (ex `eqType` act) $ mkError desc (ppr ex) (ppr act)
     return act
 
-kontIdTyOrError :: KontEnv -> PKontId -> LintM OutType
+kontIdTyOrError :: KontEnv -> JoinId -> LintM OutType
 kontIdTyOrError env k
   = case isKontTy_maybe (substTy env (idType k)) of
       Just arg -> return arg

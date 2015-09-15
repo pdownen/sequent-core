@@ -10,10 +10,10 @@
 
 module Language.SequentCore.Syntax (
   -- * AST Types
-  Term(..), Arg, Kont(..), Frame(..), End(..), PKont(..), Command(..),
+  Term(..), Arg, Kont(..), Frame(..), End(..), Join(..), Command(..),
   Bind(..), BindPair(..), Rhs,
-  Alt(..), AltCon(..), Expr(..), Program, PKontId,
-  SeqCoreTerm, SeqCoreArg, SeqCoreKont, SeqCoreFrame, SeqCoreEnd, SeqCorePKont,
+  Alt(..), AltCon(..), Expr(..), Program, JoinId,
+  SeqCoreTerm, SeqCoreArg, SeqCoreKont, SeqCoreFrame, SeqCoreEnd, SeqCoreJoin,
     SeqCoreCommand, SeqCoreBind, SeqCoreBindPair, SeqCoreRhs, SeqCoreBndr,
     SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
   -- * Constructors
@@ -27,12 +27,12 @@ module Language.SequentCore.Syntax (
   spanTypes, spanTypeArgs,
   flattenCommand,
   isValueArg, isTypeArg, isCoArg, isTyCoArg, isAppFrame, isValueAppFrame,
-  isTrivial, isTrivialTerm, isTrivialKont, isTrivialPKont, isTrivialRhs,
+  isTrivial, isTrivialTerm, isTrivialKont, isTrivialJoin, isTrivialRhs,
   isReturnKont, isReturn, isDefaultAlt,
   termIsConstruction, termAsConstruction, splitConstruction,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
   binderOfPair, setPairBinder, rhsOfPair, mkBindPair, destBindPair,
-  bindsTerm, bindsKont, flattenBind, flattenBinds, bindersOf, bindersOfBinds,
+  bindsTerm, bindsJoin, flattenBind, flattenBinds, bindersOf, bindersOfBinds,
   -- * Calculations
   termType, frameType, applyTypeToArg, applyTypeToArgs, applyTypeToFrames,
   termIsBottom, commandIsBottom,
@@ -40,12 +40,12 @@ module Language.SequentCore.Syntax (
   termIsWorkFree, commandIsWorkFree,
   termOkForSpeculation, commandOkForSpeculation, kontOkForSpeculation,
   termOkForSideEffects, commandOkForSideEffects, kontOkForSideEffects,
-  termIsCheap, kontIsCheap, commandIsCheap, pKontIsCheap, rhsIsCheap,
-  termIsExpandable, kontIsExpandable, commandIsExpandable, pKontIsExpandable, rhsIsExpandable,
+  termIsCheap, kontIsCheap, commandIsCheap, joinIsCheap, rhsIsCheap,
+  termIsExpandable, kontIsExpandable, commandIsExpandable, joinIsExpandable, rhsIsExpandable,
   CheapAppMeasure, isCheapApp, isExpandableApp,
   termIsCheapBy, kontIsCheapBy, commandIsCheapBy, rhsIsCheapBy,
   -- * Continuation ids
-  isPKontId, Language.SequentCore.WiredIn.mkKontTy, kontTyArg,
+  isJoinId, Language.SequentCore.WiredIn.mkKontTy, kontTyArg,
   -- * Alpha-equivalence
   cheapEqTerm, cheapEqKont, cheapEqFrame, cheapEqCommand,
   (=~=), AlphaEq(..), AlphaEnv, HasId(..)
@@ -130,12 +130,12 @@ data End b      = Return
 
 -- | A parameterized continuation, otherwise known as a join point. Where a
 -- regular continuation represents the context of a single expression, a
--- parameterized continuation is a point in the control flow that many different
--- computations might jump to.
-data PKont b    = PKont [b] (Command b)
+-- join point is a point in the control flow that many different computations
+-- might jump to.
+data Join b     = Join [b] (Command b)
 
--- | The identifier for a parameterized continuation, i.e. a join point.
-type PKontId = Id
+-- | The identifier for a join point.
+type JoinId = Id
 
 -- | A general computation. A command brings together a list of bindings and
 -- either:
@@ -145,15 +145,15 @@ type PKontId = Id
 --     identifier of the continuation.
 data Command b = Let (Bind b) (Command b)
                | Eval (Term b) (Kont b)
-               | Jump [Arg b] PKontId
+               | Jump [Arg b] JoinId
 
 -- | The binding of one identifier to one term or continuation.
 data BindPair b = BindTerm b (Term b)
-                | BindPKont b (PKont b)
+                | BindJoin b (Join b)
 
 -- | A view of the right-hand side of a 'BindPair', whether it binds a term or
 -- a parameterized continuation.
-type Rhs b = Either (Term b) (PKont b)
+type Rhs b = Either (Term b) (Join b)
 
 -- | A binding. Similar to the @Bind@ datatype from GHC. Can be either a single
 -- non-recursive binding or a mutually recursive block.
@@ -194,7 +194,7 @@ type SeqCoreBindPair = BindPair Var
 -- | Usual instance of 'Rhs', with 'Var's for binders
 type SeqCoreRhs     = Rhs     Var
 -- | Usual instance of 'Kont', with 'Var's for binders
-type SeqCorePKont   = PKont   Var
+type SeqCoreJoin    = Join    Var
 -- | Usual instance of 'Alt', with 'Var's for binders
 type SeqCoreAlt     = Alt     Var
 -- | Usual instance of 'Expr', with 'Var's for binders
@@ -382,7 +382,7 @@ spanTypes = mapWhileJust $ \case { Type ty -> Just ty; _ -> Nothing }
 spanTypeArgs :: [Frame b] -> ([KindOrType], [Frame b])
 spanTypeArgs = mapWhileJust $ \case { App (Type ty) -> Just ty; _ -> Nothing }
 
-flattenCommand :: Command b -> ([Bind b], Either (Term b, Kont b) ([Arg b], PKontId))
+flattenCommand :: Command b -> ([Bind b], Either (Term b, Kont b) ([Arg b], JoinId))
 flattenCommand = go []
   where
     go binds (Let bind comm) = go (bind:binds) comm
@@ -469,12 +469,12 @@ isTrivialFrame (App v)  = isTyCoArg v
 isTrivialFrame (Cast _) = True
 isTrivialFrame (Tick _) = False
 
-isTrivialPKont :: HasId b => PKont b -> Bool
-isTrivialPKont (PKont xs comm) = all (not . isRuntimeVar) (identifiers xs)
-                              && isTrivial comm
+isTrivialJoin :: HasId b => Join b -> Bool
+isTrivialJoin (Join xs comm) = all (not . isRuntimeVar) (identifiers xs)
+                            && isTrivial comm
 
 isTrivialRhs :: HasId b => Rhs b -> Bool
-isTrivialRhs = either isTrivialTerm isTrivialPKont
+isTrivialRhs = either isTrivialTerm isTrivialJoin
 
 -- | True if the given continuation is a return continuation, @Kont [] (Return _)@.
 isReturnKont :: Kont b -> Bool
@@ -564,25 +564,25 @@ flattenBinds :: [Bind b] -> [BindPair b]
 flattenBinds = concatMap flattenBind
 
 rhsOfPair :: BindPair b -> Rhs b
-rhsOfPair (BindTerm _ v)   = Left v
-rhsOfPair (BindPKont _ pk) = Right pk
+rhsOfPair (BindTerm _ v)  = Left v
+rhsOfPair (BindJoin _ pk) = Right pk
 
-bindsTerm, bindsKont :: BindPair b -> Bool
+bindsTerm, bindsJoin :: BindPair b -> Bool
 bindsTerm (BindTerm {}) = True
-bindsTerm (BindPKont {}) = False
+bindsTerm (BindJoin {}) = False
 
-bindsKont pair = not (bindsTerm pair)
+bindsJoin pair = not (bindsTerm pair)
 
 mkBindPair :: b -> Rhs b -> BindPair b
-mkBindPair x = either (BindTerm x) (BindPKont x)
+mkBindPair x = either (BindTerm x) (BindJoin x)
 
 binderOfPair :: BindPair b -> b
 binderOfPair (BindTerm x _) = x
-binderOfPair (BindPKont j _) = j
+binderOfPair (BindJoin j _) = j
 
 setPairBinder :: BindPair b -> b -> BindPair b
 setPairBinder (BindTerm _ term) x = BindTerm x term
-setPairBinder (BindPKont _ pk)  j = BindPKont j pk
+setPairBinder (BindJoin _ pk)   j = BindJoin j pk
 
 destBindPair :: BindPair b -> (b, Rhs b)
 destBindPair pair = (binderOfPair pair, rhsOfPair pair)
@@ -810,9 +810,9 @@ commandIsCheap, commandIsExpandable :: HasId b => Command b -> Bool
 commandIsCheap      = commCheap isCheapApp
 commandIsExpandable = commCheap isExpandableApp
 
-pKontIsCheap, pKontIsExpandable :: HasId b => PKont b -> Bool
-pKontIsCheap      = pKontCheap isCheapApp
-pKontIsExpandable = pKontCheap isExpandableApp
+joinIsCheap, joinIsExpandable :: HasId b => Join b -> Bool
+joinIsCheap      = joinCheap isCheapApp
+joinIsExpandable = joinCheap isExpandableApp
 
 rhsIsCheap, rhsIsExpandable :: HasId b => Rhs b -> Bool
 rhsIsCheap      = rhsCheap isCheapApp
@@ -849,12 +849,12 @@ commCheap appCheap (Eval term kont)
 commCheap appCheap (Jump args j)
   = appCheap j (length (filter isValueArg args))
   
-pKontCheap :: HasId b => CheapAppMeasure -> PKont b -> Bool
-pKontCheap appCheap (PKont _ comm) = commCheap appCheap comm
+joinCheap :: HasId b => CheapAppMeasure -> Join b -> Bool
+joinCheap appCheap (Join _ comm) = commCheap appCheap comm
 
 rhsCheap :: HasId b => CheapAppMeasure -> Rhs b -> Bool
 rhsCheap appCheap (Left term) = termCheap appCheap term
-rhsCheap appCheap (Right pk) = pKontCheap appCheap pk
+rhsCheap appCheap (Right pk)  = joinCheap appCheap pk
 
 bindPairCheap :: HasId b => CheapAppMeasure -> BindPair b -> Bool
 bindPairCheap appCheap = rhsCheap appCheap . rhsOfPair
@@ -915,8 +915,8 @@ rhsIsCheapBy     = rhsCheap
 --------------------------------------------------------------------------------
 
 -- | Find whether an id is a continuation id.
-isPKontId :: Id -> Bool
-isPKontId x = isKontTy (idType x)
+isJoinId :: Id -> Bool
+isJoinId x = isKontTy (idType x)
 
 kontTyArg :: Type -> Type
 kontTyArg ty = isKontTy_maybe ty `orElse` pprPanic "kontTyArg" (ppr ty)
@@ -1030,8 +1030,8 @@ instance HasId b => AlphaEq (End b) where
   aeqIn _ _ _
     = False
 
-instance HasId b => AlphaEq (PKont b) where
-  aeqIn env (PKont xs1 c1) (PKont xs2 c2)
+instance HasId b => AlphaEq (Join b) where
+  aeqIn env (Join xs1 c1) (Join xs2 c2)
     = aeqIn env' c1 c2
       where env' = rnBndrs2 env (identifiers xs1) (identifiers xs2)
 

@@ -11,9 +11,9 @@
 
 module Language.SequentCore.Translate (
   -- $txn
-  fromCoreModule, termFromCoreExpr, pKontFromCoreExprByKontType,
+  fromCoreModule, termFromCoreExpr, joinFromCoreExprByKontType,
   bindsToCore,
-  commandToCoreExpr, termToCoreExpr, pKontToCoreExpr, pKontIdToCore,
+  commandToCoreExpr, termToCoreExpr, joinToCoreExpr, joinIdToCore,
   CoreContext, kontToCoreExpr,
   onCoreExpr, onSequentCoreTerm
 ) where
@@ -79,11 +79,11 @@ termFromCoreExpr expr
 
 -- | Translates a single Core expression as a Sequent Core parameterized
 -- continuation, given the continuation type it should translate to. Used in
--- translating unfoldings on PKontIds, since we have the Sequent Core type
+-- translating unfoldings on JoinIds, since we have the Sequent Core type
 -- already in that case.
-pKontFromCoreExprByKontType :: Type -> Core.CoreExpr -> SeqCorePKont
-pKontFromCoreExprByKontType ty expr
-  = fromCoreExprAsPKont env (Kont [] Return) (argDescsForKontTy ty) markedExpr
+joinFromCoreExprByKontType :: Type -> Core.CoreExpr -> SeqCoreJoin
+joinFromCoreExprByKontType ty expr
+  = fromCoreExprAsJoin env (Kont [] Return) (argDescsForKontTy ty) markedExpr
   where
     markedExpr = runEscM (escAnalExpr expr)
     env = initFromCoreEnvForExpr expr
@@ -643,8 +643,8 @@ data KontType = KTExists TyVar KontType | KTTuple [KontType] | KTType Type
 
 -- | Convert an id to the id of a parameterized continuation, changing its type
 -- according to the given calling convention.
-idToPKontId :: Id -> KontCallConv -> PKontId
-idToPKontId p conv@(ByJump descs)
+idToJoinId :: Id -> KontCallConv -> JoinId
+idToJoinId p conv@(ByJump descs)
   = p `setIdType` kontTypeToType (go (idType p) descs)
       `setIdInfo` (idInfo p `setArityInfo` valArgCount)
       `tweakUnfolding` conv
@@ -668,7 +668,7 @@ idToPKontId p conv@(ByJump descs)
       = assert (argTy `eqType` argTy') $
         argTy `consKT` go retTy descs'
     go _ _
-      = pprPanic "idToPKontId" (pprBndr LetBind p $$ ppr descs)
+      = pprPanic "idToJoinId" (pprBndr LetBind p $$ ppr descs)
 
     kontTypeToType :: KontType -> Type
     kontTypeToType = mkKontTy . go
@@ -699,7 +699,7 @@ tweakUnfolding id (ByJump descs)
       Core.CoreUnfolding {} ->
         let expr = uf_tmpl unf
             env = initFromCoreEnvForExpr expr
-            (env', bndrs, body) = etaExpandForPKontBody env descs expr
+            (env', bndrs, body) = etaExpandForJoinBody env descs expr
             bndrs' | noValArgs = bndrs ++ [voidPrimId]
                    | otherwise = bndrs
             expr' = substExpr (text "tweakUnfolding") (fce_subst env') (Core.mkLams bndrs' body)
@@ -760,12 +760,12 @@ initFromCoreEnvForExpr expr = initFromCoreEnv { fce_subst = freeVarSet }
     freeVarSet = mkSubst (mkInScopeSet (Core.exprFreeVars expr))
                    emptyVarEnv emptyVarEnv emptyVarEnv
 
-bindAsPKont :: FromCoreEnv -> PKontId -> KontCallConv -> FromCoreEnv
-bindAsPKont env p conv
+bindAsJoin :: FromCoreEnv -> JoinId -> KontCallConv -> FromCoreEnv
+bindAsJoin env p conv
   = env { fce_boundKonts = extendVarEnv (fce_boundKonts env) p conv }
 
-bindAsPKonts :: FromCoreEnv -> [(PKontId, KontCallConv)] -> FromCoreEnv
-bindAsPKonts env ps = foldr (\(p, conv) env' -> bindAsPKont env' p conv) env ps
+bindAsJoins :: FromCoreEnv -> [(JoinId, KontCallConv)] -> FromCoreEnv
+bindAsJoins env ps = foldr (\(p, conv) env' -> bindAsJoin env' p conv) env ps
 
 kontCallConv :: FromCoreEnv -> Var -> Maybe KontCallConv
 kontCallConv env var = lookupVarEnv (fce_boundKonts env) var
@@ -796,10 +796,10 @@ fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
         -- part (see splitDupableKont); for now just share the whole thing.
         | otherwise -> 
         let join_arg  = mkKontArgId (idType x')
-            join_rhs  = PKont [join_arg] (Eval (Var join_arg) (Kont [] end'))
+            join_rhs  = Join [join_arg] (Eval (Var join_arg) (Kont [] end'))
             join_ty   = mkKontTy (mkTupleTy UnboxedTuple [idType x'])
-            join_bndr = mkInlinablePKontBinder join_ty
-            join_bind = NonRec (BindPKont join_bndr join_rhs)
+            join_bndr = mkInlinableJoinBinder join_ty
+            join_bind = NonRec (BindJoin join_bndr join_rhs)
         in go (join_bind : binds) env e [] (Case join_arg [Alt DEFAULT [] (Jump [Var join_arg] join_bndr)])
         where
           (subst_rhs, x') = substBndr subst x
@@ -823,7 +823,7 @@ fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
             x' = substIdOcc subst x
             args' = map (\e -> fromCoreExprAsTerm env e) args
             conv_maybe = kontCallConv env x'
-            p = let Just conv = conv_maybe in idToPKontId x' conv
+            p = let Just conv = conv_maybe in idToJoinId x' conv
             
             doneEval v k = mkCommand (reverse binds) v k
             doneJump vs j = foldr Let (Jump vs j) (reverse binds)
@@ -848,22 +848,22 @@ fromCoreExprAsTerm env expr
     subst = fce_subst env
     ty = substTy subst (Core.exprType (unmarkExpr expr))
 
-fromCoreExprAsPKont :: FromCoreEnv -> SeqCoreKont -> [ArgDesc]
-                    -> Core.Expr MarkedVar
-                    -> SeqCorePKont
-fromCoreExprAsPKont env kont descs expr
-  = --pprTrace "fromCoreExprAsPKont" (ppr descs $$ ppr bndrs $$ ppr bndrs_final)
-    PKont bndrs comm
+fromCoreExprAsJoin :: FromCoreEnv -> SeqCoreKont -> [ArgDesc]
+                   -> Core.Expr MarkedVar
+                   -> SeqCoreJoin
+fromCoreExprAsJoin env kont descs expr
+  = --pprTrace "fromCoreExprAsJoin" (ppr descs $$ ppr bndrs $$ ppr bndrs_final)
+    Join bndrs comm
   where
     -- Eta-expand the body *before* translating to Sequent Core so that the
     -- parameterized continuation has all the arguments it should get
-    (env', bndrs, etaBody) = etaExpandForPKontBody env descs expr
+    (env', bndrs, etaBody) = etaExpandForJoinBody env descs expr
     comm = fromCoreExpr env' etaBody kont
 
-etaExpandForPKontBody :: HasId b
-                      => FromCoreEnv -> [ArgDesc] -> Core.Expr b
-                      -> (FromCoreEnv, [Var], Core.Expr b)
-etaExpandForPKontBody env descs expr
+etaExpandForJoinBody :: HasId b
+                     => FromCoreEnv -> [ArgDesc] -> Core.Expr b
+                     -> (FromCoreEnv, [Var], Core.Expr b)
+etaExpandForJoinBody env descs expr
   = (env', bndrs_final, etaBody)
   where
     subst = fce_subst env
@@ -950,7 +950,7 @@ fromCoreBind (env@FCE { fce_subst = subst }) kont_maybe bind =
       where
         (subst', x') = substBndr subst x
         env' = env { fce_subst = subst' }
-        env_final | MakeKont _ <- mark = bindAsPKont env' x' conv
+        env_final | MakeKont _ <- mark = bindAsJoin env' x' conv
                   | otherwise          = env'
         (~(Just conv), pair') = fromCoreBindPair env kont_maybe x' mark rhs
 
@@ -962,8 +962,8 @@ fromCoreBind (env@FCE { fce_subst = subst }) kont_maybe bind =
         pairs' = [ fromCoreBindPair env_final kont_maybe x' mark rhs
                  | (Marked _ mark, rhs) <- pairs
                  | x' <- xs' ]
-        env_final = bindAsPKonts env' [ (binderOfPair pair, conv)
-                                      | (Just conv, pair) <- pairs' ]
+        env_final = bindAsJoins env' [ (binderOfPair pair, conv)
+                                     | (Just conv, pair) <- pairs' ]
         pairs_final = map snd pairs'
 
 fromCoreBindPair :: FromCoreEnv -> Maybe SeqCoreKont -> Var -> KontOrFunc
@@ -971,9 +971,9 @@ fromCoreBindPair :: FromCoreEnv -> Maybe SeqCoreKont -> Var -> KontOrFunc
 fromCoreBindPair env kont_maybe x mark rhs
   = case mark of
       MakeKont descs -> let Just kont = kont_maybe
-                            pkont = fromCoreExprAsPKont env kont descs rhs
+                            join = fromCoreExprAsJoin env kont descs rhs
                         in (Just (ByJump descs),
-                            BindPKont (idToPKontId x (ByJump descs)) pkont)
+                            BindJoin (idToJoinId x (ByJump descs)) join)
       MakeFunc       -> (Nothing, BindTerm x $ fromCoreExprAsTerm env rhs)
 
 fromCoreBinds :: [Core.Bind MarkedVar] -> [SeqCoreBind]
@@ -990,7 +990,7 @@ commandToCoreExpr retTy comm
       Let bind comm' -> Core.mkCoreLet (bindToCore (Just retTy) bind)
                                        (commandToCoreExpr retTy comm')
       Eval term kont -> kontToCoreExpr retTy kont (termToCoreExpr term)
-      Jump args j    -> Core.mkCoreApps (Core.Var (pKontIdToCore retTy j))
+      Jump args j    -> Core.mkCoreApps (Core.Var (joinIdToCore retTy j))
                                         (map termToCoreExpr args ++ extraArgs)
         where
           extraArgs | all isTypeArg args = [ Core.Var voidPrimId ]
@@ -1007,11 +1007,11 @@ termToCoreExpr val =
     Coercion co  -> Core.Coercion co
     Compute kb c -> commandToCoreExpr kb c
 
-pKontToCoreExpr :: Type -> SeqCorePKont -> Core.CoreExpr
-pKontToCoreExpr = pKontToCoreExpr' NonRecursive
+joinToCoreExpr :: Type -> SeqCoreJoin -> Core.CoreExpr
+joinToCoreExpr = joinToCoreExpr' NonRecursive
 
-pKontToCoreExpr' :: RecFlag -> Type -> SeqCorePKont -> Core.CoreExpr
-pKontToCoreExpr' recFlag retTy (PKont xs comm)
+joinToCoreExpr' :: RecFlag -> Type -> SeqCoreJoin -> Core.CoreExpr
+joinToCoreExpr' recFlag retTy (Join xs comm)
   = Core.mkCoreLams (maybeOneShots xs') (commandToCoreExpr retTy comm)
   where
     xs'   | null xs   = [ voidArgId ]
@@ -1043,10 +1043,10 @@ endToCoreExpr retTy k =
     Case {- expr -} b as -> \e -> Core.Case e b retTy (map (altToCore retTy) as)
     Return               -> \e -> e
 
-pKontIdToCore :: Type -> PKontId -> Id
-pKontIdToCore retTy j = maybeAddArity $ j `setIdType` kontTyToCoreTy argTy retTy
+joinIdToCore :: Type -> JoinId -> Id
+joinIdToCore retTy j = maybeAddArity $ j `setIdType` kontTyToCoreTy argTy retTy
   where
-    argTy = isKontTy_maybe (idType j) `orElse` pprPanic "pKontIdToCore" (pprBndr LetBind j)
+    argTy = isKontTy_maybe (idType j) `orElse` pprPanic "joinIdToCore" (pprBndr LetBind j)
     maybeAddArity j' | idArity j' == 0 = j' `setIdInfo` (idInfo j' `setArityInfo` 1)
                      | otherwise       = j'
 
@@ -1077,7 +1077,7 @@ bindPairToCore :: Maybe Type -> RecFlag -> SeqCoreBindPair
 bindPairToCore retTy_maybe recFlag pair =
   case pair of
     BindTerm b v -> (b, termToCoreExpr v)
-    BindPKont b pk -> (pKontIdToCore retTy b, pKontToCoreExpr' recFlag retTy pk)
+    BindJoin b pk -> (joinIdToCore retTy b, joinToCoreExpr' recFlag retTy pk)
       where
         retTy = retTy_maybe `orElse` panic "bindPairToCore: top-level cont"
 

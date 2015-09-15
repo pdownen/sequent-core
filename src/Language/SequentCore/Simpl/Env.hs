@@ -9,7 +9,7 @@ module Language.SequentCore.Simpl.Env (
   -- * Substitution and lexical scope
   SubstAns(..), KontSubst, Substable(..),
   substId, substPv, substKv, substTy, substTyVar, substCo, substCoVar, lookupRecBndr,
-  substTerm, substKont, substFrame, substEnd, substPKont, substCommand,
+  substTerm, substKont, substFrame, substEnd, substJoin, substCommand,
   extendIdSubst, extendPvSubst, extendIdOrPvSubst, extendTvSubst, extendCvSubst,
   setRetKont, pushKont,
   enterScope, enterKontScope, enterRecScopes, enterLamScope, enterLamScopes, mkFreshVar,
@@ -27,7 +27,7 @@ module Language.SequentCore.Simpl.Env (
   
   -- * Objects with lexical scope information attached
   Scoped(..), DupFlag(..),
-  ScopedFrame, ScopedEnd, ScopedPKont, ScopedCommand,
+  ScopedFrame, ScopedEnd, ScopedJoin, ScopedCommand,
   openScoped, unScope, substScoped,
   okToDup,
   pprMultiScopedKont,
@@ -51,12 +51,12 @@ module Language.SequentCore.Simpl.Env (
   augmentFromFloats,
   
   -- * Type synonyms distinguishing incoming (unsubstituted) syntax from outgoing
-  In, InCommand, InTerm, InArg, InKont, InFrame, InEnd, InPKont,
+  In, InCommand, InTerm, InArg, InKont, InFrame, InEnd, InJoin,
   InAlt, InBind, InBndr, InBindPair, InRhs,
-  InType, InCoercion, InId, InPKontId, InVar, InTyVar, InCoVar,
-  Out, OutCommand, OutTerm, OutArg, OutKont, OutFrame, OutEnd, OutPKont,
+  InType, InCoercion, InId, InJoinId, InVar, InTyVar, InCoVar,
+  Out, OutCommand, OutTerm, OutArg, OutKont, OutFrame, OutEnd, OutJoin,
   OutAlt, OutBind, OutBndr, OutBindPair, OutRhs,
-  OutType, OutCoercion, OutId, OutPKontId, OutVar, OutTyVar, OutCoVar,
+  OutType, OutCoercion, OutId, OutJoinId, OutVar, OutTyVar, OutCoVar,
   SubstedCoercion,
   
   -- * Term information
@@ -128,7 +128,7 @@ data SimplEnv
                 --  ^^^ term static part ^^^  --
                 -- No bindings for join-points
 
-                , se_pvSubst :: SimplPvSubst   -- InPKontId |--> PKontSubstAns (in/out)
+                , se_pvSubst :: SimplPvSubst   -- InJoinId  |--> PKontSubstAns (in/out)
                 , se_retTy   :: Maybe OutType
                 , se_retKont :: KontSubst      -- ()        |--> MetaKont (in/out)
                 --  ^^^ static part ^^^  --
@@ -161,9 +161,9 @@ data SubstAns env a
   | Susp env (In a)
 
 type SimplIdSubst  = SimplSubst StaticTermEnv SeqCoreTerm
-type SimplPvSubst  = SimplSubst StaticEnv     SeqCorePKont
+type SimplPvSubst  = SimplSubst StaticEnv     SeqCoreJoin
 type TermSubstAns  = SubstAns   StaticTermEnv SeqCoreTerm
-type PKontSubstAns = SubstAns   StaticEnv     SeqCorePKont
+type JoinSubstAns  = SubstAns   StaticEnv     SeqCoreJoin
 type KontSubst     = Maybe MetaKont
 
 {-
@@ -299,7 +299,7 @@ data DupFlag = NoDup | OkToDup
 
 type ScopedFrame = Scoped StaticTermEnv SeqCoreFrame
 type ScopedEnd   = Scoped StaticEnv SeqCoreEnd
-type ScopedPKont = Scoped StaticEnv SeqCorePKont
+type ScopedJoin  = Scoped StaticEnv SeqCoreJoin
 type ScopedCommand = Scoped StaticEnv SeqCoreCommand
 
 openScoped :: SimplEnvFragment env => SimplEnv -> Scoped env a -> (SimplEnv, In a)
@@ -390,12 +390,12 @@ mkBoundToWithGuidance env (Left term) src level arity guid
             , def_isConLike    = termIsConLike env term
             }
 mkBoundToWithGuidance _env (Right pk) src level arity guid
-  = BoundTo { def_rhs          = Right (occurAnalysePKont pk)
+  = BoundTo { def_rhs          = Right (occurAnalyseJoin pk)
             , def_src          = src
             , def_level        = level
             , def_guidance     = guid
             , def_arity        = arity
-            , def_isExpandable = True -- For inlining decisions, pkonts are all lambdas
+            , def_isExpandable = True -- For inlining decisions, joins are all lambdas
             , def_isValue      = True
             , def_isWorkFree   = True 
             , def_isConLike    = True
@@ -434,7 +434,7 @@ inlineBoringOk term
     goF credit []                             = Just credit
     goF _      _                              = Nothing
 
-    goPK (PKont xs (Eval term (Kont fs Return)))
+    goPK (Join xs (Eval term (Kont fs Return)))
                                               = goF (length xs) fs >>= \credit' ->
                                                 goT credit' term
     goPK _                                    = Nothing
@@ -449,8 +449,8 @@ mkGuidance dflags rhs
                    | otherwise                       -> Sometimes base args res
     in (nValBinds, guid)
   where
-    bndrs = case rhs of Left term          -> fst (lambdas term)
-                        Right (PKont xs _) -> xs
+    bndrs = case rhs of Left term         -> fst (lambdas term)
+                        Right (Join xs _) -> xs
     nValBinds = length (filter isId bndrs)
     
 uncondInline :: OutRhs -> Arity -> Int -> Bool
@@ -472,7 +472,7 @@ type InArg      = SeqCoreArg
 type InKont     = SeqCoreKont
 type InFrame    = SeqCoreFrame
 type InEnd      = SeqCoreEnd
-type InPKont    = SeqCorePKont
+type InJoin     = SeqCoreJoin
 type InAlt      = SeqCoreAlt
 type InBind     = SeqCoreBind
 type InBndr     = SeqCoreBndr
@@ -481,7 +481,7 @@ type InRhs      = SeqCoreRhs
 type InType     = Type
 type InCoercion = Coercion
 type InId       = Id
-type InPKontId  = PKontId
+type InJoinId   = JoinId
 type InVar      = Var
 type InTyVar    = TyVar
 type InCoVar    = CoVar
@@ -493,7 +493,7 @@ type OutArg     = SeqCoreArg
 type OutKont    = SeqCoreKont
 type OutFrame   = SeqCoreFrame
 type OutEnd     = SeqCoreEnd
-type OutPKont   = SeqCorePKont
+type OutJoin    = SeqCoreJoin
 type OutAlt     = SeqCoreAlt
 type OutBind    = SeqCoreBind
 type OutBndr    = SeqCoreBndr
@@ -502,7 +502,7 @@ type OutRhs     = SeqCoreRhs
 type OutType    = Type
 type OutCoercion = Coercion
 type OutId      = Id
-type OutPKontId = PKontId
+type OutJoinId  = JoinId
 type OutVar     = Var
 type OutTyVar   = TyVar
 type OutCoVar   = CoVar
@@ -622,7 +622,7 @@ enterNonCoVarIdScope env@(SimplEnv { se_inScope = in_scope, se_defs = defs
     new_id = zapFragileIdInfo id2       -- Zaps rules, worker-info, unfolding
                                         -- and fragile OccInfo
 
-    is_pv  = isPKontId old_id
+    is_pv  = isJoinId old_id
     
         -- Extend the substitution if the unique has changed,
         -- or there's some useful occurrence information
@@ -698,7 +698,7 @@ substIdForId env id
       DoneId x' -> x'
       other     -> pprPanic "substIdForId" (ppr id <+> darrow <+> ppr other)
 
-substPv :: SimplEnv -> InId -> PKontSubstAns
+substPv :: SimplEnv -> InId -> JoinSubstAns
 substPv (SimplEnv { se_pvSubst = pvs, se_inScope = ins }) j
   = case lookupVarEnv pvs j of
       Nothing                 -> DoneId (refine ins j)
@@ -721,7 +721,7 @@ lookupRecBndr :: SimplEnv -> InId -> OutId
 -- Look up an Id which has been put into the envt by enterRecScopes,
 -- but where we have not yet done its RHS
 lookupRecBndr (SimplEnv { se_inScope = in_scope, se_idSubst = ids, se_pvSubst = pvs }) v
-  | isPKontId v
+  | isJoinId v
   = case lookupVarEnv pvs v of
       Just (DoneId v) -> v
       Just _ -> pprPanic "lookupRecBndr" (ppr v)
@@ -779,22 +779,22 @@ mkCoreSubst doc env@(SimplEnv { se_inScope = in_scope, se_tvSubst = tv_env, se_c
                               , se_idSubst = id_env, se_pvSubst = pv_env })
   = mk_subst tv_env cv_env id_env pv_env
   where
-    mk_subst tv_env cv_env id_env pv_env = CoreSubst.mkSubst (mapInScopeSet fiddlePKontVar in_scope)
+    mk_subst tv_env cv_env id_env pv_env = CoreSubst.mkSubst (mapInScopeSet fiddleJoinVar in_scope)
                                              tv_env cv_env
                                              (mapVarEnv fiddle id_env `plusVarEnv`
-                                              mapVarEnv fiddlePKont pv_env)
+                                              mapVarEnv fiddleJoin pv_env)
 
     fiddle (Done e)          = termToCoreExpr e
     fiddle (DoneId v)        = Core.Var v
     fiddle (Susp (StaticTermEnv env') e) = termToCoreExpr (substTerm (text "mkCoreSubst" <+> doc) env' e)
                                                 -- Don't shortcut here
                                                 
-    fiddlePKontVar x | isPKontId x = pKontIdToCore retTy x
-                     | otherwise   = x
+    fiddleJoinVar x | isJoinId x = joinIdToCore retTy x
+                    | otherwise  = x
     
-    fiddlePKont (Done pk)    = pKontToCoreExpr (retType env) pk
-    fiddlePKont (DoneId j)   = Core.Var (pKontIdToCore retTy j)
-    fiddlePKont (Susp (StaticEnv env') e) = pKontToCoreExpr retTy (substPKont (text "mkCoreSubst" <+> doc) env' e)
+    fiddleJoin (Done pk)    = joinToCoreExpr (retType env) pk
+    fiddleJoin (DoneId j)   = Core.Var (joinIdToCore retTy j)
+    fiddleJoin (Susp (StaticEnv env') e) = joinToCoreExpr retTy (substJoin (text "mkCoreSubst" <+> doc) env' e)
     
     mapInScopeSet :: (Var -> Var) -> InScopeSet -> InScopeSet
     mapInScopeSet f = mkInScopeSet . mapVarEnv f . getInScopeVars
@@ -805,14 +805,14 @@ substTerm    :: SDoc -> SimplEnv -> SeqCoreTerm    -> SeqCoreTerm
 substKont    :: SDoc -> SimplEnv -> SeqCoreKont    -> SeqCoreKont
 substFrame   :: SDoc -> SimplEnv -> SeqCoreFrame   -> SeqCoreFrame
 substEnd     :: SDoc -> SimplEnv -> SeqCoreEnd     -> SeqCoreEnd
-substPKont   :: SDoc -> SimplEnv -> SeqCorePKont   -> SeqCorePKont
+substJoin    :: SDoc -> SimplEnv -> SeqCoreJoin    -> SeqCoreJoin
 substCommand :: SDoc -> SimplEnv -> SeqCoreCommand -> SeqCoreCommand
 
 substTerm _doc env term    = doSubstT env term
 substKont _doc env kont    = doSubstK env kont
 substFrame _doc env frame  = doSubstF env frame
 substEnd _doc env end      = doSubstE env end
-substPKont _doc env pk     = doSubstP env pk
+substJoin _doc env pk      = doSubstJ env pk
 substCommand _doc env comm = doSubstC env comm
 
 doSubstT :: SimplEnv -> SeqCoreTerm -> SeqCoreTerm
@@ -861,8 +861,8 @@ doSubstE env (Case x alts)
             rhs' = doSubstC env'' rhs
         in Alt ac bndrs' rhs'
 
-doSubstP :: SimplEnv -> SeqCorePKont -> SeqCorePKont
-doSubstP env (PKont bndrs comm) = PKont bndrs' (doSubstC env' comm)
+doSubstJ :: SimplEnv -> SeqCoreJoin -> SeqCoreJoin
+doSubstJ env (Join bndrs comm) = Join bndrs' (doSubstC env' comm)
   where (env', bndrs') = enterLamScopes env bndrs
 
 doSubstC :: SimplEnv -> SeqCoreCommand -> SeqCoreCommand
@@ -872,10 +872,10 @@ doSubstC env (Let bind body)
 doSubstC env (Jump args j)
   = case substPv env j of
       DoneId j' -> Jump args' j'
-      Done (PKont bndrs body) -> doSubstC env' body
+      Done (Join bndrs body) -> doSubstC env' body
         where
           env' = foldl extend (zapSubstEnvs env) (bndrs `zip` args')
-      Susp stat (PKont bndrs body) -> doSubstC env' body
+      Susp stat (Join bndrs body) -> doSubstC env' body
         where
           env' = foldl extend (stat `inDynamicScope` env) (bndrs `zip` args')
   where
@@ -897,8 +897,8 @@ doSubstB env bind
           (env', bndrs') = enterRecScopes env bndrs
           rhss' = map (doRhs env') rhss
   where
-    doRhs env' (Left term) = Left  (doSubstT env' term)
-    doRhs env' (Right pk)  = Right (doSubstP env' pk)
+    doRhs env' (Left term)  = Left  (doSubstT env' term)
+    doRhs env' (Right join) = Right (doSubstJ env' join)
     
 class Substable a where
   subst :: SimplEnv -> a -> a
@@ -907,20 +907,20 @@ instance Substable SeqCoreTerm where subst = doSubstT
 instance Substable SeqCoreKont where subst = doSubstK
 instance Substable SeqCoreFrame where subst = doSubstF
 instance Substable SeqCoreEnd where subst = doSubstE
-instance Substable SeqCorePKont where subst = doSubstP
+instance Substable SeqCoreJoin where subst = doSubstJ
 instance Substable SeqCoreCommand where subst = doSubstC
 
 extendIdSubst :: SimplEnv -> InVar -> TermSubstAns -> SimplEnv
 extendIdSubst env x rhs
   = env { se_idSubst = extendVarEnv (se_idSubst env) x rhs }
 
-extendPvSubst :: SimplEnv -> InVar -> PKontSubstAns -> SimplEnv
+extendPvSubst :: SimplEnv -> InVar -> JoinSubstAns -> SimplEnv
 extendPvSubst env x rhs
   = env { se_pvSubst = extendVarEnv (se_pvSubst env) x rhs }
 
 extendIdOrPvSubst :: SimplEnv -> InVar -> SubstAns StaticEnv SeqCoreRhs -> SimplEnv
 extendIdOrPvSubst env x rhs
-  | isPKontId x
+  | isJoinId x
   = extendPvSubst env x $ case rhs of
                             Done (Right pk) -> Done pk
                             DoneId j        -> DoneId j
@@ -976,10 +976,10 @@ zapKontSubstEnvsStatic (StaticEnv env)
 
 setSubstEnvs :: SimplEnv -> [OutBindPair] -> SimplEnv
 setSubstEnvs env pairs
-  = env { se_idSubst = mkVarEnv [ (id, Done term)  | BindTerm  id term      <- pairs, isId id ]
-        , se_pvSubst = mkVarEnv [ (id, Done pkont) | BindPKont id pkont     <- pairs ]
-        , se_tvSubst = mkVarEnv [ (tv, ty)         | BindTerm  tv (Type ty) <- pairs ]
-        , se_cvSubst = mkVarEnv [ (cv, co)         | BindTerm  cv (Coercion co) <- pairs ]
+  = env { se_idSubst = mkVarEnv [ (id, Done term)  | BindTerm id term          <- pairs, isId id ]
+        , se_pvSubst = mkVarEnv [ (id, Done join)  | BindJoin id join          <- pairs ]
+        , se_tvSubst = mkVarEnv [ (tv, ty)         | BindTerm tv (Type ty)     <- pairs ]
+        , se_cvSubst = mkVarEnv [ (cv, co)         | BindTerm cv (Coercion co) <- pairs ]
         , se_retKont = Nothing }
 
 retType :: SimplEnv -> Type
@@ -1194,9 +1194,9 @@ wrapKontFloats flts cmd
   = foldr wrapBind cmd (mapMaybe onlyKonts binds)
   where
     binds = fromOL (floatBinds flts)
-    onlyKonts bind@(NonRec pair) | bindsKont pair = Just bind
+    onlyKonts bind@(NonRec pair) | bindsJoin pair = Just bind
                                  | otherwise      = Nothing
-    onlyKonts (Rec pairs)        | let pairs' = filter bindsKont pairs
+    onlyKonts (Rec pairs)        | let pairs' = filter bindsJoin pairs
                                  , not (null pairs')
                                  = Just (Rec pairs')
                                  | otherwise
@@ -1326,7 +1326,7 @@ getUnfoldingInRuleMatch env
      | otherwise           = isActive (sm_phase mode) (idInlineActivation id)
 
 unfoldingToDef :: Var -> Unfolding -> Definition
-unfoldingToDef var _ | isPKontId var = NoDefinition -- Can't translate a pkont in isolation
+unfoldingToDef var _ | isJoinId var = NoDefinition -- Can't translate a join in isolation
 unfoldingToDef _ NoUnfolding     = NoDefinition
 unfoldingToDef _ (OtherCon cons) = NotAmong cons
 unfoldingToDef _ unf@(CoreUnfolding {})
@@ -1527,7 +1527,7 @@ termIsConApp_maybe env id_unf term
       = let env   = env0 { se_inScope = ins } `setSubstEnvs` zipWith BindTerm bndrs args
             args' = map (substTerm (text "termIsConApp_maybe::go") env) dcArgs
         in dealWithCoercion (mkTransCoMaybe co_m co_m') dc args'
-      | assert (not (isPKontId fun)) True
+      | assert (not (isJoinId fun)) True
       , Just (Left term) <- expandDef_maybe def
       , def_arity def == 0
       = let ins' = extendInScopeSetSet ins (termFreeVars term)
