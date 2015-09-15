@@ -40,10 +40,10 @@ module Language.SequentCore.Syntax (
   termIsWorkFree, commandIsWorkFree,
   termOkForSpeculation, commandOkForSpeculation, kontOkForSpeculation,
   termOkForSideEffects, commandOkForSideEffects, kontOkForSideEffects,
-  termIsCheap, kontIsCheap, commandIsCheap, joinIsCheap, rhsIsCheap,
-  termIsExpandable, kontIsExpandable, commandIsExpandable, joinIsExpandable, rhsIsExpandable,
+  termIsCheap, kontIsCheap, commandIsCheap,
+  termIsExpandable, kontIsExpandable, commandIsExpandable,
   CheapAppMeasure, isCheapApp, isExpandableApp,
-  termIsCheapBy, kontIsCheapBy, commandIsCheapBy, rhsIsCheapBy,
+  termIsCheapBy, kontIsCheapBy, commandIsCheapBy,
   -- * Continuation ids
   isJoinId, Language.SequentCore.WiredIn.mkKontTy, kontTyArg,
   -- * Alpha-equivalence
@@ -810,14 +810,6 @@ commandIsCheap, commandIsExpandable :: HasId b => Command b -> Bool
 commandIsCheap      = commCheap isCheapApp
 commandIsExpandable = commCheap isExpandableApp
 
-joinIsCheap, joinIsExpandable :: HasId b => Join b -> Bool
-joinIsCheap      = joinCheap isCheapApp
-joinIsExpandable = joinCheap isExpandableApp
-
-rhsIsCheap, rhsIsExpandable :: HasId b => Rhs b -> Bool
-rhsIsCheap      = rhsCheap isCheapApp
-rhsIsExpandable = rhsCheap isExpandableApp
-
 type CheapAppMeasure = Id -> Int -> Bool
 
 termCheap :: HasId b => CheapAppMeasure -> Term b -> Bool
@@ -903,12 +895,10 @@ isExpandableApp fid valArgCount = isConLikeId fid
 termIsCheapBy    :: HasId b => CheapAppMeasure -> Term b    -> Bool
 kontIsCheapBy    :: HasId b => CheapAppMeasure -> Kont b    -> Bool
 commandIsCheapBy :: HasId b => CheapAppMeasure -> Command b -> Bool
-rhsIsCheapBy     :: HasId b => CheapAppMeasure -> Rhs b     -> Bool
 
 termIsCheapBy    = termCheap
 kontIsCheapBy    = kontCheap
 commandIsCheapBy = commCheap
-rhsIsCheapBy     = rhsCheap
 
 --------------------------------------------------------------------------------
 -- Continuation ids

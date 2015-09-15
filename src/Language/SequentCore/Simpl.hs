@@ -660,8 +660,8 @@ simplDef env top_lvl id new_rhs def
         | isStableSource src
         -> do { rhs' <- simplRhsNoFloats rule_env rhs
               ; case guide of
-                  Usually {}   -- Happens for INLINE things
-                     -> let guide' = guide { guEvenIfBoring = inlineBoringOk rhs' }
+                  UnfWhen {}   -- Happens for INLINE things
+                     -> let guide' = guide { ug_boring_ok = inlineBoringOk rhs' }
                         -- Refresh the boring-ok flag, in case expr'
                         -- has got small. This happens, notably in the inlinings
                         -- for dfuns for single-method classes; see
@@ -1722,7 +1722,7 @@ distillKont env fs end = (mapMaybe (doFrame . substScoped env) fs, doEnd (substS
     doEnd (Case {})    = CaseCtxt
 
 tryUnfolding :: DynFlags -> Id -> Bool -> [ArgSummary] -> CallCtxt
-             -> OutRhs -> Bool -> Bool -> Bool -> Arity -> Guidance
+             -> OutRhs -> Bool -> Bool -> Bool -> Arity -> UnfoldingGuidance
              -> Maybe OutRhs
 tryUnfolding dflags id lone_variable 
              arg_infos cont_info unf_template is_top 
@@ -1783,15 +1783,15 @@ tryUnfolding dflags id lone_variable
 
     (yes_or_no, extra_doc)
       = case guidance of
-          Never -> (False, empty)
+          UnfNever -> (False, empty)
 
-          Usually { guEvenIfUnsat = unsat_ok, guEvenIfBoring = boring_ok }
+          UnfWhen { ug_unsat_ok = unsat_ok, ug_boring_ok = boring_ok }
              -> (enough_args && (boring_ok || some_benefit), empty )
              where      -- See Note [INLINE for small functions (3)]
                enough_args = saturated || (unsat_ok && n_val_args > 0)
 
-          Sometimes { guArgDiscounts = arg_discounts, guResultDiscount = res_discount,
-                      guSize = size }
+          UnfIfGoodArgs { ug_args = arg_discounts, ug_res = res_discount,
+                          ug_size = size }
              -> ( is_wf && some_benefit && small_enough
                 , (text "discounted size =" <+> int discounted_size) )
                  where

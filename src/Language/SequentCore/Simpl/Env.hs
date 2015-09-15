@@ -37,7 +37,7 @@ module Language.SequentCore.Simpl.Env (
   canDupMetaKont,
   
   -- * Sequent Core definitions (unfoldings) of identifiers
-  IdDefEnv, Definition(..), Guidance(..),
+  IdDefEnv, Definition(..), UnfoldingGuidance(..),
   mkBoundTo, mkBoundToWithGuidance, mkBoundToDFun, inlineBoringOk, mkDef,
   findDef, findRealDef, setDef, activeUnfolding,
   defIsCheap, defIsConLike, defIsEvald, defIsSmallEnoughToInline, defIsStable,
@@ -337,7 +337,7 @@ data Definition
   | BoundTo { def_rhs :: OutRhs
             , def_src :: UnfoldingSource
             , def_level :: TopLevelFlag
-            , def_guidance :: Guidance
+            , def_guidance :: UnfoldingGuidance
             , def_arity :: Arity
             , def_isValue :: Bool
             , def_isConLike :: Bool
@@ -349,17 +349,8 @@ data Definition
                 , dfun_args :: [OutTerm] }
   | NotAmong [AltCon]
 
-data Guidance
-  = Never
-  | Usually   { guEvenIfUnsat :: Bool
-              , guEvenIfBoring :: Bool } -- currently only used when translated
-                                         -- from a Core unfolding
-  | Sometimes { guSize :: Int
-              , guArgDiscounts :: [Int]
-              , guResultDiscount :: Int }
-              
-always :: Guidance
-always = Usually { guEvenIfUnsat = True, guEvenIfBoring = True }
+always :: UnfoldingGuidance
+always = UnfWhen { ug_unsat_ok = True, ug_boring_ok = True }
 
 mkDef :: SimplEnv -> TopLevelFlag -> OutRhs -> Definition
 mkDef env level rhs
@@ -377,7 +368,7 @@ mkBoundTo env dflags rhs src level bottoming
   where (arity, guid) = mkGuidance dflags rhs
 
 mkBoundToWithGuidance :: SimplEnv -> OutRhs -> UnfoldingSource -> TopLevelFlag
-                      -> Arity -> Guidance -> Definition
+                      -> Arity -> UnfoldingGuidance -> Definition
 mkBoundToWithGuidance env (Left term) src level arity guid
   = BoundTo { def_rhs          = Left (occurAnalyseTerm term)
             , def_src          = src
@@ -439,14 +430,16 @@ inlineBoringOk term
                                                 goT credit' term
     goPK _                                    = Nothing
 
-mkGuidance :: DynFlags -> OutRhs -> (Arity, Guidance)
+mkGuidance :: DynFlags -> OutRhs -> (Arity, UnfoldingGuidance)
 mkGuidance dflags rhs
   = let cap = ufCreationThreshold dflags
         guid = case rhsSize dflags cap rhs of
-                 Nothing -> Never
+                 Nothing -> UnfNever
                  Just (ExprSize base args res)
                    | uncondInline rhs nValBinds base -> always
-                   | otherwise                       -> Sometimes base args res
+                   | otherwise                       -> UnfIfGoodArgs { ug_size = base
+                                                                      , ug_args = args
+                                                                      , ug_res  = res  }
     in (nValBinds, guid)
   where
     bndrs = case rhs of Left term         -> fst (lambdas term)
@@ -1333,7 +1326,7 @@ unfoldingToDef _ unf@(CoreUnfolding {})
   = BoundTo { def_rhs          = Left (termFromCoreExpr (uf_tmpl unf))
             , def_src          = uf_src unf
             , def_level        = if uf_is_top unf then TopLevel else NotTopLevel
-            , def_guidance     = unfGuidanceToGuidance (uf_guidance unf)
+            , def_guidance     = uf_guidance unf
             , def_arity        = uf_arity unf
             , def_isValue      = uf_is_value unf
             , def_isConLike    = uf_is_conlike unf
@@ -1344,13 +1337,6 @@ unfoldingToDef _ unf@(DFunUnfolding {})
                 , dfun_dataCon  = df_con unf
                 , dfun_args     = map (occurAnalyseTerm . termFromCoreExpr)
                                       (df_args unf) }
-
-unfGuidanceToGuidance :: UnfoldingGuidance -> Guidance
-unfGuidanceToGuidance UnfNever = Never
-unfGuidanceToGuidance (UnfWhen { ug_unsat_ok = unsat , ug_boring_ok = boring })
-  = Usually { guEvenIfUnsat = unsat , guEvenIfBoring = boring }
-unfGuidanceToGuidance (UnfIfGoodArgs { ug_args = args, ug_size = size, ug_res = res })
-  = Sometimes { guSize = size, guArgDiscounts = args, guResultDiscount = res }
 
 setDef :: SimplEnv -> OutId -> Definition -> (SimplEnv, OutId)
 setDef env x def
@@ -1367,16 +1353,9 @@ defToUnfolding (BoundTo { def_rhs = Right _pkont })
   = NoUnfolding -- TODO Can we do better? Translating requires knowing the outer linear cont.
 defToUnfolding (BoundTo { def_src = src, def_rhs = Left term, def_level = lev, def_guidance = guid })
   = mkCoreUnfolding src (isTopLevel lev) (termToCoreExpr term)
-      (termArity term) (guidanceToUnfGuidance guid)
+      (termArity term) guid
 defToUnfolding (BoundToDFun { dfun_bndrs = bndrs, dfun_dataCon = con, dfun_args = args})
   = mkDFunUnfolding bndrs con (map termToCoreExpr args)
-
-guidanceToUnfGuidance :: Guidance -> UnfoldingGuidance
-guidanceToUnfGuidance Never = UnfNever
-guidanceToUnfGuidance (Usually { guEvenIfUnsat = unsat, guEvenIfBoring = boring })
-  = UnfWhen { ug_unsat_ok = unsat, ug_boring_ok = boring }
-guidanceToUnfGuidance (Sometimes { guSize = size, guArgDiscounts = args, guResultDiscount = res})
-  = UnfIfGoodArgs { ug_size = size, ug_args = args, ug_res = res }
 
 -- TODO This might be in Syntax, but since we're not storing our "unfoldings" in
 -- ids, we rely on the environment to tell us whether a variable has been
@@ -1432,7 +1411,7 @@ defIsStable (BoundToDFun {})                 = True
 defIsStable _                                = False
 
 defIsSmallEnoughToInline :: DynFlags -> Definition -> Bool
-defIsSmallEnoughToInline dflags (BoundTo { def_guidance = Sometimes { guSize = size }})
+defIsSmallEnoughToInline dflags (BoundTo { def_guidance = UnfIfGoodArgs { ug_size = size }})
   = size <= ufUseThreshold dflags
 defIsSmallEnoughToInline _ _
   = False
@@ -1755,15 +1734,6 @@ instance Outputable a => Outputable (Scoped env a) where
 instance Outputable DupFlag where
   ppr OkToDup = text "<ok to dup>"
   ppr NoDup   = text "<no dup>"
-
-instance Outputable Guidance where
-  ppr Never = text "Never"
-  ppr (Usually unsatOk boringOk)
-    = text "Usually" <+> brackets (hsep $ punctuate comma $ catMaybes
-                                    [if unsatOk then Just (text "even if unsat") else Nothing,
-                                     if boringOk then Just (text "even if boring cxt") else Nothing])
-  ppr (Sometimes base argDiscs resDisc)
-    = text "Sometimes" <+> brackets (int base <+> ppr argDiscs <+> int resDisc)
 
 instance Outputable Floats where
   ppr (Floats binds ff) = ppr ff $$ ppr (fromOL binds)
