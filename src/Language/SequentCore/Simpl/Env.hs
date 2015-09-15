@@ -126,13 +126,19 @@ data SimplEnv
                 , se_tvSubst :: TvSubstEnv     -- InTyVar   |--> OutType
                 , se_cvSubst :: CvSubstEnv     -- InCoVar   |--> OutCoercion
                 --  ^^^ term static part ^^^  --
+                -- No bindings for join-points
+
                 , se_pvSubst :: SimplPvSubst   -- InPKontId |--> PKontSubstAns (in/out)
                 , se_retTy   :: Maybe OutType
                 , se_retKont :: KontSubst      -- ()        |--> MetaKont (in/out)
                 --  ^^^ static part ^^^  --
-                --  (includes term static part)
+                --  (includes term static part plus bindings for join points
+
                 , se_inScope :: InScopeSet     -- OutVar    |--> OutVar
                 , se_defs    :: IdDefEnv       -- OutId     |--> Definition (out)
+                                               -- Gives the unfoldings in Sequent Core
+                                               -- for Ids in the InScopeSet
+                                               -- INVARIANT: dom(se_defs) is a subset of dom(se_inScope)
                 , se_context :: CallCtxt
                 , se_global  :: SimplGlobalEnv }
 

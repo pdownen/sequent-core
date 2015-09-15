@@ -100,7 +100,8 @@ data Term b     = Lit Literal       -- ^ A primitive literal value.
                                     -- a continuation. The body is a command.
                 | Compute Type (Command b)
                                     -- ^ A value produced by a computation.
-                                    -- Binds a continuation.
+                                    -- Binds a continuation.  The type is the type
+                                    -- of the value returned by the computation
                 | Type Type         -- ^ A type. Used to pass a type as an
                                     -- argument to a type-level lambda.
                 | Coercion Coercion -- ^ A coercion. Used to pass evidence
