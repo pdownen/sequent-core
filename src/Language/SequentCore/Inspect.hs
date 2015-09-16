@@ -115,5 +115,5 @@ showBind opts pair
         cap = ufCreationThreshold dflags
         sizePart | opt_sizes opts = ppr size
                  | otherwise      = empty
-        size = either (termSize dflags cap) (pKontSize dflags cap) rhs
+        size = rhsSize dflags cap rhs
     putMsg $ sep [ idPart, sizePart ]

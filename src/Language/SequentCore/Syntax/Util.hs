@@ -199,14 +199,14 @@ seqCoreBindsSize = sum . map sizeB
     sizeB (Rec pairs) = sum (sizeBP <$> pairs)
     
     sizeBP (BindTerm x term) = sizeX x + sizeT term
-    sizeBP (BindPKont j pk)  = sizeX j + sizePK pk
+    sizeBP (BindJoin j join) = sizeX j + sizeJ join
     
     sizeX x | isTyVar x = seqType (tyVarKind x) `seq` 1
             | otherwise = seqType (idType x)       `seq`
                           megaSeqIdInfo (idInfo x) `seq`
                           1
     
-    sizePK (PKont xs c) = sum (sizeX <$> xs) + sizeC c
+    sizeJ (Join xs c) = sum (sizeX <$> xs) + sizeC c
     
     sizeT (Var x) = x `seq` 1
     sizeT (Lit lit) = lit `seq` 1

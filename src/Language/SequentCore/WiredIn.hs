@@ -8,7 +8,7 @@ module Language.SequentCore.WiredIn (
   
   sequentCoreTag, sequentCoreWiredInTag,
   
-  mkKontId, mkKontArgId, mkInlinablePKontBinder
+  mkKontId, mkKontArgId, mkInlinableJoinBinder
 ) where
 
 import FastString
@@ -30,13 +30,13 @@ sequentCoreTag, sequentCoreWiredInTag :: Char
 sequentCoreTag        = 'Q'
 sequentCoreWiredInTag = 'q'
 
-kontKindKey, kontTypeKey, ubxExistsTypeKey, kontIdKey, kontArgKey, inlinablePKontBndrKey :: Unique
-kontKindKey: kontTypeKey: ubxExistsTypeKey: kontIdKey: kontArgKey: inlinablePKontBndrKey: _
+kontKindKey, kontTypeKey, ubxExistsTypeKey, kontIdKey, kontArgKey, inlinableJoinBndrKey :: Unique
+kontKindKey: kontTypeKey: ubxExistsTypeKey: kontIdKey: kontArgKey: inlinableJoinBndrKey: _
   = map (mkUnique sequentCoreWiredInTag) [1..]
 
-kontArgName, kontIdName, inlinablePKontBinderName :: Name
-[kontArgName, kontIdName, inlinablePKontBinderName] = zipWith mkSystemVarName
-  [kontArgKey,   kontIdKey,    inlinablePKontBndrKey]
+kontArgName, kontIdName, inlinableJoinBinderName :: Name
+[kontArgName, kontIdName, inlinableJoinBinderName] = zipWith mkSystemVarName
+  [kontArgKey,   kontIdKey,    inlinableJoinBndrKey]
   [fsLit "karg", fsLit "*ret", fsLit "*inj"]
 
 kontKindTyConName, kontTyConName, ubxExistsTyConName :: Name
@@ -50,8 +50,8 @@ mkKontArgId ty = mkLocalId kontArgName ty
 mkKontId :: Type -> Var
 mkKontId ty = mkLocalId kontIdName ty
 
-mkInlinablePKontBinder :: Type -> Var
-mkInlinablePKontBinder ty = mkLocalId inlinablePKontBinderName ty
+mkInlinableJoinBinder :: Type -> Var
+mkInlinableJoinBinder ty = mkLocalId inlinableJoinBinderName ty
 
 kontKindTyCon, kontTyCon, ubxExistsTyCon :: TyCon
 kontKindTyCon = mkKindTyCon kontKindTyConName (superKind `mkArrowKind` superKind)

@@ -50,8 +50,8 @@ ppr_binding pair
     hang (ppr val_bdr <+> equals) 2 body
   where
     val_bdr = binderOfPair pair
-    body = pprDeeper $ either pprCoreTerm pprCorePKont (rhsOfPair pair)
-    prefix | bindsKont pair = text "pkont"
+    body = pprDeeper $ either pprCoreTerm pprCoreJoin (rhsOfPair pair)
+    prefix | bindsJoin pair = text "join"
            | otherwise = empty
 
 ppr_comm :: OutputableBndr b => (SDoc -> SDoc) -> Command b -> SDoc
@@ -72,13 +72,13 @@ ppr_comm add_par comm
             -> text "jump" <+> prefix <+> ppr j <+> parens (pprDeeper $ pprWithCommas pprCoreTerm args)
             where prefix | GHC.isTyVar j     = text "TYVAR"
                          | GHC.isCoVar j     = text "COVAR"
-                         | not (isPKontId j) = text "IDVAR"
+                         | not (isJoinId j)  = text "IDVAR"
                          | otherwise         = empty
 
 ppr_term :: OutputableBndr b => (SDoc -> SDoc) -> Term b -> SDoc
 ppr_term _ (Var name) = prefix <+> ppr name
   where prefix | GHC.isTyVar name = text "TYVAR"
-               | isPKontId name = text "PKVAR"
+               | isJoinId name = text "PKVAR"
                | otherwise = empty
   -- Something is quite wrong if it's a type variable!
 ppr_term add_par (Type ty) = add_par $ text "TYPE" <+> ppr ty
@@ -125,8 +125,8 @@ ppr_kont :: OutputableBndr b => (SDoc -> SDoc) -> Kont b -> SDoc
 ppr_kont add_par (Kont frames end)
   = add_par $ sep $ punctuate semi (ppr_kont_frames frames ++ [ppr_end end])
 
-ppr_pkont :: OutputableBndr b => (SDoc -> SDoc) -> PKont b -> SDoc
-ppr_pkont add_par (PKont bndrs body)
+ppr_join :: OutputableBndr b => (SDoc -> SDoc) -> Join b -> SDoc
+ppr_join add_par (Join bndrs body)
   = add_par $
       hang (char '\\' <+> argTuple <+> arrow)
         2 (pprCoreComm body)
@@ -156,8 +156,8 @@ pprCoreComm comm = ppr_comm noParens comm
 pprCoreTerm :: OutputableBndr b => Term b -> SDoc
 pprCoreTerm val = ppr_term noParens val
 
-pprCorePKont :: OutputableBndr b => PKont b -> SDoc
-pprCorePKont pkont = ppr_pkont noParens pkont
+pprCoreJoin :: OutputableBndr b => Join b -> SDoc
+pprCoreJoin join = ppr_join noParens join
 
 pprParendTerm :: OutputableBndr b => Term b -> SDoc
 pprParendTerm term = ppr_term parens term
@@ -186,8 +186,8 @@ instance OutputableBndr b => Outputable (Frame b) where
 instance OutputableBndr b => Outputable (End b) where
   ppr = ppr_end
 
-instance OutputableBndr b => Outputable (PKont b) where
-  ppr = ppr_pkont noParens
+instance OutputableBndr b => Outputable (Join b) where
+  ppr = ppr_join noParens
 
 instance OutputableBndr b => Outputable (Alt b) where
   ppr = pprCoreAlt

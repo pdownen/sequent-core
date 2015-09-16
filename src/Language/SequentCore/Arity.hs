@@ -810,7 +810,7 @@ arityType = goT
         cheap_bind (NonRec pair) = cheapFlag $ is_cheap pair
         cheap_bind (Rec prs)     = cheapFlag $ all is_cheap prs
         is_cheap (BindTerm x v)  = ae_cheap_fn env v (Just (idType x))
-        is_cheap (BindPKont _ _) = True -- pkonts aren't shared anyway
+        is_cheap (BindJoin _ _)  = True -- joins aren't shared anyway
     
     goC _ (Jump {}) = ATop -- TODO
 

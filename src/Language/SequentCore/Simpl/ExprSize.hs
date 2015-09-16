@@ -1,5 +1,5 @@
 module Language.SequentCore.Simpl.ExprSize (
-  ExprSize(..), termSize, kontSize, pKontSize, commandSize, rhsSize
+  ExprSize(..), termSize, kontSize, joinSize, commandSize, rhsSize
 ) where
 
 import Language.SequentCore.Syntax
@@ -76,7 +76,7 @@ mkBodySize cap b as r
 
 termSize    :: DynFlags -> Int -> SeqCoreTerm    -> Maybe ExprSize
 kontSize    :: DynFlags -> Int -> SeqCoreKont    -> Maybe ExprSize
-pKontSize   :: DynFlags -> Int -> SeqCorePKont   -> Maybe ExprSize
+joinSize    :: DynFlags -> Int -> SeqCoreJoin    -> Maybe ExprSize
 commandSize :: DynFlags -> Int -> SeqCoreCommand -> Maybe ExprSize
 rhsSize     :: DynFlags -> Int -> SeqCoreRhs     -> Maybe ExprSize
 
@@ -98,11 +98,11 @@ commandSize dflags cap comm
 
 kontSize dflags cap kont = body2ExprSize [] $ bodySize dflags cap [] (K kont)
 
-pKontSize dflags cap (PKont xs comm)
+joinSize dflags cap (Join xs comm)
   = let valBinders = filter isId xs
     in body2ExprSize valBinders $ bodySize dflags cap valBinders (C comm)
 
-rhsSize dflags cap = either (termSize dflags cap) (pKontSize dflags cap)
+rhsSize dflags cap = either (termSize dflags cap) (joinSize dflags cap)
 
 bodySize dflags cap topArgs expr
   = cap `seq` size expr -- use seq to unbox cap now; we will use it often
@@ -187,7 +187,7 @@ bodySize dflags cap topArgs expr
           -- An unlifted type has no heap allocation
           | isUnLiftedType (idType x) =  0
           | otherwise                 = 10
-    sizeBind (NonRec (BindPKont _p (PKont _xs comm)))
+    sizeBind (NonRec (BindJoin _p (Join _xs comm)))
       = size (C comm)
 
     sizeBind (Rec pairs)
@@ -195,10 +195,10 @@ bodySize dflags cap topArgs expr
       where
         allocSize                     = 10 * length (filter bindsTerm pairs)
         pairSize (BindTerm _x rhs)    = size (T rhs)
-        pairSize (BindPKont _p (PKont _xs comm))
+        pairSize (BindJoin _p (Join _xs comm))
                                       = size (C comm)
 
-    sizeJump :: [SeqCoreArg] -> PKontId -> BodySize
+    sizeJump :: [SeqCoreArg] -> JoinId -> BodySize
     sizeJump args j
       = let realArgs      = filter (not . isTyCoArg) args
             voids         = count isRealWorldTerm realArgs
