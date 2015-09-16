@@ -104,6 +104,11 @@ joinSize dflags cap (Join xs comm)
 
 rhsSize dflags cap = either (termSize dflags cap) (joinSize dflags cap)
 
+
+tStize ::  args -> (TErm -> Int, Join->Int, Cmd->Int)
+
+termSize args = case tSize args of (a,_,_) = a
+
 bodySize dflags cap topArgs expr
   = cap `seq` size expr -- use seq to unbox cap now; we will use it often
   where

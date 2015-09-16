@@ -884,6 +884,12 @@ the Term to the End and returns.
 simplTermInCommand     :: SimplTermEnv -> InTerm -> Maybe SubstedCoercion
                        -> [ScopedFrame] -> ScopedEnd
                        -> SimplM (Floats, OutCommand)
+
+-- simplTermInCommand env t (Just c) fs e
+--   means the command <env(t), Cast c : fs, e>
+
+
+
 simplTermInCommand env_v v co_m fs end
   | tracing
   , pprTraceShort "simplTermInCommand" (
