@@ -249,9 +249,9 @@ simplModule env0 binds0
     trace_bind False _    = \x -> x
 
     simpl_bind env (Rec pairs)   = simplRec          env  pairs TopLevel
-    simpl_bind env (NonRec pair) = simplRecOrTopPair env' b b' r TopLevel NonRecursive
+    simpl_bind env (NonRec pair) = simplRecOrTopPair env' b' pair TopLevel NonRecursive
         where
-          (b, r) = destBindPair pair
+          b = binderOfPair pair
           (env', b') = addBndrRules env b (lookupRecBndr env b)
 
 {-
@@ -267,16 +267,17 @@ simplRec env0 pairs0 top_lvl
         ; (flts, env1) <- go env_with_info triples []
         ; return (env1 `addRecFloats` flts) }
   where
-    add_rules :: SimplEnv -> InBindPair -> (SimplEnv, (InBndr, OutBndr, InRhs))
+    add_rules :: SimplEnv -> InBindPair -> (SimplEnv, (OutBndr, InBindPair))
         -- Add the (substituted) rules to the binder
-    add_rules env (destBindPair -> (bndr, rhs)) = (env', (bndr, bndr', rhs))
+    add_rules env pair = (env', (bndr', pair))
         where
+          bndr = binderOfPair pair
           (env', bndr') = addBndrRules env bndr (lookupRecBndr env bndr)
 
     go env [] fltss = return (catFloats (reverse fltss), env)
 
-    go env ((old_bndr, new_bndr, rhs) : pairs) fltss
-        = do { (flts, env') <- simplRecOrTopPair env old_bndr new_bndr rhs top_lvl Recursive
+    go env ((new_bndr, old_bind_pair) : pairs) fltss
+        = do { (flts, env') <- simplRecOrTopPair env new_bndr old_bind_pair top_lvl Recursive
              ; go env' pairs (flts : fltss) }
 
 {-
@@ -288,27 +289,31 @@ It assumes the binder has already been simplified, but not its IdInfo.
 -}
 
 simplRecOrTopPair :: SimplEnv
-                  -> InId -> OutBndr -> InRhs
+                  -> OutBndr -> InBindPair
                   -> TopLevelFlag -> RecFlag
                   -> SimplM (Floats, SimplEnv)
-simplRecOrTopPair env old_bndr new_bndr rhs top_lvl is_rec
+simplRecOrTopPair env new_bndr old_pair top_lvl is_rec
   = do -- Check for unconditional inline
-       preInline <- preInlineUnconditionally env (staticPart env) (mkBindPair old_bndr rhs) top_lvl
+       preInline <- preInlineUnconditionally env (staticPart env) old_pair top_lvl
        if preInline
            then do tick (PreInlineUnconditionally old_bndr)
-                   return (emptyFloats, extendIdOrPvSubst env old_bndr (Susp (staticPart env) rhs))
-           else simplLazyOrJoinBind env old_bndr new_bndr (staticPart env) rhs top_lvl is_rec
+                   return (emptyFloats, extendSubstWithInBindPair env (staticPart env) old_pair)
+           else simplLazyOrJoinBind env new_bndr (staticPart env) old_pair top_lvl is_rec
+  where old_bndr = binderOfPair old_pair
 
-simplLazyOrJoinBind :: SimplEnv -> InVar -> OutVar -> StaticEnv -> InRhs -> TopLevelFlag
+simplLazyOrJoinBind :: SimplEnv -> OutVar -> StaticEnv -> InBindPair -> TopLevelFlag
                     -> RecFlag -> SimplM (Floats, SimplEnv)
-simplLazyOrJoinBind env_x x x' env_r r level recFlag
-  = case r of
-      Left term -> assert (not (isJoinId x)) $
-                   simplLazyBind env_x x x' (zapKontSubstEnvsStatic env_r) term level recFlag
-      Right pk  -> assert (isJoinId x && isNotTopLevel level) $ do
-                   (flts, env_r') <- ensureDupableKont (env_r `inDynamicScope` env_x)
-                     -- Note [Call ensureDupableKont around join point]
-                   addingFloats flts $ simplJoinBind (env_x `augmentFromFloats` flts) x x' (staticPart env_r') pk recFlag
+simplLazyOrJoinBind env new_bndr env_rhs pair level recFlag
+  = case pair of
+      BindTerm old_bndr term ->
+        simplLazyBind env new_bndr (zapKontSubstEnvsStatic env_rhs)
+                          old_bndr term level recFlag
+      BindJoin old_bndr join ->
+        assert (isNotTopLevel level) $ do
+          (flts, env_rhs') <- ensureDupableKont (env_rhs `inDynamicScope` env)
+            -- Note [Call ensureDupableKont around join point]
+          addingFloats flts $ simplJoinBind (env `augmentFromFloats` flts) new_bndr (staticPart env_rhs')
+                                                                           old_bndr join recFlag
 
 {-
 simplLazyBind is used for
@@ -326,30 +331,30 @@ Nota bene:
        that should have been done already.
 -}
 
-simplLazyBind :: SimplEnv -> InVar -> OutVar -> StaticTermEnv -> InTerm -> TopLevelFlag
+simplLazyBind :: SimplEnv -> OutVar -> StaticTermEnv -> InVar -> InTerm -> TopLevelFlag
               -> RecFlag -> SimplM (Floats, SimplEnv)
-simplLazyBind env_x x x' env_v v level recFlag
+simplLazyBind env new_bndr env_rhs old_bndr term level recFlag
   | tracing
-  , pprTraceShort "simplLazyBind" (ppr x <+> (if x == x' then empty else darrow <+> ppr x')
-                                      <+> ppr level <+> ppr recFlag $$ pprBndr LetBind x' $$ ppr v) False
+  , pprTraceShort "simplLazyBind" (ppr old_bndr <+> (if old_bndr == new_bndr then empty else darrow <+> ppr new_bndr)
+                                      <+> ppr level <+> ppr recFlag $$ pprBndr LetBind new_bndr $$ ppr term) False
   = undefined
-  | isCoVar x
-  , Coercion co <- assert (isCoArg v) v
-  = let co' = simplCoercion (env_v `inDynamicScopeForTerm` env_x) co
-    in return (emptyFloats, extendCvSubst env_x x co')
+  | isCoVar old_bndr
+  , Coercion co <- assert (isCoArg term) term
+  = let co' = simplCoercion (env_rhs `inDynamicScopeForTerm` env) co
+    in return (emptyFloats, extendCvSubst env old_bndr co')
   | otherwise
   = do
     -- TODO Handle floating type lambdas
-    let env_v' = env_v `inDynamicScopeForTerm` env_x
-    (flts, v') <- simplTerm env_v' RhsCtxt v
-    (flts', v'') <- prepareRhsTerm (env_v' `augmentFromFloats` flts) level x' v'
+    let env_rhs' = env_rhs `inDynamicScopeForTerm` env
+    (flts, term') <- simplTerm env_rhs' RhsCtxt term
+    (flts', term'') <- prepareRhsTerm (env_rhs' `augmentFromFloats` flts) level new_bndr term'
     let flts_all = flts `addFloats` flts'
-    (flts_out, env_x', v''')
-      <- if not (doFloatFromRhs level recFlag False v'' flts_all)
-            then    return (emptyFloats, env_x, wrapFloatsAroundTerm flts_all v'')
+    (flts_out, env_x', term_final)
+      <- if not (doFloatFromRhs level recFlag False term'' flts_all)
+            then    return (emptyFloats, env, wrapFloatsAroundTerm flts_all term'')
             else do tick LetFloatFromLet
-                    return (flts_all, env_x `augmentFromFloats` flts_all, v'')
-    addingFloats flts_out $ completeBind env_x' x x' (Left v''') level
+                    return (flts_all, env `augmentFromFloats` flts_all, term'')
+    addingFloats flts_out $ completeBind env_x' old_bndr (BindTerm new_bndr term_final) level
 
 {-
 simplNonRecInCommand is used for
@@ -362,47 +367,47 @@ know which one called, the caller needs to say what metacontinuation to use in
 case the binding is strict and we tail-recurse into the right-hand side.
 -}
 -- c.f. Simplify.simplNonRecE
-simplNonRecInCommand :: SimplEnv -> InVar -> StaticEnv -> InRhs
+simplNonRecInCommand :: SimplEnv -> StaticEnv -> InBindPair
                      -> MetaKont
                         -- ^ MetaKont to recurse with if strict
                      -> (SimplEnv -> SimplM (Floats, OutCommand))
                         -- ^ Continuation to call if lazy or pre-inlined
                      -> SimplM (Floats, OutCommand)
-simplNonRecInCommand env_x x env_v rhs mk_strict _
+simplNonRecInCommand env env_rhs pair mk_strict _
   | tracing
-  , pprTraceShort "simplNonRecInCommand" (ppr env_x $$ ppr x $$ ppr env_v $$ ppr rhs $$ ppr mk_strict) False
+  , pprTraceShort "simplNonRecInCommand" (ppr env $$ ppr (binderOfPair pair) $$
+                                          ppr env_rhs $$ ppr pair $$ ppr mk_strict) False
   = undefined
-simplNonRecInCommand env_x x env_v rhs _mk_strict k_lazy
-  | isTyVar x
-  , Left (Type ty) <- rhs
-  = let ty' = substTy (env_v `inDynamicScope` env_x) ty
-    in k_lazy $ extendTvSubst env_x x ty'
-  | isTyVar x
-  = pprPanic "simplNonRec" (ppr x <+> ppr rhs)
-simplNonRecInCommand env_x x env_v rhs mk_strict k_lazy
+simplNonRecInCommand env env_rhs pair _mk_strict k_lazy
+  | BindTerm x (Type ty) <- pair
+  = let ty' = substTy (env_rhs `inDynamicScope` env) ty
+    in k_lazy $ extendTvSubst env x ty'
+  | isTyVar (binderOfPair pair)
+  = pprPanic "simplNonRec" (ppr pair)
+simplNonRecInCommand env env_rhs pair mk_strict k_lazy
   = do
-    preInline <- preInlineUnconditionally env_x env_v (mkBindPair x rhs) NotTopLevel
+    let x = binderOfPair pair
+    preInline <- preInlineUnconditionally env env_rhs pair NotTopLevel
     case () of 
       _ | preInline
        -> do
           tick (PreInlineUnconditionally x)
-          let ans = Susp env_v rhs
-              env' = extendIdOrPvSubst env_x x ans
+          let env' = extendSubstWithInBindPair env env_rhs pair
           k_lazy env'
         | isStrictId x
-        , Left term <- rhs -- A join point could be marked strict by happenstance,
-                           -- but it's hard to see what the meaning would be here
+        , BindTerm _ term <- pair -- A join point could be marked strict by happenstance,
+                                  -- but it's hard to see what the meaning would be here
        -> do
-          let env       = env_v `inDynamicScope` env_x
-              (env', _) = enterKontScope env BoringCtxt (idType x)
-              env_rhs   = env' `setRetKont` mk_strict
-          simplTermInCommand env_rhs term Nothing []
-                             (Incoming (staticPart env_rhs) Return)
+          let env'       = env_rhs `inDynamicScope` env
+              (env'', _) = enterKontScope env' BoringCtxt (idType x)
+              env_rhs'   = env'' `setRetKont` mk_strict
+          simplTermInCommand env_rhs' term Nothing []
+                             (Incoming (staticPart env_rhs') Return)
         | otherwise
        -> do
-          let (env_x',  x')  = enterScope env_x x
-              (env_x'', x'') = addBndrRules env_x' x x'
-          (flts, env_final) <- simplLazyOrJoinBind env_x'' x x'' env_v rhs
+          let (env',  x')  = enterScope env x
+              (env'', x'') = addBndrRules env' x x'
+          (flts, env_final) <- simplLazyOrJoinBind env'' x'' env_rhs pair
                                                     NotTopLevel NonRecursive
           addingFloats flts $ k_lazy (env_final `augmentFromFloats` flts)
 
@@ -430,7 +435,7 @@ completeNonRecOut env level isStrict bndr bndr' rhs
              return (flts, rhs')
         else return (emptyFloats, wrapFloatsAroundTerm flts rhs')
     addingFloats flts' $
-      completeBind (env `augmentFromFloats` flts') bndr bndr' (Left rhs'') level
+      completeBind (env `augmentFromFloats` flts') bndr (BindTerm bndr' rhs'') level
 
 prepareRhsTerm :: SimplEnv -> TopLevelFlag -> OutId -> OutTerm
                -> SimplM (Floats, OutTerm)
@@ -545,25 +550,25 @@ Nota bene:
     2. It does not check for pre-inline-unconditionallly;
        that should have been done already.
 -}
-simplJoinBind :: SimplEnv -> InJoinId -> OutJoinId -> StaticEnv -> InJoin
+simplJoinBind :: SimplEnv -> OutJoinId -> StaticEnv -> InJoinId -> InJoin
               -> RecFlag -> SimplM (Floats, SimplEnv)
-simplJoinBind _env_j j j' _env_pk pk recFlag
+simplJoinBind _env new_bndr _env_rhs old_bndr join recFlag
   | tracing
-  , pprTraceShort "simplJoinBind" (ppr j <+> (if j == j' then empty else darrow <+> ppr j') <+>
-                                    ppr recFlag $$ ppr pk) False
+  , pprTraceShort "simplJoinBind" (ppr old_bndr <+> (if old_bndr == new_bndr then empty else darrow <+> ppr new_bndr) <+>
+                                    ppr recFlag $$ ppr join) False
   = undefined
-simplJoinBind env_j j j' env_pk pk _recFlag
+simplJoinBind env new_bndr env_rhs old_bndr join _recFlag
   = do
-    let env_pk' = env_pk `inDynamicScope` env_j
-    (flts, pk') <- simplJoin env_pk' pk
-    env_j' <-
+    let env_rhs' = env_rhs `inDynamicScope` env
+    (flts, join') <- simplJoin env_rhs' join
+    env' <-
       if isEmptyFloats flts
-         then    return env_j
+         then    return env
          else do tick LetFloatFromLet -- Can always float through a cont binding
                                       -- (If the cont has parameters, the floats
                                       -- won't make it here; see simplJoin.)
-                 return $ env_j `augmentFromFloats` flts
-    addingFloats flts $ completeBind env_j' j j' (Right pk') NotTopLevel
+                 return $ env `augmentFromFloats` flts
+    addingFloats flts $ completeBind env' old_bndr (BindJoin new_bndr join') NotTopLevel
 
 {-
 Note [Call ensureDupableKont outside join point]
@@ -598,31 +603,29 @@ simplJoinNoFloats env (Join xs comm)
     comm' <- simplCommandNoFloats env' comm
     return $ Join xs' comm'
 
-simplRhsNoFloats :: SimplEnv -> InRhs -> SimplM OutRhs
-simplRhsNoFloats env (Left term)  = Left  <$> simplTermNoFloats env RhsCtxt term
-simplRhsNoFloats env (Right join) = Right <$> simplJoinNoFloats env join
-
-completeBind :: SimplEnv -> InVar -> OutVar -> OutRhs
+completeBind :: SimplEnv -> InVar -> OutBindPair
              -> TopLevelFlag -> SimplM (Floats, SimplEnv)
-completeBind env x x' v level
+completeBind env x pair level
   | isCoVar x
-  = case v of
-      Left (Coercion co) -> return (emptyFloats, extendCvSubst env x co)
-      Right _            -> pprPanic "completeBind" (ppr x <+> ppr v)
-      _                  -> return (unitFloat (NonRec (mkBindPair x' v)), env)
+  = case pair of
+      BindTerm _ (Coercion co) -> return (emptyFloats, extendCvSubst env x co)
+      BindJoin _ _             -> pprPanic "completeBind" (ppr x <+> ppr pair)
+      _                        -> return (unitFloat (NonRec pair), env)
   | otherwise
   = do
-    (newArity, v') <- tryEtaExpandRhs env x' v
+    (newArity, v') <- tryEtaExpandRhs env pair
     let oldDef = findRealDef env x
     newDef <- simplDef env level x v' oldDef
-    postInline <- postInlineUnconditionally env (mkBindPair x v') level newDef
+    postInline <- postInlineUnconditionally env pair level newDef
     if postInline
       then do
         tick (PostInlineUnconditionally x)
-        -- Nevermind about substituting x' for x; we'll substitute v' instead
-        return (emptyFloats, extendIdOrPvSubst env x (Done v'))
+        -- We were going to rename x, but we're substituting intead, so throw
+        -- out the new binder
+        return (emptyFloats, extendSubstWithOutBindPair env (pair `setPairBinder` x))
       else do
-        let info1 = idInfo x' `setArityInfo` newArity
+        let x' = binderOfPair pair
+            info1 = idInfo x' `setArityInfo` newArity
             (env', x'') = setDef env (x' `setIdInfo` info1) newDef
             info2 = idInfo x''
               -- Demand info: Note [Setting the demand info] in GHC Simplify
@@ -639,48 +642,66 @@ completeBind env x x' v level
             x_final = x'' `setIdInfo` info3
         
         when tracing $ liftCoreM $ putMsg (text "defined" <+> ppr x_final <+> equals <+> ppr newDef)
-        return (unitFloat (NonRec (mkBindPair x_final v')), env')
+        return (unitFloat (NonRec (pair `setPairBinder` x_final)), env')
 
 -- (from Simplify.simplUnfolding)
 ------------------------------
 simplDef :: SimplEnv -> TopLevelFlag
          -> InId
-         -> OutRhs
+         -> OutBindPair
          -> Definition -> SimplM Definition
 -- Note [Setting the new unfolding]
-simplDef env top_lvl id new_rhs def
+simplDef env top_lvl id new_pair def
   = case def of
       BoundToDFun { dfun_bndrs = bndrs, dfun_dataCon = con, dfun_args = args }
         -> do { let (env', bndrs') = enterLamScopes rule_env bndrs
               ; args' <- mapM (simplTermNoFloats env' BoringCtxt) args
               ; return (mkBoundToDFun bndrs' con args') }
 
-      BoundTo { def_rhs = rhs, def_arity = arity
-              , def_src = src, def_guidance = guide }
+      BoundToTerm { def_term = term, def_arity = arity
+                  , def_src = src, def_guidance = guide }
         | isStableSource src
-        -> do { rhs' <- simplRhsNoFloats rule_env rhs
+        -> do { term' <- simplTermNoFloats rule_env RhsCtxt term
               ; case guide of
                   UnfWhen {}   -- Happens for INLINE things
-                     -> let guide' = guide { ug_boring_ok = inlineBoringOk rhs' }
+                     -> let guide' = guide { ug_boring_ok = termInlineBoringOk term' }
                         -- Refresh the boring-ok flag, in case expr'
                         -- has got small. This happens, notably in the inlinings
                         -- for dfuns for single-method classes; see
                         -- Note [Single-method classes] in TcInstDcls.
                         -- A test case is Trac #4138
-                        in return (mkBoundToWithGuidance env rhs' src top_lvl arity guide')
+                        in return (mkBoundToTermWithGuidance env term' src top_lvl arity guide')
                             -- See Note [Top-level flag on inline rules] in CoreUnfold
 
                   _other              -- Happens for INLINABLE things
                      -> bottoming `seq` -- See Note [Force bottoming field]
                         do { let dflags = dynFlags env
-                           ; return (mkBoundTo env dflags rhs' src top_lvl bottoming) } }
+                           ; return (mkBoundToTerm env dflags term' src top_lvl bottoming) } }
                 -- If the guidance is UnfIfGoodArgs, this is an INLINABLE
                 -- unfolding, and we need to make sure the guidance is kept up
                 -- to date with respect to any changes in the unfolding.
 
+      BoundToJoin { def_join = join, def_arity = arity
+                  , def_src = src, def_guidance = guide }
+        | isStableSource src
+        -> do { join' <- simplJoinNoFloats rule_env join
+              ; case guide of
+                  UnfWhen {}
+                     -> let guide' = guide { ug_boring_ok = joinInlineBoringOk join' }
+                        in return (mkBoundToJoinWithGuidance env join' src arity guide')
+
+                  _other
+                     -> bottoming `seq`
+                        do { let dflags = dynFlags env
+                           ; return (mkBoundToJoin env dflags join' src) } }
+
       _other -> bottoming `seq`
                 do { let dflags = dynFlags env
-                   ; return (mkBoundTo env dflags new_rhs InlineRhs top_lvl bottoming) }
+                   ; case new_pair of
+                       BindTerm _ term ->
+                         return (mkBoundToTerm env dflags term InlineRhs top_lvl bottoming)
+                       BindJoin _ join ->
+                         return (mkBoundToJoin env dflags join InlineRhs) }
                      -- We make an  unfolding *even for loop-breakers*.
                      -- Reason: (a) It might be useful to know that they are WHNF
                      --         (b) In TidyPgm we currently assume that, if we want to
@@ -705,12 +726,12 @@ updModeForInlineRules inline_rule_act current_mode
     phaseFromActivation (ActiveAfter n) = Phase n
     phaseFromActivation _               = InitialPhase
 
-tryEtaExpandRhs :: SimplEnv -> OutId -> OutRhs -> SimplM (Arity, OutRhs)
-tryEtaExpandRhs env x (Left v)
+tryEtaExpandRhs :: SimplEnv -> OutBindPair -> SimplM (Arity, OutBindPair)
+tryEtaExpandRhs env (BindTerm x v)
   = do (arity, v') <- tryEtaExpandRhsTerm env x v
-       return (arity, Left v')
-tryEtaExpandRhs _ _ (Right pk@(Join xs _))
-  = return (length (filter isId xs), Right pk)
+       return (arity, BindTerm x v')
+tryEtaExpandRhs _   (BindJoin j join@(Join xs _))
+  = return (length (filter isId xs), BindJoin j join)
       -- TODO Somehow take into account the arity of the outer context
 
 tryEtaExpandRhsTerm :: SimplEnv -> OutId -> OutTerm -> SimplM (Arity, OutTerm)
@@ -747,7 +768,7 @@ tryEtaExpandRhsTerm env bndr rhs
 addPolyBind :: SimplEnv -> TopLevelFlag -> OutBind -> SimplM (Floats, SimplEnv)
 addPolyBind env level (NonRec pair)
   = do
-    def <- simplDef env level (binderOfPair pair) (rhsOfPair pair) NoDefinition
+    def <- simplDef env level (binderOfPair pair) pair NoDefinition
     let (env', x') = setDef env (binderOfPair pair) def
     return $ addNonRecFloat env' (pair `setPairBinder` x')
 addPolyBind env _level bind@(Rec _)
@@ -781,14 +802,14 @@ simplCommand env (Let (Rec pairs) comm)
     addingFloats flts $ simplCommand env'' comm
 simplCommand env (Let (NonRec pair) comm)
   = do
-    let (x, rhs) = destBindPair pair
+    let x = binderOfPair pair
         stat = staticPart env
         -- If the binding is strict, we tail-recurse into the term, so we need
         -- a metacontinuation to resume
         mk_if_strict = StrictLet { mk_env = stat
                                  , mk_binder = x
                                  , mk_command = comm }
-    simplNonRecInCommand env x (staticPart env) rhs mk_if_strict $
+    simplNonRecInCommand env (staticPart env) pair mk_if_strict $
       \env' -> simplCommand env' comm -- Called if the binding is lazy or gets
                                       -- pre-inlined
 simplCommand env (Eval term (Kont fs end))
@@ -912,17 +933,16 @@ simplTermInCommand env_v (Var x) co_m fs end
         -> do
            let lone | (unScope -> App {}) : _ <- fs = False
                     | otherwise                     = True
-               term'_maybe = callSiteInline env_v x' (activeUnfolding env_v x')
-                                            lone fs end
+               term'_maybe = callSiteInlineTerm env_v x' (activeUnfolding env_v x')
+                                                lone fs end
            case term'_maybe of
              Nothing
                -> simplTermInCommandDone env_v (Var x') co_m fs end
-             Just (Left term')
+             Just term'
                -> do
                   tick (UnfoldingDone x')
                   dump_inline (dynFlags env_v) term' fs end
                   simplTermInCommand (zapSubstEnvs env_v) term' co_m fs end
-             _ -> pprPanic "simplTermInCommand" (ppr x $$ ppr term'_maybe)
       Done v
         -- Term already simplified (then PostInlineUnconditionally'd), so
         -- don't do any substitutions when processing it again
@@ -992,7 +1012,7 @@ simplTermInCommand env_v v@(Lam x body) co_m (f : fs) end
                                      , mk_coercion = co_m'
                                      , mk_frames   = fs
                                      , mk_end      = end }
-    simplNonRecInCommand env_v x (staticPart env_k') (Left arg') mk_if_strict $
+    simplNonRecInCommand env_v (staticPart env_k') (BindTerm x arg') mk_if_strict $
       \env_v' -> simplTermInCommand env_v' body co_m' fs end
         -- Called if the argument is lazy or gets pre-inlined
   where
@@ -1321,22 +1341,19 @@ simplJump env args j
   = case substPv env j of
       DoneId j'
         -> do
-           let lone = null args
-               -- Pretend to callSiteInline that we're just applying a bunch of
+           let -- Pretend to callSiteInline that we're just applying a bunch of
                -- arguments to a function
-               rhs'_maybe = callSiteInline env j' (activeUnfolding env j') lone 
-                                           frames end
+               rhs'_maybe = callSiteInlineJoin env j' (activeUnfolding env j') [] end
           
            case rhs'_maybe of
              Nothing
                -> simplKont env (mkJumpArgInfo env j' frames) frames end
                     -- Activate case 2 of simplKont (Note [simplKont invariants])
-             Just (Right pk')
+             Just join'
                -> do
                   tick (UnfoldingDone j')
-                  dump_inline (dynFlags env) pk'
-                  reduce (zapSubstEnvs env) pk'
-             _ -> pprPanic "simplJump" (ppr j $$ ppr rhs'_maybe)
+                  dump_inline (dynFlags env) join'
+                  reduce (zapSubstEnvs env) join'
       Done pk
         -> reduce (zapSubstEnvs env) pk
       Susp stat' pk
@@ -1452,7 +1469,7 @@ simplAlt env scrut' _ case_bndr' (Alt (DataAlt con) vs rhs)
 
 addAltUnfoldings :: SimplEnv -> Maybe OutTerm -> OutId -> OutTerm -> SimplM SimplEnv
 addAltUnfoldings env scrut case_bndr con_app
-  = do { let con_app_def = mkDef env NotTopLevel (Left con_app)
+  = do { let con_app_def = mkTermDef env NotTopLevel con_app
              (env1, _) = setDef env case_bndr con_app_def
 
              -- See Note [Add unfolding for scrutinee]
@@ -1460,7 +1477,7 @@ addAltUnfoldings env scrut case_bndr con_app
                       Just (Var v)           -> setDef env1 v con_app_def
                       Just (Compute _ (Eval (Var v) (Kont [Cast co] Return)))
                                              -> setDef env1 v $
-                                                mkDef env1 NotTopLevel (Left (mkCast con_app (mkSymCo co)))
+                                                mkTermDef env1 NotTopLevel (mkCast con_app (mkSymCo co))
                       _                      -> (env1, undefined)
 
        ; when tracing $ pprTraceShort "addAltUnf" (vcat [ppr case_bndr <+> ppr scrut, ppr con_app]) return ()
@@ -1637,7 +1654,7 @@ postInlineUnconditionally env pair level def
       | isExportedId x              = False
       | isTopLevel level            = False
       | defIsStable def             = False
-      | either isTrivialTerm isTrivialJoin rhs = True
+      | trivial                     = True
       | otherwise
       = case occ_info of
           OneOcc in_lam _one_br int_cxt
@@ -1648,9 +1665,12 @@ postInlineUnconditionally env pair level def
           _ -> False
 
       where
-        (x, rhs) = destBindPair pair
+        x = binderOfPair pair
         occ_info = idOccInfo x
         active = isActive (sm_phase mode) (idInlineActivation x)
+        trivial = case pair of
+          BindTerm _ term -> isTrivialTerm term
+          BindJoin _ join -> isTrivialJoin join
 
 computeDiscount :: DynFlags -> Arity -> [Int] -> Int -> [ArgSummary] -> CallCtxt
                 -> Int
@@ -1697,24 +1717,44 @@ computeDiscount dflags uf_arity arg_discounts res_discount arg_infos cont_info
                 -- But we want to aovid inlining large functions that return 
                 -- constructors into contexts that are simply "interesting"
 
-callSiteInline :: SimplEnv -> OutId -> Bool -> Bool -> [ScopedFrame] -> ScopedEnd -> Maybe OutRhs
-callSiteInline env id active_unfolding lone_variable fs end
+callSiteInlineTerm :: SimplEnv -> OutId -> Bool -> Bool -> [ScopedFrame] -> ScopedEnd -> Maybe OutTerm
+callSiteInlineTerm env id active_unfolding lone_variable fs end
   = case findDef env id of 
       -- idUnfolding checks for loop-breakers, returning NoUnfolding
       -- Things with an INLINE pragma may have an unfolding *and* 
       -- be a loop breaker  (maybe the knot is not yet untied)
-      BoundTo { def_rhs = unf_template, def_level = is_top 
-              , def_isWorkFree = is_wf,  def_arity = uf_arity
-              , def_guidance = guidance, def_isExpandable = is_exp }
-              | active_unfolding -> let (arg_infos, cont_info) = distillKont env fs end
-                                    in tryUnfolding (dynFlags env) id lone_variable
-                                        arg_infos cont_info unf_template (isTopLevel is_top)
-                                        is_wf is_exp uf_arity guidance
-              | let dflags = dynFlags env
-              , tracing || dopt Opt_D_dump_inlinings dflags && dopt Opt_D_verbose_core2core dflags
-              -> pprTrace "Inactive unfolding:" (ppr id) Nothing
-              | otherwise -> Nothing
-      _       -> Nothing
+      BoundToTerm { def_term = unf_term, def_level = is_top 
+                  , def_isWorkFree = is_wf,  def_arity = uf_arity
+                  , def_guidance = guidance, def_isExpandable = is_exp }
+                  | active_unfolding -> let (arg_infos, cont_info) = distillKont env fs end
+                                        in tryUnfolding (dynFlags env) id lone_variable
+                                            arg_infos cont_info unf_term (isTopLevel is_top)
+                                            is_wf is_exp uf_arity guidance
+                  | let dflags = dynFlags env
+                  , tracing || dopt Opt_D_dump_inlinings dflags && dopt Opt_D_verbose_core2core dflags
+                  -> pprTrace "Inactive unfolding:" (ppr id) Nothing
+                  | otherwise -> Nothing
+      _           -> Nothing
+
+callSiteInlineJoin :: SimplEnv -> OutJoinId -> Bool -> [ScopedFrame] -> ScopedEnd -> Maybe OutJoin
+callSiteInlineJoin env id active_unfolding fs end
+  = case findDef env id of 
+      -- idUnfolding checks for loop-breakers, returning NoUnfolding
+      -- Things with an INLINE pragma may have an unfolding *and* 
+      -- be a loop breaker  (maybe the knot is not yet untied)
+      BoundToJoin { def_join = unf_join, def_arity = uf_arity
+                  , def_guidance = guidance }
+                  | active_unfolding -> let (arg_infos, cont_info) = distillKont env fs end
+                                        in tryUnfolding (dynFlags env) id False
+                                            arg_infos cont_info unf_join
+                                            False True True
+                                              -- top-level no, work-free yes, expandable yes
+                                            uf_arity guidance
+                  | let dflags = dynFlags env
+                  , tracing || dopt Opt_D_dump_inlinings dflags && dopt Opt_D_verbose_core2core dflags
+                  -> pprTrace "Inactive unfolding:" (ppr id) Nothing
+                  | otherwise -> Nothing
+      _           -> Nothing
 
 -- Impedence mismatch between Sequent Core code and logic from CoreUnfold.
 distillKont :: SimplEnv -> [ScopedFrame] -> ScopedEnd -> ([ArgSummary], CallCtxt)
@@ -1728,8 +1768,8 @@ distillKont env fs end = (mapMaybe (doFrame . substScoped env) fs, doEnd (substS
     doEnd (Case {})    = CaseCtxt
 
 tryUnfolding :: DynFlags -> Id -> Bool -> [ArgSummary] -> CallCtxt
-             -> OutRhs -> Bool -> Bool -> Bool -> Arity -> UnfoldingGuidance
-             -> Maybe OutRhs
+             -> a -> Bool -> Bool -> Bool -> Arity -> UnfoldingGuidance
+             -> Maybe a
 tryUnfolding dflags id lone_variable 
              arg_infos cont_info unf_template is_top 
              is_wf is_exp uf_arity guidance
@@ -1784,7 +1824,7 @@ tryUnfolding dflags id lone_variable
           _           -> not is_top && is_function    -- Note [Nested functions]
                                                       -- Note [Inlining in ArgCtxt]
 
-    is_function | Right {} <- unf_template = True -- Join points are always functions
+    is_function | isJoinId id = True -- Join points are always functions
                 | otherwise = uf_arity > 0
 
     (yes_or_no, extra_doc)
@@ -1978,7 +2018,7 @@ mkDupableKont env ty kont
             env_rhs   = env'' `setRetKont` mk
             join_rhs  = Join [x] (Eval (Var x) (Kont [] Return))
             join_kont = Case x [Alt DEFAULT [] (Jump [Var x] j)]
-        (flts, env_final) <- simplJoinBind env'' j j (staticPart env_rhs) join_rhs NonRecursive
+        (flts, env_final) <- simplJoinBind env'' j (staticPart env_rhs) j join_rhs NonRecursive
         return (flts, env_final, join_kont)
     
 mkDupableTerm :: SimplEnv -> InTerm
@@ -1986,7 +2026,7 @@ mkDupableTerm :: SimplEnv -> InTerm
 mkDupableTerm env term
   = do
     (env', bndr) <- mkFreshVar env (fsLit "triv") (substTy env (termType term))
-    (flts, env'') <- simplLazyBind env' bndr bndr (termStaticPart env') term NotTopLevel NonRecursive
+    (flts, env'') <- simplLazyBind env' bndr (termStaticPart env') bndr term NotTopLevel NonRecursive
     term_final <- simplVar env'' bndr
     return (flts, term_final)
 

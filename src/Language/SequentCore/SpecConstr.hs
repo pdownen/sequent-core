@@ -105,7 +105,6 @@ import VarEnv
 import VarSet
 
 import Control.Applicative  ( (<$>), (<|>) )
-import Control.Arrow        ( second )
 import Control.Monad
 import Data.List            ( nubBy )
 import Data.Monoid
@@ -231,13 +230,15 @@ specInEnd env (Case x as)
 specInEnd _ Return
   = return (emptyScUsage, Return)
 
-specInRhs :: ScEnv -> SeqCoreRhs -> CoreM (ScUsage, SeqCoreRhs)
-specInRhs env (Left term)
-  = second Left <$> specInTerm env term
-specInRhs env (Right (Join xs comm))
+specInBindRhs :: ScEnv -> SeqCoreBindPair -> CoreM (ScUsage, SeqCoreBindPair)
+specInBindRhs env (BindTerm x term)
+  = do
+    (usage, term') <- specInTerm env term
+    return (usage, BindTerm x term')
+specInBindRhs env (BindJoin j (Join xs comm))
   = do
     (usage, comm') <- specInCommand env comm
-    return (usage, Right (Join xs comm'))
+    return (usage, BindJoin j (Join xs comm'))
 
 specInAlt :: ScEnv -> SeqCoreAlt -> CoreM (ScUsage, SeqCoreAlt)
 specInAlt env (Alt ac xs c)
@@ -295,24 +296,22 @@ usageFromCut _ _ _
 specBind :: ScEnv -> SeqCoreBind -> CoreM (ScUsage, ScEnv, SeqCoreBind)
 specBind env (NonRec pair)
   = do
-    let (x, v) = destBindPair pair
-    (u, v') <- specInRhs env v
-    return (u, env, NonRec (mkBindPair x v'))
-specBind env (Rec bs)
+    (u, pair') <- specInBindRhs env pair
+    return (u, env, NonRec pair')
+specBind env (Rec pairs)
   = do
-    (usages, vs') <- unzip `liftM` mapM (specInRhs env' . rhsOfPair) bs
+    (usages, pairs') <- mapAndUnzipM (specInBindRhs env') pairs
     let
       totalUsages = mconcat usages
-      bs'         = zip (map binderOfPair bs) vs'
-    bindss <- forM bs' $ \(bndr, rhs) ->
-      case rhs of
-        Left  term -> map (uncurry BindTerm) <$>
-                        specialize env' totalUsages (bndr, term)
-        Right join -> return [BindJoin bndr join]
+    bindss <- forM (zip (map binderOfPair pairs) pairs') $ \(bndr, pair') ->
+      case pair' of
+        BindTerm _ term -> map (uncurry BindTerm) <$>
+                               specialize env' totalUsages (bndr, term)
+        BindJoin _ join -> return [BindJoin bndr join]
     return (totalUsages, env', Rec (concat bindss))
   where 
     env'  = env { sc_how_bound = hb' }
-    hb'   = mkVarEnv [(binderOfPair b, SpecFun) | b <- bs] `plusVarEnv`
+    hb'   = mkVarEnv [(binderOfPair pair, SpecFun) | pair <- pairs] `plusVarEnv`
                     sc_how_bound env
 
 data CallPat = [Var] :-> [SeqCoreTerm]

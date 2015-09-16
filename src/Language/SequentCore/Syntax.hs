@@ -11,10 +11,10 @@
 module Language.SequentCore.Syntax (
   -- * AST Types
   Term(..), Arg, Kont(..), Frame(..), End(..), Join(..), Command(..),
-  Bind(..), BindPair(..), Rhs,
+  Bind(..), BindPair(..),
   Alt(..), AltCon(..), Program, JoinId,
   SeqCoreTerm, SeqCoreArg, SeqCoreKont, SeqCoreFrame, SeqCoreEnd, SeqCoreJoin,
-    SeqCoreCommand, SeqCoreBind, SeqCoreBindPair, SeqCoreRhs, SeqCoreBndr,
+    SeqCoreCommand, SeqCoreBind, SeqCoreBindPair, SeqCoreBndr,
     SeqCoreAlt, SeqCoreProgram,
   -- * Constructors
   mkCommand, mkVarArg, mkLambdas, mkCompute, mkComputeEval,
@@ -27,11 +27,11 @@ module Language.SequentCore.Syntax (
   spanTypes, spanTypeArgs,
   flattenCommand,
   isValueArg, isTypeArg, isCoArg, isTyCoArg, isAppFrame, isValueAppFrame,
-  isTrivial, isTrivialTerm, isTrivialKont, isTrivialJoin, isTrivialRhs,
+  isTrivial, isTrivialTerm, isTrivialKont, isTrivialJoin,
   isReturnKont, isReturn, isDefaultAlt,
   termIsConstruction, termAsConstruction, splitConstruction,
   commandAsSaturatedCall, asSaturatedCall, asValueCommand,
-  binderOfPair, setPairBinder, rhsOfPair, mkBindPair, destBindPair,
+  binderOfPair, setPairBinder,
   bindsTerm, bindsJoin, flattenBind, flattenBinds, bindersOf, bindersOfBinds,
   -- * Calculations
   termType, frameType, applyTypeToArg, applyTypeToArgs, applyTypeToFrames,
@@ -151,10 +151,6 @@ data Command b = Let (Bind b) (Command b)
 data BindPair b = BindTerm b (Term b)
                 | BindJoin b (Join b)
 
--- | A view of the right-hand side of a 'BindPair', whether it binds a term or
--- a parameterized continuation.
-type Rhs b = Either (Term b) (Join b)
-
 -- | A binding. Similar to the @Bind@ datatype from GHC. Can be either a single
 -- non-recursive binding or a mutually recursive block.
 data Bind b     = NonRec (BindPair b) -- ^ A single non-recursive binding.
@@ -185,8 +181,6 @@ type SeqCoreCommand = Command Var
 type SeqCoreBind    = Bind    Var
 -- | Usual instance of 'BindPair', with 'Var's for binders
 type SeqCoreBindPair = BindPair Var
--- | Usual instance of 'Rhs', with 'Var's for binders
-type SeqCoreRhs     = Rhs     Var
 -- | Usual instance of 'Kont', with 'Var's for binders
 type SeqCoreJoin    = Join    Var
 -- | Usual instance of 'Alt', with 'Var's for binders
@@ -465,9 +459,6 @@ isTrivialJoin :: HasId b => Join b -> Bool
 isTrivialJoin (Join xs comm) = all (not . isRuntimeVar) (identifiers xs)
                             && isTrivial comm
 
-isTrivialRhs :: HasId b => Rhs b -> Bool
-isTrivialRhs = either isTrivialTerm isTrivialJoin
-
 -- | True if the given continuation is a return continuation, @Kont [] (Return _)@.
 isReturnKont :: Kont b -> Bool
 isReturnKont (Kont [] Return) = True
@@ -555,18 +546,11 @@ flattenBind (Rec pairs)   = pairs
 flattenBinds :: [Bind b] -> [BindPair b]
 flattenBinds = concatMap flattenBind
 
-rhsOfPair :: BindPair b -> Rhs b
-rhsOfPair (BindTerm _ v)  = Left v
-rhsOfPair (BindJoin _ pk) = Right pk
-
 bindsTerm, bindsJoin :: BindPair b -> Bool
 bindsTerm (BindTerm {}) = True
 bindsTerm (BindJoin {}) = False
 
 bindsJoin pair = not (bindsTerm pair)
-
-mkBindPair :: b -> Rhs b -> BindPair b
-mkBindPair x = either (BindTerm x) (BindJoin x)
 
 binderOfPair :: BindPair b -> b
 binderOfPair (BindTerm x _) = x
@@ -575,9 +559,6 @@ binderOfPair (BindJoin j _) = j
 setPairBinder :: BindPair b -> b -> BindPair b
 setPairBinder (BindTerm _ term) x = BindTerm x term
 setPairBinder (BindJoin _ pk)   j = BindJoin j pk
-
-destBindPair :: BindPair b -> (b, Rhs b)
-destBindPair pair = (binderOfPair pair, rhsOfPair pair)
 
 bindersOf :: Bind b -> [b]
 bindersOf (NonRec pair) = [binderOfPair pair]
@@ -833,15 +814,9 @@ commCheap appCheap (Eval term kont)
 commCheap appCheap (Jump args j)
   = appCheap j (length (filter isValueArg args))
   
-joinCheap :: HasId b => CheapAppMeasure -> Join b -> Bool
-joinCheap appCheap (Join _ comm) = commCheap appCheap comm
-
-rhsCheap :: HasId b => CheapAppMeasure -> Rhs b -> Bool
-rhsCheap appCheap (Left term) = termCheap appCheap term
-rhsCheap appCheap (Right pk)  = joinCheap appCheap pk
-
 bindPairCheap :: HasId b => CheapAppMeasure -> BindPair b -> Bool
-bindPairCheap appCheap = rhsCheap appCheap . rhsOfPair
+bindPairCheap appCheap (BindTerm _ term) = termCheap appCheap term
+bindPairCheap _        (BindJoin _ _   ) = True
 
 -- See the last clause in CoreUtils.exprIsCheap' for explanations
 
@@ -1033,23 +1008,28 @@ instance HasId b => AlphaEq (Command b) where
 -- tracking the correspondences between the bound variables.
 aeqBindIn :: HasId b => AlphaEnv -> Bind b -> Bind b -> Maybe AlphaEnv
 aeqBindIn env (NonRec pair1) (NonRec pair2)
-  = aeqBindPairIn env pair1 pair2
+  = aeqBindPairsIn env [pair1] [pair2]
 aeqBindIn env (Rec pairs1) (Rec pairs2)
-  = if and $ zipWith alpha pairs1 pairs2 then Just env' else Nothing
-  where
-    alpha pair1 pair2
-      = aeqIn env' (rhsOfPair pair1) (rhsOfPair pair2)
-    env'
-      = rnBndrs2 env (identifiers (map binderOfPair pairs1))
-                     (identifiers (map binderOfPair pairs2))
+  = aeqBindPairsIn env pairs1 pairs2
 aeqBindIn _ _ _
   = Nothing
 
-aeqBindPairIn :: HasId b => AlphaEnv -> BindPair b -> BindPair b -> Maybe AlphaEnv
-aeqBindPairIn env pair1 pair2
-  = if aeqIn env' (rhsOfPair pair1) (rhsOfPair pair2) then Just env' else Nothing
-  where env' = rnBndr2 env (identifier (binderOfPair pair1))
-                           (identifier (binderOfPair pair2))
+aeqBindPairsIn :: HasId b => AlphaEnv -> [BindPair b] -> [BindPair b]
+               -> Maybe AlphaEnv
+aeqBindPairsIn env pairs1 pairs2
+  = if alpha pairs1 pairs2 then Just env' else Nothing
+  where
+    alpha (BindTerm _ term1 : pairs1) (BindTerm _ term2 : pairs2)
+      = aeqIn env' term1 term2 && alpha pairs1 pairs2
+    alpha (BindJoin _ join1 : pairs1) (BindJoin _ join2 : pairs2)
+      = aeqIn env' join1 join2 && alpha pairs1 pairs2
+    alpha [] []
+      = True
+    alpha _  _
+      = False
+    env'
+      = rnBndrs2 env (identifiers (map binderOfPair pairs1))
+                     (identifiers (map binderOfPair pairs2))
 
 instance HasId b => AlphaEq (Alt b) where
   aeqIn env (Alt a1 xs1 c1) (Alt a2 xs2 c2)

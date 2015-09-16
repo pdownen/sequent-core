@@ -110,10 +110,12 @@ showBind :: Options -> SeqCoreBindPair -> CoreM ()
 showBind opts pair
   = do
     dflags <- getDynFlags
-    let (x, rhs) = destBindPair pair
+    let x = binderOfPair pair
         idPart = ppr x
         cap = ufCreationThreshold dflags
         sizePart | opt_sizes opts = ppr size
                  | otherwise      = empty
-        size = rhsSize dflags cap rhs
+        size = case pair of
+                 BindTerm _ term -> termSize dflags cap term
+                 BindJoin _ join -> joinSize dflags cap join
     putMsg $ sep [ idPart, sizePart ]

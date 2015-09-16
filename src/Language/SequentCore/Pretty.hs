@@ -47,10 +47,11 @@ ppr_binds_with open mid close binds = vcat $ intersperse space $ ppr_block open 
 ppr_binding :: OutputableBndr b => BindPair b -> SDoc
 ppr_binding pair
   = prefix <+> pprBndr LetBind val_bdr $$
-    hang (ppr val_bdr <+> equals) 2 body
+    hang (ppr val_bdr <+> equals) 2 (pprDeeper $ body pair)
   where
     val_bdr = binderOfPair pair
-    body = pprDeeper $ either pprCoreTerm pprCoreJoin (rhsOfPair pair)
+    body (BindTerm _ term) = ppr term
+    body (BindJoin _ join) = ppr join
     prefix | bindsJoin pair = text "join"
            | otherwise = empty
 

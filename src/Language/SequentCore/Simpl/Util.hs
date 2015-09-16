@@ -117,7 +117,7 @@ mkArgInfo env term@(Var fun) co_m fs end
     vanilla_discounts, arg_discounts :: [Int]
     vanilla_discounts = repeat 0
     arg_discounts = case findDef env fun of
-                        BoundTo { def_guidance = UnfIfGoodArgs { ug_args = discounts } }
+                        BoundToTerm { def_guidance = UnfIfGoodArgs { ug_args = discounts } }
                               -> discounts ++ vanilla_discounts
                         _     -> vanilla_discounts
 

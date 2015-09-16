@@ -1,7 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 
 module Language.SequentCore.Simpl.ExprSize (
-  ExprSize(..), termSize, kontSize, joinSize, commandSize, rhsSize
+  ExprSize(..), termSize, kontSize, joinSize, commandSize
 ) where
 
 import Language.SequentCore.Syntax
@@ -80,7 +80,6 @@ termSize    :: DynFlags -> Int -> SeqCoreTerm    -> Maybe ExprSize
 kontSize    :: DynFlags -> Int -> SeqCoreKont    -> Maybe ExprSize
 joinSize    :: DynFlags -> Int -> SeqCoreJoin    -> Maybe ExprSize
 commandSize :: DynFlags -> Int -> SeqCoreCommand -> Maybe ExprSize
-rhsSize     :: DynFlags -> Int -> SeqCoreRhs     -> Maybe ExprSize
 
 termSize dflags cap term@(Lam {})
   = let (xs, body) = lambdas term
@@ -106,9 +105,6 @@ joinSize dflags cap (Join xs comm)
   where
     (_, _, sizeC) = sizeFuncs dflags cap valBinders
     valBinders = filter isId xs
-
-rhsSize dflags cap = either (termSize dflags cap) (joinSize dflags cap)
-
 
 sizeFuncs :: DynFlags -> Int -> [Id] -> (SeqCoreTerm -> BodySize,
                                          SeqCoreKont -> BodySize,
