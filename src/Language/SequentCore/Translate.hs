@@ -633,7 +633,7 @@ escAnalUnfolding _                                            = return ()
 -- Continuation calling conventions --
 
 -- | The protocol for invoking a given let-bound continuation. Currently all
--- such continuations must be invoked using a jump, so 'ByJump' is the only
+-- such continuations must be invoked using a jump, so @ByJump@ is the only
 -- constructor, but we must still keep track of which arguments are fixed and
 -- should be omitted when converting a function call.
 newtype KontCallConv = ByJump [ArgDesc]
@@ -1007,6 +1007,7 @@ termToCoreExpr val =
     Coercion co  -> Core.Coercion co
     Compute kb c -> commandToCoreExpr kb c
 
+-- | Translates a join point into Core.
 joinToCoreExpr :: Type -> SeqCoreJoin -> Core.CoreExpr
 joinToCoreExpr = joinToCoreExpr' NonRecursive
 
@@ -1021,6 +1022,7 @@ joinToCoreExpr' recFlag retTy (Join xs comm)
     setOneShotLambdaIfId x | isId x = setOneShotLambda x
                            | otherwise = x
 
+-- | Functional representation of expression contexts in Core.
 type CoreContext = Core.CoreExpr -> Core.CoreExpr
 
 -- | Translates a continuation into a function that will wrap a Core expression
@@ -1043,6 +1045,11 @@ endToCoreExpr retTy k =
     Case {- expr -} b as -> \e -> Core.Case e b retTy (map (altToCore retTy) as)
     Return               -> \e -> e
 
+-- | Convert a join id to its Core form. For instance, given a return type of 
+--   String,
+--     @j :: Cont# (exists# a. (# a, Int, Char #))
+--   becomes
+--     @j :: forall a. a -> Int -> Char -> String
 joinIdToCore :: Type -> JoinId -> Id
 joinIdToCore retTy j = maybeAddArity $ j `setIdType` kontTyToCoreTy argTy retTy
   where

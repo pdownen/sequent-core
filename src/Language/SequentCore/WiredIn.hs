@@ -73,6 +73,7 @@ ubxExistsTyCon = mkPrimTyCon ubxExistsTyConName kind [Representational] VoidRep
 mkKontKind :: Kind -> Kind
 mkKontKind kind = mkTyConApp kontKindTyCon [kind]
 
+-- | Form the type of a continuation accepting a value of the given type.
 mkKontTy :: Type -> Type
 mkKontTy ty = mkTyConApp kontTyCon [typeKind ty, ty]
 

@@ -1,3 +1,12 @@
+-- | 
+-- Module      : Language.SequentCore.OccurAnal
+-- Description : Occurrence analysis for Sequent Core
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
+--
+-- Normally occurrence analysis is performed by the simplifier, but if needed, this
+-- module can update a module or a single term on demand.
+
 {-
 %
 % (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -1251,8 +1260,8 @@ occAnalTerm env (Compute ty comm)
 occAnalKont :: OccEnv
             -> UsageDetails         -- ^ Usage details for the term
             -> SeqCoreKont
-            -> (UsageDetails,       -- ^ Usage details for the term *and* continuation
-                SeqCoreKont)
+            -> (UsageDetails,
+                SeqCoreKont)        -- ^ Usage details for the term *and* continuation
 occAnalKont env uds (frames@(App {} : _), end)
   = case occAnalArgs env args []                  of { ( args_uds, args' ) ->
     case occAnalKont env (uds +++ args_uds) kont' of { ( final_uds, (frames'', end') ) ->

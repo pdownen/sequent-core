@@ -18,13 +18,13 @@ module Language.SequentCore.Syntax (
     SeqCoreAlt, SeqCoreProgram,
   -- * Constructors
   mkCommand, mkVarArg, mkLambdas, mkCompute, mkComputeEval,
-  mkAppTerm, mkAppCommand, mkConstruction, mkConstructionCommand,
-  mkCast, mkCastMaybe, castBottomTerm, mkImpossibleCommand,
+  mkAppTerm, mkConstruction, mkConstructionCommand,
+  mkCast, castBottomTerm, mkImpossibleCommand,
   addLets, addLetsToTerm, addNonRec,
   -- * Deconstructors
   lambdas, collectArgs, collectTypeArgs, collectTypeAndOtherArgs, collectArgsUpTo,
   splitCastTerm, splitCastCommand,
-  spanTypes, spanTypeArgs,
+  spanTypes,
   flattenCommand,
   isValueArg, isTypeArg, isCoArg, isTyCoArg, isAppFrame, isValueAppFrame,
   isTrivial, isTrivialTerm, isTrivialKont, isTrivialJoin,
@@ -37,13 +37,13 @@ module Language.SequentCore.Syntax (
   termType, frameType, applyTypeToArg, applyTypeToArgs, applyTypeToFrames,
   termIsBottom, commandIsBottom,
   needsCaseBinding,
-  termIsWorkFree, commandIsWorkFree,
-  termOkForSpeculation, commandOkForSpeculation, kontOkForSpeculation,
-  termOkForSideEffects, commandOkForSideEffects, kontOkForSideEffects,
-  termIsCheap, kontIsCheap, commandIsCheap,
-  termIsExpandable, kontIsExpandable, commandIsExpandable,
+  termIsWorkFree,
+  termOkForSpeculation, commandOkForSpeculation,
+  termOkForSideEffects, commandOkForSideEffects,
+  termIsCheap, commandIsCheap,
+  termIsExpandable, commandIsExpandable,
   CheapAppMeasure, isCheapApp, isExpandableApp,
-  termIsCheapBy, kontIsCheapBy, commandIsCheapBy,
+  termIsCheapBy, commandIsCheapBy,
   -- * Continuation ids
   isJoinId, Language.SequentCore.WiredIn.mkKontTy, kontTyArg,
   -- * Alpha-equivalence
@@ -108,6 +108,14 @@ data Term b     = Lit Literal       -- ^ A primitive literal value.
 -- | An argument, which can be a regular term or a type or coercion.
 type Arg b = Term b
 
+-- | A piece of context for a term. So called because we can think of them as
+-- as stack frames in an idealized abstract machine. Typically a list of frames
+-- is simply a list of arguments, but other bits of context such as casts and
+-- ticks are also frames.
+--
+-- In contrast to an 'End', a 'Frame' takes input and produces output. Thus a
+-- 'Command' can be seen as a pipeline starting from a 'Term', passing through
+-- some 'Frame's, and ending at an 'End'.
 data Frame b    = App {- expr -} (Arg b)
                   -- ^ Apply the value to an argument.
                 | Cast {- expr -} Coercion
@@ -115,6 +123,9 @@ data Frame b    = App {- expr -} (Arg b)
                 | Tick (Tickish Id) {- expr -}
                   -- ^ Annotate the enclosed frame. Used by the profiler.
 
+-- | The end of a continuation. After arguments and casts are applied, we can
+-- do two things to a value: Return it to the calling context or perform a case
+-- analysis.
 data End b      = Return
                   -- ^ Pass to the bound continuation.
                 | Case {- expr -} b [Alt b]
@@ -202,11 +213,15 @@ mkCommand binds (Compute _ comm) frames end
 mkCommand binds term frames end
   = foldr Let (Eval term frames end) binds
 
+-- | Makes an argument out of a variable. Type variables must be represented
+-- using the 'Type' constructor and coercion variables must use the 'Coercion'
+-- constructor; this function chooses as appropriate.
 mkVarArg :: Var -> Arg b
 mkVarArg x | Type.isTyVar x = Type (Type.mkTyVarTy x)
            | Coercion.isCoVar x = Coercion (mkCoVarCo x)
            | otherwise = Var x
 
+-- | Wrap a term in a series of lambdas.
 mkLambdas :: [b] -> Term b -> Term b
 mkLambdas = flip (foldr Lam)
 
@@ -219,21 +234,19 @@ mkCompute ty comm
   = val
   | otherwise
   = Compute ty comm
-  
+
+-- | Forms a term as a computation with a given term and given frames. Helpful
+-- because it works out the Type argument to Compute automatically.
 mkComputeEval :: HasId b => Term b -> [Frame b] -> Term b
 mkComputeEval v fs = mkCompute ty (Eval v fs Return)
   where
     ty = foldl frameType (termType v) fs
 
+-- | Forms a term comprising the application of several arguments to a term.
 mkAppTerm :: HasId b => Term b -> [Term b] -> Term b
-mkAppTerm fun args = mkCompute retTy (mkAppCommand fun args)
-  where
-    (tyArgs, _) = spanTypes args
-    (_, retTy) = Type.splitFunTys $ Type.applyTys (termType fun) tyArgs
+mkAppTerm fun args = mkComputeEval fun (map App args)
 
-mkAppCommand :: Term b -> [Term b] -> Command b
-mkAppCommand fun args = Eval fun (map App args) Return
-
+-- | Forms a term that casts the given term with the given coercion. 
 mkCast :: Term b -> Coercion -> Term b
 mkCast term co | isReflCo co = term
 mkCast (Coercion termCo) co | isCoVarType (pSnd (coercionKind co))
@@ -242,18 +255,14 @@ mkCast (Coercion termCo) co | isCoVarType (pSnd (coercionKind co))
 -- We would need a deep search to find anything besides this very simple case.
 -- Fortunately, this should ensure that successive mkCasts accumulate nicely.
 mkCast (Compute _ (Eval term [Cast co1] Return)) co2
-  = Compute ty (Eval term [Cast (mkTransCo co1 co2)] Return)
-  where
-    ty = pSnd (coercionKind co2)
+  = mkCast term (mkTransCo co1 co2)
 mkCast term co
   = Compute ty (Eval term [Cast co] Return)
   where
     ty = pSnd (coercionKind co)
 
-mkCastMaybe :: SeqCoreTerm -> Maybe Coercion -> SeqCoreTerm
-mkCastMaybe term Nothing   = term
-mkCastMaybe term (Just co) = mkCast term co
-
+-- | Form a term that takes a term assumed to be bottoming and "casts" it to
+-- any other type using an empty case.
 castBottomTerm :: SeqCoreTerm -> Type -> SeqCoreTerm
 castBottomTerm v ty | termTy `Type.eqType` ty = v
                     | otherwise          = Compute ty (Eval v [] (Case wild []))
@@ -261,15 +270,19 @@ castBottomTerm v ty | termTy `Type.eqType` ty = v
     termTy = termType v
     wild = mkWildValBinder termTy
 
+-- | Builds a term that applies a constructor to some arguments.
 mkConstruction :: HasId b => DataCon -> [Type] -> [Term b] -> Term b
 mkConstruction dc tyArgs valArgs
   = mkAppTerm (Var (dataConWorkId dc)) (map Type tyArgs ++ valArgs)
 
+-- | Builds a command that applies a constructor to some arguments.
 mkConstructionCommand :: DataCon -> [Type] -> [Term b] -> Command b
 mkConstructionCommand dc tyArgs valArgs
-  = mkAppCommand (Var (dataConWorkId dc)) (map Type tyArgs ++ valArgs)
+  = Eval (Var (dataConWorkId dc)) (map App (map Type tyArgs ++ valArgs)) Return
 
-mkImpossibleCommand :: Type -> SeqCoreCommand
+-- | Builds a command that throws a runtime error indicating that an
+-- impossible case alternative has been reached.
+mkImpossibleCommand :: Type -> Command b
 mkImpossibleCommand ty
   = Eval (Var rUNTIME_ERROR_ID) [App (Type ty), App errString] Return
   where
@@ -287,7 +300,9 @@ addNonRec (BindTerm bndr rhs) comm
   = mkCommand [] rhs [] (Case bndr [Alt DEFAULT [] comm])
 addNonRec pair comm
   = addLets [NonRec pair] comm
-  
+
+-- | Adds the given bindings to a term. Generally this requires making it into
+-- a Compute, as Let produces a command, not a term.
 addLetsToTerm :: [SeqCoreBind] -> SeqCoreTerm -> SeqCoreTerm
 addLetsToTerm [] term = term
 addLetsToTerm binds term = mkCompute ty (mkCommand binds term [] Return)
@@ -357,9 +372,9 @@ collectArgsUpTo n fs
 spanTypes :: [Arg b] -> ([KindOrType], [Arg b])
 spanTypes = mapWhileJust $ \case { Type ty -> Just ty; _ -> Nothing }
 
-spanTypeArgs :: [Frame b] -> ([KindOrType], [Frame b])
-spanTypeArgs = mapWhileJust $ \case { App (Type ty) -> Just ty; _ -> Nothing }
-
+-- | Put a command into a "flat" representation, as a list of bindings followed
+-- by either ('Left') a term, some frames, and an end comprising a computation
+-- to evaluate; or ('Right') some arguments and a join id to jump to.
 flattenCommand :: Command b -> ([Bind b], Either (Term b, [Frame b], End b) ([Arg b], JoinId))
 flattenCommand = go []
   where
@@ -370,6 +385,8 @@ flattenCommand = go []
 -- TODO Since this function has to look at the end of a list that could be long
 -- (namely the list of frames in the continuation), we should try and find ways
 -- around needing it.
+-- | Given a term, see if it is a coercion wrapping another term and extract
+-- the coercion and the inner term.
 splitCastTerm :: Term b -> (Term b, Maybe Coercion)
 splitCastTerm (Compute _ty comm)
   | (comm', Just co) <- splitCastCommand comm
@@ -377,6 +394,8 @@ splitCastTerm (Compute _ty comm)
   = (mkCompute fromTy comm', Just co)
 splitCastTerm term = (term, Nothing)
 
+-- | Given a command, see if it wraps a cast around a computation and extract
+-- the coercion and the rest of the computation.
 splitCastCommand :: Command b -> (Command b, Maybe Coercion)
 splitCastCommand (Eval term fs Return)
   | not (null fs)
@@ -442,11 +461,17 @@ isTrivialKont :: HasId b => Kont b -> Bool
 isTrivialKont (fs, Return) = all isTrivialFrame fs
 isTrivialKont _            = False
 
+-- | True if the given frame is so simple we can duplicate it freely. This is
+-- true of casts and of erased applications (types and coercions). Ticks are not
+-- considered trivial, since this would cause them to be inlined.
 isTrivialFrame :: HasId b => Frame b -> Bool
 isTrivialFrame (App v)  = isTyCoArg v
 isTrivialFrame (Cast _) = True
 isTrivialFrame (Tick _) = False
 
+-- | True if the given join point is so simple we can duplicate it freely. All
+-- the arguments must be types or coercions and the body must itself be
+-- trivial.
 isTrivialJoin :: HasId b => Join b -> Bool
 isTrivialJoin (Join xs comm) = all (not . isRuntimeVar) (identifiers xs)
                             && isTrivial comm
@@ -480,9 +505,12 @@ commandAsSaturatedCall (Eval term frames end)
 commandAsSaturatedCall (Jump {})
   = Nothing
 
+-- | True if a term is simply a saturated application of a data constructor.
 termIsConstruction :: HasId b => Term b -> Bool
 termIsConstruction = isJust . termAsConstruction
 
+-- | If a term is a saturated application of a data construtor, extract the
+-- constructor and the type and value arguments it's applied to.
 termAsConstruction :: HasId b => Term b -> Maybe (DataCon, [Type], [Term b])
 termAsConstruction (Var id)      | Just dc <- isDataConWorkId_maybe id
                                  , dataConRepArity dc == 0
@@ -492,6 +520,9 @@ termAsConstruction (Var id)      | Just dc <- isDataConWorkId_maybe id
 termAsConstruction (Compute _ c) = commandAsConstruction c
 termAsConstruction _             = Nothing
 
+-- | If a term and a continuation comprise a saturated application of a data
+-- constructor and possibly an outer context, extract the constructor, the
+-- type arguments, the value arguments, and the outer context.
 splitConstruction :: Term b -> Kont b -> Maybe (DataCon, [Type], [Term b], Kont b)
 splitConstruction (Var fid) (frames, end)
   | Just dataCon <- isDataConWorkId_maybe fid
@@ -502,6 +533,8 @@ splitConstruction (Var fid) (frames, end)
 splitConstruction _ _
   = Nothing
 
+-- | If a command is simply a saturated application of a data constructor,
+-- extracts the constructor and its term and type arguments.
 commandAsConstruction :: Command b
                       -> Maybe (DataCon, [Type], [Term b])
 commandAsConstruction (Eval term fs end)
@@ -532,31 +565,39 @@ asValueCommand (Eval term [] Return)
 asValueCommand _
   = Nothing
 
+-- | Get the pairs from a binding.
 flattenBind :: Bind b -> [BindPair b]
 flattenBind (NonRec pair) = [pair]
 flattenBind (Rec pairs)   = pairs
 
+-- | Get all the pairs from a list of bindings.
 flattenBinds :: [Bind b] -> [BindPair b]
 flattenBinds = concatMap flattenBind
 
 bindsTerm, bindsJoin :: BindPair b -> Bool
+-- | True if this bind pair binds a term.
 bindsTerm (BindTerm {}) = True
 bindsTerm (BindJoin {}) = False
 
+-- | True if this bind pair binds a join point.
 bindsJoin pair = not (bindsTerm pair)
 
+-- | Get the binder from a binding pair.
 binderOfPair :: BindPair b -> b
 binderOfPair (BindTerm x _) = x
 binderOfPair (BindJoin j _) = j
 
+-- | Change the binder in a binding pair (of either kind).
 setPairBinder :: BindPair b -> b -> BindPair b
 setPairBinder (BindTerm _ term) x = BindTerm x term
 setPairBinder (BindJoin _ pk)   j = BindJoin j pk
 
+-- | Get the binders from a binding.
 bindersOf :: Bind b -> [b]
 bindersOf (NonRec pair) = [binderOfPair pair]
 bindersOf (Rec pairs) = map binderOfPair pairs
 
+-- | Get all the binders in a list of bindings.
 bindersOfBinds :: [Bind b] -> [b]
 bindersOfBinds = concatMap bindersOf
 
@@ -582,10 +623,14 @@ frameType ty (App _)            = Type.funResultTy ty
 frameType _  (Cast co)          = pSnd (coercionKind co)
 frameType ty (Tick _)           = ty
 
+-- | Compute the result type if a value of the given type (assumed to be a
+-- function or forall) is applied to the given argument.
 applyTypeToArg :: Type -> Arg b -> Type
 applyTypeToArg ty (Type tyArg) = ty `Type.applyTy` tyArg
 applyTypeToArg ty _            = Type.funResultTy ty
 
+-- | Compute the result type if a value of the given type (assumed to be a
+-- function or forall) is applied to the given arguments.
 applyTypeToArgs :: Type -> [Arg b] -> Type
 applyTypeToArgs ty [] = ty
 applyTypeToArgs ty args@(Type _ : _)
@@ -594,13 +639,14 @@ applyTypeToArgs ty args@(Type _ : _)
     (tyArgs, args') = spanTypes args
 applyTypeToArgs ty (_ : args)
   = applyTypeToArgs (Type.funResultTy ty) args
-  
+
+-- | Compute the result type if the given frames are applied to the given value.
 applyTypeToFrames :: Type -> [Frame b] -> Type
 applyTypeToFrames ty [] = ty
 applyTypeToFrames ty fs@(App (Type _) : _)
   = applyTypeToFrames (ty `Type.applyTys` tyArgs) fs'
   where
-    (tyArgs, fs') = spanTypeArgs fs
+    (tyArgs, fs') = collectTypeArgs fs
 applyTypeToFrames ty (App _ : fs)
   = applyTypeToFrames (Type.funResultTy ty) fs
 applyTypeToFrames _  (Cast co : fs)
@@ -608,7 +654,9 @@ applyTypeToFrames _  (Cast co : fs)
 applyTypeToFrames ty (Tick _ : fs)
   = applyTypeToFrames ty fs
 
--- | Compute (a conservative estimate of) the arity of a term.
+-- | Compute (a conservative estimate of) the arity of a term, in the simplest
+-- manner possible: Count the value lambdas, then if the body is a variable, add
+-- its advertised arity.
 termArity :: HasId b => Term b -> Int
 termArity (Var x)
   | isId x = idArity x
@@ -640,11 +688,10 @@ commandIsBottom (Eval (Var x) fs _)
 commandIsBottom (Jump _ j) = isBottomingId j
 commandIsBottom _          = False
 
-termIsWorkFree    :: HasId b => Term    b -> Bool
-commandIsWorkFree :: HasId b => Command b -> Bool
-
-termIsWorkFree    = termWF 0
-commandIsWorkFree = commWF 0
+-- | Find whether a term performs no work whatsoever. Otherwise we don't want to
+-- inline it. (See Note [exprIsWorkFree] in CoreUtils.)
+termIsWorkFree :: HasId b => Term b -> Bool
+termIsWorkFree = termWF 0
 
 termWF :: HasId b => Int -> Term b -> Bool
   -- termWF n v == is v work-free when its continuation applies n value args?
@@ -686,16 +733,18 @@ needsCaseBinding ty rhs
 
 termOkForSpeculation,    termOkForSideEffects    :: Term b    -> Bool
 commandOkForSpeculation, commandOkForSideEffects :: Command b -> Bool
-kontOkForSpeculation,    kontOkForSideEffects    :: Kont b    -> Bool
 
+-- | Find whether a term is safe to evaluate eagerly. See comments on
+-- exprOkForSpeculation in CoreUtils.
 termOkForSpeculation = termOk primOpOkForSpeculation
+-- | Find whether a term is free of side effects from primops.
 termOkForSideEffects = termOk primOpOkForSideEffects
 
+-- | Find whether a command is safe to execute eagerly. See comments on
+-- exprOkForSpeculation in CoreUtils.
 commandOkForSpeculation = commOk primOpOkForSpeculation
+-- | Find whether a command is free of side effects from primops.
 commandOkForSideEffects = commOk primOpOkForSideEffects
-
-kontOkForSpeculation = kontOk primOpOkForSpeculation
-kontOkForSideEffects = kontOk primOpOkForSideEffects
 
 termOk :: (PrimOp -> Bool) -> Term b -> Bool
 termOk primOpOk (Var id)         = appOk primOpOk id []
@@ -765,17 +814,20 @@ appOk primOpOk fid args
     isDivOp _                = False
 
 termIsCheap, termIsExpandable :: HasId b => Term b -> Bool
+-- | See comments on exprIsCheap in CoreUtils.
 termIsCheap      = termCheap isCheapApp
+-- | See comments on exprIsExpandable in CoreUtils.
 termIsExpandable = termCheap isExpandableApp
 
-kontIsCheap, kontIsExpandable :: HasId b => Kont b -> Bool
-kontIsCheap      = kontCheap isCheapApp
-kontIsExpandable = kontCheap isExpandableApp
-
 commandIsCheap, commandIsExpandable :: HasId b => Command b -> Bool
+-- | See comments on exprIsCheap in CoreUtils.
 commandIsCheap      = commCheap isCheapApp
+-- | See comments on exprIsExpandable in CoreUtils.
 commandIsExpandable = commCheap isExpandableApp
 
+-- | A type for predicates that determine whether an application is cheap, given
+-- the id of the function and the number of value arguments. See 'termIsCheapBy'
+-- and 'commandIsCheapBy'.
 type CheapAppMeasure = Id -> Int -> Bool
 
 termCheap :: HasId b => CheapAppMeasure -> Term b -> Bool
@@ -838,9 +890,12 @@ cutCheap appCheap _ [] end = endCheap appCheap end
 cutCheap _ _ _ _ = False
     
 isCheapApp, isExpandableApp :: CheapAppMeasure
+-- | The default cheapness predicate used by 'termIsCheap' and 'commandIsCheap'.
 isCheapApp fid valArgCount = isDataConWorkId fid
                            || valArgCount == 0
                            || valArgCount < idArity fid
+-- | The default cheapness predicate used by 'termIsExpandable' and
+-- 'commandIsExpandable'.
 isExpandableApp fid valArgCount = isConLikeId fid
                                 || valArgCount < idArity fid
                                 || allPreds valArgCount (idType fid)
@@ -852,22 +907,25 @@ isExpandableApp fid valArgCount = isConLikeId fid
       , Type.isPredTy argTy = allPreds (n-1) ty'
       | otherwise = False
 
+-- | Call 'termIsCheap' using an alternative cheapness predicate.
 termIsCheapBy    :: HasId b => CheapAppMeasure -> Term b    -> Bool
-kontIsCheapBy    :: HasId b => CheapAppMeasure -> Kont b    -> Bool
+-- | Call 'commandIsCheap' using an alternative cheapness predicate.
 commandIsCheapBy :: HasId b => CheapAppMeasure -> Command b -> Bool
 
 termIsCheapBy    = termCheap
-kontIsCheapBy    = kontCheap
 commandIsCheapBy = commCheap
 
 --------------------------------------------------------------------------------
 -- Continuation ids
 --------------------------------------------------------------------------------
 
--- | Find whether an id is a continuation id.
+-- | Find whether an id is a join id.
 isJoinId :: Id -> Bool
 isJoinId x = isKontTy (idType x)
 
+-- | Find the type of the argument to a continuation of the given type. For a
+-- join point, this will be either an unboxed tuple or an unboxed existential
+-- (a fiction of Sequent Core; see "Language.SequentCore.WiredIn").
 kontTyArg :: Type -> Type
 kontTyArg ty = isKontTy_maybe ty `orElse` pprPanic "kontTyArg" (ppr ty)
 
@@ -875,8 +933,11 @@ kontTyArg ty = isKontTy_maybe ty `orElse` pprPanic "kontTyArg" (ppr ty)
 -- Alpha-Equivalence
 --------------------------------------------------------------------------------
 
+-- | Find whether two terms are obviously equal, expending minimal effort.
 cheapEqTerm    :: Term b -> Term b -> Bool
+-- | Find whether two frames are obviously equal, expending minimal effort.
 cheapEqFrame   :: Frame b -> Frame b -> Bool
+-- | Find whether two commands are obviously equal, expending minimal effort.
 cheapEqCommand :: Command b -> Command b -> Bool
 
 cheapEqTerm (Var v1)   (Var v2)   = v1==v2

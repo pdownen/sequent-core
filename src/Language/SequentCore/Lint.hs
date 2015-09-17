@@ -1,5 +1,14 @@
 {-# LANGUAGE MultiWayIf #-}
 
+-- | 
+-- Module      : Language.SequentCore.Lint
+-- Description : Type checker for Sequent Core
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
+--
+-- Provides a sanity check for Sequent Core transformations in the tradition of
+-- CoreLint.
+
 module Language.SequentCore.Lint ( lintCoreBindings, lintTerm ) where
 
 import Language.SequentCore.Syntax

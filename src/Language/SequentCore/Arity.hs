@@ -1,3 +1,11 @@
+-- | 
+-- Module      : Language.SequentCore.Arity
+-- Description : Arity analysis and eta-expansion
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
+--
+-- Arity and eta expansion
+
 {-
 %
 % (c) The University of Glasgow 2006
@@ -10,7 +18,6 @@
 {-# LANGUAGE CPP, ViewPatterns #-}
 {-# OPTIONS -fno-warn-tabs #-}
 
--- | Arity and eta expansion
 module Language.SequentCore.Arity (
         manifestArity, termArity, termBotStrictness_maybe,
         termEtaExpandArity, findRhsArity, CheapMeasure, etaExpand
