@@ -12,10 +12,10 @@ module Language.SequentCore.Syntax (
   -- * AST Types
   Term(..), Arg, Kont(..), Frame(..), End(..), Join(..), Command(..),
   Bind(..), BindPair(..), Rhs,
-  Alt(..), AltCon(..), Expr(..), Program, JoinId,
+  Alt(..), AltCon(..), Program, JoinId,
   SeqCoreTerm, SeqCoreArg, SeqCoreKont, SeqCoreFrame, SeqCoreEnd, SeqCoreJoin,
     SeqCoreCommand, SeqCoreBind, SeqCoreBindPair, SeqCoreRhs, SeqCoreBndr,
-    SeqCoreAlt, SeqCoreExpr, SeqCoreProgram,
+    SeqCoreAlt, SeqCoreProgram,
   -- * Constructors
   mkCommand, mkVarArg, mkLambdas, mkCompute, mkComputeEval,
   mkAppTerm, mkAppCommand, mkConstruction, mkConstructionCommand,
@@ -164,12 +164,6 @@ data Bind b     = NonRec (BindPair b) -- ^ A single non-recursive binding.
 -- bound variables (empty for a literal), and the body as a 'Command'.
 data Alt b      = Alt AltCon [b] (Command b)
 
--- | Some expression -- a term, a command, or a continuation. Useful for
--- writing mutually recursive functions.
-data Expr a     = T { unT :: Term a }
-                | C { unC :: Command a }
-                | K { unK :: Kont a }
-
 -- | An entire program.
 type Program a  = [Bind a]
 
@@ -197,8 +191,6 @@ type SeqCoreRhs     = Rhs     Var
 type SeqCoreJoin    = Join    Var
 -- | Usual instance of 'Alt', with 'Var's for binders
 type SeqCoreAlt     = Alt     Var
--- | Usual instance of 'Expr', with 'Var's for binders
-type SeqCoreExpr    = Expr    Var
 -- | Usual instance of 'Term', with 'Var's for binders
 type SeqCoreProgram = Program Var
 

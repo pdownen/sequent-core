@@ -1,3 +1,5 @@
+{-# LANGUAGE BangPatterns #-}
+
 module Language.SequentCore.Simpl.ExprSize (
   ExprSize(..), termSize, kontSize, joinSize, commandSize, rhsSize
 ) where
@@ -80,53 +82,55 @@ joinSize    :: DynFlags -> Int -> SeqCoreJoin    -> Maybe ExprSize
 commandSize :: DynFlags -> Int -> SeqCoreCommand -> Maybe ExprSize
 rhsSize     :: DynFlags -> Int -> SeqCoreRhs     -> Maybe ExprSize
 
--- We have three mutually recursive functions, but only one argument changes
--- between recursive calls; easiest to use one recursive function that takes
--- a sum
-
-bodySize :: DynFlags -> Int -> [Id] -> SeqCoreExpr -> BodySize
-
 termSize dflags cap term@(Lam {})
   = let (xs, body) = lambdas term
         valBinders = filter isId xs
-    in body2ExprSize valBinders $ bodySize dflags cap valBinders (T body)
+        (sizeT, _, _) = sizeFuncs dflags cap valBinders
+    in body2ExprSize valBinders $ sizeT body
 termSize dflags cap term
-  = body2ExprSize [] $ bodySize dflags cap [] (T term)
+  = body2ExprSize [] $ sizeT term
+  where
+    (sizeT, _, _) = sizeFuncs dflags cap []
 
 commandSize dflags cap comm
-  = body2ExprSize [] $ bodySize dflags cap [] (C comm)
+  = body2ExprSize [] $ sizeC comm
+  where
+    (_, _, sizeC) = sizeFuncs dflags cap []
 
-kontSize dflags cap kont = body2ExprSize [] $ bodySize dflags cap [] (K kont)
+kontSize dflags cap kont = body2ExprSize [] $ sizeK kont
+  where
+    (_, sizeK, _) = sizeFuncs dflags cap []
 
 joinSize dflags cap (Join xs comm)
-  = let valBinders = filter isId xs
-    in body2ExprSize valBinders $ bodySize dflags cap valBinders (C comm)
+  = body2ExprSize valBinders $ sizeC comm
+  where
+    (_, _, sizeC) = sizeFuncs dflags cap valBinders
+    valBinders = filter isId xs
 
 rhsSize dflags cap = either (termSize dflags cap) (joinSize dflags cap)
 
 
-tStize ::  args -> (TErm -> Int, Join->Int, Cmd->Int)
-
-termSize args = case tSize args of (a,_,_) = a
-
-bodySize dflags cap topArgs expr
-  = cap `seq` size expr -- use seq to unbox cap now; we will use it often
+sizeFuncs :: DynFlags -> Int -> [Id] -> (SeqCoreTerm -> BodySize,
+                                         SeqCoreKont -> BodySize,
+                                         SeqCoreCommand -> BodySize)
+sizeFuncs dflags !cap topArgs
+  = (sizeT, sizeK, sizeC)
   where
-    size (T (Type _))       = sizeZero
-    size (T (Coercion _))   = sizeZero
-    size (T (Var x))        = sizeCall x [] 0
-    size (T (Compute _ comm)) = size (C comm)
-    size (T (Lit lit))      = sizeN (litSize lit)
-    size (T (Lam x body))   | isId x, not (isRealWorldId x)
-                            = lamScrutDiscount dflags (size (T body) `addSizeN` 10)
-                            | otherwise
-                            = size (T body)
+    sizeT (Type _)       = sizeZero
+    sizeT (Coercion _)   = sizeZero
+    sizeT (Var x)        = sizeCall x [] 0
+    sizeT (Compute _ comm) = sizeC comm
+    sizeT (Lit lit)      = sizeN (litSize lit)
+    sizeT (Lam x body)   | isId x, not (isRealWorldId x)
+                         = lamScrutDiscount dflags (sizeT body `addSizeN` 10)
+                         | otherwise
+                         = sizeT body
     
-    size (K (Kont fs end))  = foldr addSizeNSD (sizeEnd end) (map sizeFrame fs)
+    sizeK (Kont fs end)  = foldr addSizeNSD (sizeEnd end) (map sizeFrame fs)
 
-    size (C (Let b c))      = addSizeNSD (sizeBind b) (size (C c))
-    size (C (Eval v k))     = sizeCut v k
-    size (C (Jump args j))  = sizeJump args j
+    sizeC (Let b c)      = addSizeNSD (sizeBind b) (sizeC c)
+    sizeC (Eval v k)     = sizeCut v k
+    sizeC (Jump args j)  = sizeJump args j
     
     sizeFrame (App arg)     = sizeArg arg
     sizeFrame _             = sizeZero
@@ -160,10 +164,10 @@ bodySize dflags cap topArgs expr
         combineSizes tot _ = tot -- must be TooBig
 
     sizeCut term kont
-      = size (T term) `addSizeOfKont` kont
+      = sizeT term `addSizeOfKont` kont
 
     sizeArg :: SeqCoreTerm -> BodySize
-    sizeArg arg = size (T arg)
+    sizeArg arg = sizeT arg
 
     sizeArgs :: [SeqCoreTerm] -> BodySize
     sizeArgs args = foldr (addSizeNSD . sizeArg) sizeZero args
@@ -179,29 +183,29 @@ bodySize dflags cap topArgs expr
            _                -> funSize dflags topArgs fun (length valArgs) voids
 
     sizeAlt :: SeqCoreAlt -> BodySize
-    sizeAlt (Alt _ _ rhs) = size (C rhs) `addSizeN` 10
+    sizeAlt (Alt _ _ rhs) = sizeC rhs `addSizeN` 10
 
     sizeAlts :: [SeqCoreAlt] -> BodySize
     sizeAlts alts = foldr (addAltSize . sizeAlt) sizeZero alts
 
     sizeBind :: SeqCoreBind -> BodySize
     sizeBind (NonRec (BindTerm x rhs))
-      = size (T rhs) `addSizeN` allocSize
+      = sizeT rhs `addSizeN` allocSize
       where
         allocSize
           -- An unlifted type has no heap allocation
           | isUnLiftedType (idType x) =  0
           | otherwise                 = 10
     sizeBind (NonRec (BindJoin _p (Join _xs comm)))
-      = size (C comm)
+      = sizeC comm
 
     sizeBind (Rec pairs)
       = foldr (addSizeNSD . pairSize) (sizeN allocSize) pairs
       where
         allocSize                     = 10 * length (filter bindsTerm pairs)
-        pairSize (BindTerm _x rhs)    = size (T rhs)
+        pairSize (BindTerm _x rhs)    = sizeT rhs
         pairSize (BindJoin _p (Join _xs comm))
-                                      = size (C comm)
+                                      = sizeC comm
 
     sizeJump :: [SeqCoreArg] -> JoinId -> BodySize
     sizeJump args j
@@ -231,7 +235,7 @@ bodySize dflags cap topArgs expr
     addSizeOfKont :: BodySize -> SeqCoreKont -> BodySize
     addSizeOfKont size1 kont
       | isPassThroughKont kont = size1
-      | otherwise              = size1 `addSizeNSD` size (K kont)
+      | otherwise              = size1 `addSizeNSD` sizeK kont
 
     isPassThroughKont :: Kont b -> Bool
     isPassThroughKont (Kont _  (Case {}))  = False

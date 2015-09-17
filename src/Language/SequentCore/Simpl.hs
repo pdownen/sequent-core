@@ -2037,23 +2037,24 @@ mkDupableAlt env caseBndr alt@(Alt altCon bndrs rhs)
             
 commandIsDupable :: DynFlags -> SeqCoreCommand -> Bool
 commandIsDupable dflags c
-  = isJust (go dupAppSize (C c))
+  = isJust (goC dupAppSize c)
   where
-    go n (C (Eval v k))    = go n  (T v) >>= \n' ->
-                             go n' (K k)
-  
-    go n (T (Type {}))     = Just n
-    go n (T (Coercion {})) = Just n
-    go n (T (Var {}))      = decrement n
-    go n (T (Lit lit))     | litIsDupable dflags lit = decrement n
+    goC n (Eval v k)    = goT n  v >>= \n' ->
+                          goK n' k
+    goC _ _             = Nothing
     
-    go n (K (Kont fs Return)) = goF n fs
+    goT n (Type {})     = Just n
+    goT n (Coercion {}) = Just n
+    goT n (Var {})      = decrement n
+    goT n (Lit lit)     | litIsDupable dflags lit = decrement n
+    goT _ _             = Nothing
     
-    go _ _ = Nothing
+    goK n (Kont fs Return) = goF n fs
+    goK _ _                = Nothing
     
     goF n (Tick _ : fs) = goF n fs
     goF n (Cast _ : fs) = goF n fs
-    goF n (App  v : fs) = go n (T v) >>= \n' ->
+    goF n (App  v : fs) = goT n v >>= \n' ->
                           goF n' fs
     goF n []            = Just n
     
