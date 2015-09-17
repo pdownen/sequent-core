@@ -122,10 +122,10 @@ sizeFuncs dflags !cap topArgs
                          | otherwise
                          = sizeT body
     
-    sizeK (Kont fs end)  = foldr addSizeNSD (sizeEnd end) (map sizeFrame fs)
+    sizeK (fs, end)      = foldr addSizeNSD (sizeEnd end) (map sizeFrame fs)
 
     sizeC (Let b c)      = addSizeNSD (sizeBind b) (sizeC c)
-    sizeC (Eval v k)     = sizeCut v k
+    sizeC (Eval v fs e)  = sizeCut v fs e
     sizeC (Jump args j)  = sizeJump args j
     
     sizeFrame (App arg)     = sizeArg arg
@@ -134,16 +134,16 @@ sizeFuncs dflags !cap topArgs
     sizeEnd Return          = sizeZero
     sizeEnd (Case _ alts)   = sizeAlts alts
     
-    sizeCut :: SeqCoreTerm -> SeqCoreKont -> BodySize
+    sizeCut :: SeqCoreTerm -> [SeqCoreFrame] -> SeqCoreEnd -> BodySize
     -- Compare this clause to size_up_app in CoreUnfold; already having the
     -- function and arguments at hand avoids some acrobatics
-    sizeCut (Var f) kont@(Kont (App {} : _) _)
-      = let (args, kont') = collectArgs kont
+    sizeCut (Var f) frames@(App {} : _) end
+      = let (args, fs')   = collectArgs frames
             realArgs      = filter (not . isTyCoArg) args
             voids         = count isRealWorldTerm realArgs
         in sizeArgs realArgs `addSizeNSD` sizeCall f realArgs voids
-                             `addSizeOfKont` kont'
-    sizeCut (Var x) (Kont [] (Case _b alts))
+                             `addSizeOfKont` (fs', end)
+    sizeCut (Var x) [] (Case _b alts)
       | x `elem` topArgs
       = combineSizes total max
       where
@@ -159,8 +159,8 @@ sizeFuncs dflags !cap topArgs
                      totResDisc
         combineSizes tot _ = tot -- must be TooBig
 
-    sizeCut term kont
-      = sizeT term `addSizeOfKont` kont
+    sizeCut term fs end
+      = sizeT term `addSizeOfKont` (fs, end)
 
     sizeArg :: SeqCoreTerm -> BodySize
     sizeArg arg = sizeT arg
@@ -234,8 +234,8 @@ sizeFuncs dflags !cap topArgs
       | otherwise              = size1 `addSizeNSD` sizeK kont
 
     isPassThroughKont :: Kont b -> Bool
-    isPassThroughKont (Kont _  (Case {}))  = False
-    isPassThroughKont (Kont fs Return)     = all passThrough fs
+    isPassThroughKont (_,  Case {})  = False
+    isPassThroughKont (fs, Return)   = all passThrough fs
       where
         passThrough f = case f of
                           Tick _  -> True

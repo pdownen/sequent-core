@@ -16,7 +16,7 @@ module Language.SequentCore.Simpl (plugin) where
 import Language.SequentCore.Arity
 import Language.SequentCore.Lint
 import Language.SequentCore.OccurAnal
-import Language.SequentCore.Pretty (pprTopLevelBinds)
+import Language.SequentCore.Pretty (pprTopLevelBinds, pprCoreKont)
 import Language.SequentCore.Simpl.Env
 import Language.SequentCore.Simpl.Monad
 import Language.SequentCore.Simpl.Util
@@ -447,7 +447,7 @@ prepareRhsTerm env level x (Compute ty comm)
     (flts, _, term') <- prepComm env comm
     return (flts, term')
   where
-    prepComm env (Eval term (Kont fs Return))
+    prepComm env (Eval term fs Return)
       = do
         (_isExp, flts, env', fs', co_maybe) <- go (0 :: Int) fs
         case co_maybe of
@@ -465,13 +465,13 @@ prepareRhsTerm env level x (Compute ty comm)
                      -- of x' should be - namely those of x. So we propagate
                      -- some of the idInfo over.
                      let Pair fromTy _toTy = coercionKind co
-                         rhs' = mkCompute fromTy (Eval term (Kont fs' Return))
+                         rhs' = mkCompute fromTy (Eval term fs' Return)
                          info = idInfo x
                          sanitizedInfo = vanillaIdInfo `setStrictnessInfo` strictnessInfo info
                                                        `setDemandInfo` demandInfo info
                      (flts', rhs'') <- makeTrivialWithInfo level env' sanitizedInfo rhs'
                      return (flts `addFloats` flts', env', mkCast rhs'' co)
-          Nothing -> return (flts, env', Compute ty (Eval term (Kont fs' Return)))
+          Nothing -> return (flts, env', Compute ty (Eval term fs' Return))
       where
         -- The possibility of a coercion split makes all of this tricky. Suppose
         -- we have
@@ -812,7 +812,7 @@ simplCommand env (Let (NonRec pair) comm)
     simplNonRecInCommand env (staticPart env) pair mk_if_strict $
       \env' -> simplCommand env' comm -- Called if the binding is lazy or gets
                                       -- pre-inlined
-simplCommand env (Eval term (Kont fs end))
+simplCommand env (Eval term fs end)
   = simplTermInCommand (zapKontSubstEnvs env) term Nothing
                        (Incoming (termStaticPart env) <$> fs)
                        (Incoming (staticPart env) end)
@@ -1131,7 +1131,7 @@ simplKontFrame env ai@(ArgInfo { ai_strs = str:_
                        , mk_end = end }
         (env', _ty') = enterKontScope env cci (termType arg)
         env_final    = env' `setRetKont` mk
-    simplCommand env_final (Eval arg (Kont [] Return))
+    simplCommand env_final (Eval arg [] Return)
   | otherwise
   = do
     -- Don't float out of lazy arguments (see Simplify.rebuildCall)
@@ -1247,8 +1247,8 @@ simplKontAfterRules env ai (Case case_bndr [Alt _ bndrs rhs])
  
     case_bndr_evald_next :: SeqCoreCommand -> Bool
       -- See Note [Case binder next]
-    case_bndr_evald_next (Eval (Var v) _) = v == case_bndr
-    case_bndr_evald_next _                = False
+    case_bndr_evald_next (Eval (Var v) _ _) = v == case_bndr
+    case_bndr_evald_next _                  = False
       -- Could allow for let bindings,
       -- but the original code in Simplify suggests doing so would be expensive
       
@@ -1266,7 +1266,7 @@ simplKontAfterRules env ai (Case x alts)
                  Just co -> ai' { ai_frames = Cast co : ai_frames ai' }
                  Nothing -> ai'
     dflags <- getDynFlags
-    Kont fs' end' <- mkCase dflags x' alts'
+    (fs', end') <- mkCase dflags x' alts'
     let ai_final = addFramesToArgInfo ai'' fs'
         term_final = argInfoToTerm ai_final
     addingFloats flts $ simplKontDone env' term_final end'
@@ -1321,11 +1321,11 @@ simplKontDone env term end
   | tracing
   , pprTraceShort "simplKontDone" (ppr env $$ ppr term $$ ppr end) False
   = undefined
-  | Compute _ (Eval term' (Kont fs Return)) <- term
+  | Compute _ (Eval term' fs Return) <- term
       -- Common code path: simplKontAfterRules -> invokeKont -> simplKontDone
-  = return (emptyFloats, Eval term' (Kont fs end))
+  = return (emptyFloats, Eval term' fs end)
   | otherwise
-  = return (emptyFloats, mkCommand [] term (Kont [] end))
+  = return (emptyFloats, mkCommand [] term [] end)
 
 -----------
 -- Jumps --
@@ -1475,7 +1475,7 @@ addAltUnfoldings env scrut case_bndr con_app
              -- See Note [Add unfolding for scrutinee]
              (env2, _) = case scrut of
                       Just (Var v)           -> setDef env1 v con_app_def
-                      Just (Compute _ (Eval (Var v) (Kont [Cast co] Return)))
+                      Just (Compute _ (Eval (Var v) [Cast co] Return))
                                              -> setDef env1 v $
                                                 mkTermDef env1 NotTopLevel (mkCast con_app (mkSymCo co))
                       _                      -> (env1, undefined)
@@ -1533,8 +1533,9 @@ knownCon env scrut dc tyArgs valArgs bndr binds rhs
                                          -- but binds are InBndrs
                                  ; let con_app = mkCompute (substTy env (idType bndr)) $
                                                  Eval (Var (dataConWorkId dc))
-                                                      (Kont (map (App . Type) tyArgs ++
-                                                             map App args) Return)
+                                                      (map (App . Type) tyArgs ++
+                                                       map App args)
+                                                       Return
                                  ; simplNonRecOut env bndr con_app }
 
 missingAlt :: SimplEnv -> Id -> [InAlt] -> SimplM (Floats, OutCommand)
@@ -1580,7 +1581,7 @@ tryRules env rules fn args
           [ text "Rule:" <+> ftext (ru_name rule)
           , text "Before:" <+> hang (ppr fn) 2 (sep (map ppr $ take arity args))
           , text "After: " <+> ppr rule_rhs
-          , text "Cont:  " <+> ppr (Kont (map App $ drop arity args) Return) ]
+          , text "Cont:  " <+> pprCoreKont (map App $ drop arity args, Return) ]
 
       | dopt Opt_D_dump_rule_firings dflags
       = log_rule dflags Opt_D_dump_rule_firings "Rule fired:" $
@@ -2016,7 +2017,7 @@ mkDupableKont env ty kont
         (env', j) <- mkFreshVar env name kontTy
         let (env'', x) = enterScope env' (mkKontArgId ty)
             env_rhs   = env'' `setRetKont` mk
-            join_rhs  = Join [x] (Eval (Var x) (Kont [] Return))
+            join_rhs  = Join [x] (Eval (Var x) [] Return)
             join_kont = Case x [Alt DEFAULT [] (Jump [Var x] j)]
         (flts, env_final) <- simplJoinBind env'' j (staticPart env_rhs) j join_rhs NonRecursive
         return (flts, env_final, join_kont)
@@ -2079,8 +2080,9 @@ commandIsDupable :: DynFlags -> SeqCoreCommand -> Bool
 commandIsDupable dflags c
   = isJust (goC dupAppSize c)
   where
-    goC n (Eval v k)    = goT n  v >>= \n' ->
-                          goK n' k
+    goC n (Eval v fs Return)
+                        = goT n  v >>= \n' ->
+                          goF n' fs
     goC _ _             = Nothing
     
     goT n (Type {})     = Just n
@@ -2088,9 +2090,6 @@ commandIsDupable dflags c
     goT n (Var {})      = decrement n
     goT n (Lit lit)     | litIsDupable dflags lit = decrement n
     goT _ _             = Nothing
-    
-    goK n (Kont fs Return) = goF n fs
-    goK _ _                = Nothing
     
     goF n (Tick _ : fs) = goF n fs
     goF n (Cast _ : fs) = goF n fs

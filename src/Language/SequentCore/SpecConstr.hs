@@ -208,11 +208,11 @@ specInTerm _ v
   = return (emptyScUsage, v)
 
 specInKont :: ScEnv -> SeqCoreKont -> CoreM (ScUsage, SeqCoreKont)
-specInKont env (Kont frames end)
+specInKont env (frames, end)
   = do
     (usages, frames') <- mapAndUnzipM (specInFrame env) frames
     (usage2, end') <- specInEnd env end
-    return (mconcat usages <> usage2, Kont frames' end')
+    return (mconcat usages <> usage2, (frames', end'))
 
 specInFrame :: ScEnv -> SeqCoreFrame -> CoreM (ScUsage, SeqCoreFrame)
 specInFrame env (App v)
@@ -258,27 +258,27 @@ specInCommand env (Let bind comm)
     (usage1, env', bind') <- specBind env bind
     (usage2, comm') <- specInCommand env' comm
     return (usage1 <> usage2, Let bind' comm')
-specInCommand env (Eval term kont)
+specInCommand env (Eval term frames end)
   = do
-    (usage, term', kont') <- specInCut env term kont
-    return (usage, Eval term' kont')
+    (usage, term', frames', end') <- specInCut env term frames end
+    return (usage, Eval term' frames' end')
 specInCommand env (Jump args j)
   = do
     -- TODO Maybe specialize join points, too?
     (usages, args') <- mapAndUnzipM (specInTerm env) args
     return (mconcat usages, Jump args' j)
     
-specInCut :: ScEnv -> SeqCoreTerm -> SeqCoreKont
-        -> CoreM (ScUsage, SeqCoreTerm, SeqCoreKont)
-specInCut env v k
+specInCut :: ScEnv -> SeqCoreTerm -> [SeqCoreFrame] -> SeqCoreEnd
+        -> CoreM (ScUsage, SeqCoreTerm, [SeqCoreFrame], SeqCoreEnd)
+specInCut env v fs e
   = do
-    let u = usageFromCut env v k
+    let u = usageFromCut env v fs e
     (u_v, v') <- specInTerm env v
-    (u_k, k') <- specInKont env k
-    return (u <> u_v <> u_k, v', k')
+    (u_k, (fs', e')) <- specInKont env (fs, e)
+    return (u <> u_v <> u_k, v', fs', e')
 
-usageFromCut :: ScEnv -> SeqCoreTerm -> SeqCoreKont -> ScUsage
-usageFromCut env (Var x) (Kont [] (Case {}))
+usageFromCut :: ScEnv -> SeqCoreTerm -> [SeqCoreFrame] -> SeqCoreEnd -> ScUsage
+usageFromCut env (Var x) [] (Case {})
   | Just SpecArg <- sc_how_bound env `lookupVarEnv` x
   = ScUsage emptyVarEnv (unitVarSet x)
 -- Implementation note: The Sequent Core form simplifies this function by making
@@ -286,11 +286,11 @@ usageFromCut env (Var x) (Kont [] (Case {}))
 -- collectArgs isn't necessary to find out what the head is. In this case, that
 -- means we can avoid doing any search whatsoever if the head isn't a variable
 -- that we know to be bound to a candidate for specialization.
-usageFromCut env v@(Var f) k
+usageFromCut env v@(Var f) fs _
   | Just SpecFun <- sc_how_bound env `lookupVarEnv` f
-  , Just (args, _) <- asSaturatedCall v k
+  , Just (args, _) <- asSaturatedCall v fs
   = ScUsage (unitVarEnv f [args]) emptyVarSet
-usageFromCut _ _ _
+usageFromCut _ _ _ _
   = emptyScUsage
 
 specBind :: ScEnv -> SeqCoreBind -> CoreM (ScUsage, ScEnv, SeqCoreBind)

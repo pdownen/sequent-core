@@ -252,8 +252,8 @@ lintCoreCommand env (Let bind comm)
   = do
     env' <- lintCoreBind env bind
     lintCoreCommand env' comm
-lintCoreCommand env (Eval term kont)
-  = lintCoreCut env term kont
+lintCoreCommand env (Eval term frames end)
+  = lintCoreCut env term (frames, end)
 lintCoreCommand env (Jump args j)
   = lintCoreJump env args j
 
@@ -308,7 +308,7 @@ lintCoreJump env args j
             $$ text "for args:" <+> ppr topArgs
 
 lintCoreKont :: SDoc -> LintEnv -> OutType -> SeqCoreKont -> LintM ()
-lintCoreKont desc env ty (Kont frames end)
+lintCoreKont desc env ty (frames, end)
   = do
     (env', ty') <- foldM (uncurry (lintCoreFrame desc)) (env, ty) frames
     lintCoreEnd desc env' ty' end

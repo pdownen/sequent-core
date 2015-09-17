@@ -429,7 +429,7 @@ joinInlineBoringOk :: SeqCoreJoin -> Bool
     goT credit (Lam x e) | isId x             = goT (credit+1) e
                          | otherwise          = goT credit e
     goT credit (Var {})                       = Just credit
-    goT credit (Compute _ (Eval term (Kont fs Return)))
+    goT credit (Compute _ (Eval term fs Return))
                                               = goF credit fs >>= \credit' ->
                                                 goT credit' term
     goT _      _                              = Nothing
@@ -442,8 +442,7 @@ joinInlineBoringOk :: SeqCoreJoin -> Bool
     goF credit []                             = Just credit
     goF _      _                              = Nothing
 
-    goJ (Join xs (Eval term (Kont fs Return)))
-                                              = goF (length xs) fs >>= \credit' ->
+    goJ (Join xs (Eval term fs Return))       = goF (length xs) fs >>= \credit' ->
                                                 goT credit' term
     goJ _                                     = Nothing
 
@@ -857,8 +856,8 @@ doSubstT env (Compute ty comm)
     (env', ty') = enterKontScope env BoringCtxt ty
 
 doSubstK :: SimplEnv -> SeqCoreKont -> SeqCoreKont
-doSubstK env (Kont fs end)
-  = Kont (map (doSubstF env) fs) (doSubstE env end)
+doSubstK env (fs, end)
+  = (map (doSubstF env) fs, doSubstE env end)
 
 doSubstF :: SimplEnv -> SeqCoreFrame -> SeqCoreFrame
 doSubstF env (App arg)
@@ -902,8 +901,8 @@ doSubstC env (Jump args j)
   where
     args' = map (doSubstT env) args
     extend env (bndr, arg) = extendIdSubst env bndr (Done arg)
-doSubstC env (Eval v k)
-  = Eval (doSubstT env v) (doSubstK env k)
+doSubstC env (Eval v fs e)
+  = Eval (doSubstT env v) (doSubstF env <$> fs) (doSubstE env e)
     
 doSubstB :: SimplEnv -> SeqCoreBind -> (SimplEnv, SeqCoreBind)
 doSubstB env bind
@@ -970,7 +969,7 @@ setKontSubst env mk_m
   = env { se_retKont = mk_m }
 
 pushKont :: SimplEnv -> InKont -> SimplEnv
-pushKont env (Kont frames end)
+pushKont env (frames, end)
   -- Since invoking this metacontinuation will restore the current environment,
   -- the original metacontinuation will run after this one.
   = env `setRetKont` SynKont { mk_frames = Incoming (termStaticPart env) <$> frames
@@ -1258,7 +1257,7 @@ wrapFloatsAroundTerm flts (Compute p comm)
                                                   (getFloatBinds flts))) $
     Compute p (wrapFloats (zapKontFloats flts) comm)
 wrapFloatsAroundTerm flts term
-  = mkCompute (termType term) $ wrapFloats flts (mkCommand [] term (Kont [] Return))
+  = mkCompute (termType term) $ wrapFloats flts (mkCommand [] term [] Return)
 
 addFloats :: Floats -> Floats -> Floats
 addFloats (Floats bs1 l1) (Floats bs2 l2)
@@ -1409,9 +1408,8 @@ termIsHNFLike isCon isHNFDef env term
     
     isHNFLikeComm (Let _ comm)  = isHNFLikeComm comm
     isHNFLikeComm (Jump _ j)    = isCon j -- emphasis on constructor-*like*
-    isHNFLikeComm (Eval v k)    = case k of
-                                    Kont _ (Case {}) -> False
-                                    Kont fs Return   -> isHNFLike v fs
+    isHNFLikeComm (Eval v fs Return) = isHNFLike v fs
+    isHNFLikeComm _             = False
     
     isRuntimeApp (App (Type _)) = False
     isRuntimeApp (App _)        = True
@@ -1497,7 +1495,7 @@ termIsConApp_maybe env id_unf term
   where
     goT :: Either InScopeSet SimplEnv -> OutTerm
         -> Maybe (DataCon, [OutType], [OutTerm])
-    goT subst (Compute _ (Eval v (Kont fs Return))) = go subst v fs Nothing
+    goT subst (Compute _ (Eval v fs Return)) = go subst v fs Nothing
     goT _     (Compute _ _) = Nothing
     goT subst v             = go subst v [] Nothing
     
@@ -1513,12 +1511,12 @@ termIsConApp_maybe env id_unf term
             co_m'' = mkTransCoMaybe co_m co_m'
         in go subst' term' (map (subst_frame subst') fs') co_m''
       where
-        match (Compute _ (Eval term (Kont fs Return)))
+        match (Compute _ (Eval term fs Return))
                             = Just (term, fs)
         match (Compute _ _) = Nothing
         match other         = Just (other, [])
     
-    go subst (Compute _ (Eval term (Kont fs' Return))) fs co_m
+    go subst (Compute _ (Eval term fs' Return)) fs co_m
       = go subst term (fs' ++ fs) co_m
     
     go (Right env') (Var x) fs co_m

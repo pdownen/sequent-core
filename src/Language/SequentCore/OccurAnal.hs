@@ -947,8 +947,8 @@ reOrderNodes depth bndr_set weak_fvs (node : nodes) binds
     is_con_app (Compute _ c) = is_command_con_app c
     is_con_app _          = False
     
-    is_command_con_app (Eval v _) = is_con_app v
-    is_command_con_app _          = False
+    is_command_con_app (Eval v _ _) = is_con_app v
+    is_command_con_app _            = False
     
     trivial (BindTerm _ term) = isTrivialTerm term
     trivial (BindJoin _ join) = isTrivialJoin join
@@ -1253,15 +1253,17 @@ occAnalKont :: OccEnv
             -> SeqCoreKont
             -> (UsageDetails,       -- ^ Usage details for the term *and* continuation
                 SeqCoreKont)
-occAnalKont env uds kont@(Kont (App {} : _) _)
+occAnalKont env uds (frames@(App {} : _), end)
   = case occAnalArgs env args []                  of { ( args_uds, args' ) ->
-    case occAnalKont env (uds +++ args_uds) kont' of { ( final_uds, kont'' ) ->
-    (final_uds, map App args' `addFrames` kont'') }}
-  where (args, kont') = collectArgs kont
+    case occAnalKont env (uds +++ args_uds) kont' of { ( final_uds, (frames'', end') ) ->
+    (final_uds, (map App args' ++ frames'', end')) }}
+  where
+    (args, frames') = collectArgs frames
+    kont' = (frames', end)
 
-occAnalKont env uds (Kont [] (Case bndr alts))
+occAnalKont env uds ([], Case bndr alts)
   = case occAnalCase env Nothing bndr alts of { ( case_uds, kont' ) ->
-    (uds +++ case_uds, Kont [] kont') }
+    (uds +++ case_uds, ([], kont')) }
 
 {-
 Note [Gather occurrences of coercion veriables]
@@ -1269,31 +1271,31 @@ Note [Gather occurrences of coercion veriables]
 We need to gather info about what coercion variables appear, so that
 we can sort them into the right place when doing dependency analysis.
 -}
-occAnalKont env uds (Kont (Tick tickish : frames) end)
+occAnalKont env uds (Tick tickish : frames, end)
   | Core.Breakpoint _ ids <- tickish
   = (mapVarEnv markInsideSCC usage
          +++ mkVarEnv (zip ids (repeat NoOccInfo)),
-     Tick tickish `consFrame` kont')
+     (Tick tickish : frames', end'))
     -- never substitute for any of the Ids in a Breakpoint
   | Core.tickishScoped tickish
-  = (mapVarEnv markInsideSCC usage, Tick tickish `consFrame` kont')
+  = (mapVarEnv markInsideSCC usage, (Tick tickish : frames', end'))
   | otherwise
-  = (usage, Tick tickish `consFrame` kont')
+  = (usage, (Tick tickish : frames, end'))
   where
-    !(usage,kont') = occAnalKont env uds (Kont frames end)
+    !(usage,(frames', end')) = occAnalKont env uds (frames, end)
 
-occAnalKont env usage (Kont (Cast co : frames) end)
+occAnalKont env usage (Cast co : frames, end)
   = let usage1 = markManyIf (isRhsEnv env) usage
         -- If we see let x = y `cast` co
         -- then mark y as 'Many' so that we don't
         -- immediately inline y again.
         usage2 = addIdOccs usage1 (coVarsOfCo co)
           -- See Note [Gather occurrences of coercion veriables]
-    in case occAnalKont env usage2 (Kont frames end) of { (usage3, kont') ->
-      (usage3, Cast co `consFrame` kont')
+    in case occAnalKont env usage2 (frames, end) of { (usage3, (frames', end')) ->
+      (usage3, (Cast co : frames', end'))
     }
     
-occAnalKont _env uds kont@(Kont [] Return)
+occAnalKont _env uds kont@([], Return)
   = (uds, kont)
 
 occAnalJoin :: OccEnv
@@ -1325,8 +1327,8 @@ occAnalCommand env (Let bind comm)
   = case occAnalCommand env comm                         of { ( body_usage, body' ) ->
     case occAnalBind env env emptyVarEnv bind body_usage of { ( final_usage, binds' ) ->
     (final_usage, addLets binds' body') }}
-occAnalCommand env (Eval term kont)
-  = occAnalCut env term kont
+occAnalCommand env (Eval term frames end)
+  = occAnalCut env term (frames, end)
 occAnalCommand env (Jump args j)
   = occAnalJump env args j
     
@@ -1335,12 +1337,12 @@ occAnalCut :: OccEnv
            -> SeqCoreKont
            -> (UsageDetails,
                SeqCoreCommand)
-occAnalCut env (Var x) (Kont [] (Case bndr alts@(alt1 : otherAlts)))
+occAnalCut env (Var x) ([], Case bndr alts@(alt1 : otherAlts))
   -- If a variable is scrutinised by a case with at least one non-default
   -- alternative, mark it as appearing in an interesting context
   | not (null otherAlts) || not (isDefaultAlt alt1)
   = case occAnalCase env (Just (x, Nothing)) bndr alts of { ( kont_usage, end') ->
-    (kont_usage +++ mkOneOcc env x True, Eval (Var x) (Kont [] end')) }
+    (kont_usage +++ mkOneOcc env x True, Eval (Var x) [] end') }
 
 -- FIXME This logic could probably be made cleaner.
 -- mkAltEnv (and hence occAnalCase) has two special cases it checks for: When
@@ -1351,20 +1353,20 @@ occAnalCut env (Var x) (Kont [] (Case bndr alts@(alt1 : otherAlts)))
 occAnalCut env (Var x) kont
   | Just (co_maybe, fs, bndr, alts) <- match kont
   = case occAnalCase env (Just (x, co_maybe)) bndr alts of { ( kont_usage, end') ->
-    (kont_usage +++ mkOneOcc env x False, Eval (Var x) (Kont fs end')) }
+    (kont_usage +++ mkOneOcc env x False, Eval (Var x) fs end') }
   where
-    match (Kont fs@[Cast co] (Case bndr alts)) = Just (Just co, fs, bndr, alts)
-    match (Kont []           (Case bndr alts)) = Just (Nothing, [], bndr, alts)
-    match _                                    = Nothing
+    match (fs@[Cast co], Case bndr alts) = Just (Just co, fs, bndr, alts)
+    match ([],           Case bndr alts) = Just (Nothing, [], bndr, alts)
+    match _                              = Nothing
 
-occAnalCut env fun kont@(Kont (App {} : _) _)
-  = let (args, kont') = collectArgs kont
-    in occAnalApp env fun args kont'
+occAnalCut env fun (frames@(App {} : _), end)
+  = let (args, frames') = collectArgs frames
+    in occAnalApp env fun args (frames', end)
     
 occAnalCut env term kont
   = case occAnalTerm (vanillaCtxt env) term of { ( term_usage, term' ) ->
-    case occAnalKont env term_usage kont    of { ( final_usage, kont' ) ->
-    ( final_usage, Eval term' kont' ) }}
+    case occAnalKont env term_usage kont    of { ( final_usage, (frames', end') ) ->
+    ( final_usage, Eval term' frames' end' ) }}
 
 occAnalJump :: OccEnv
             -> [SeqCoreArg]
@@ -1410,8 +1412,8 @@ occAnalApp env (Var fun) args kont
           -- This is the *whole point* of the isRhsEnv predicate
           -- See Note [Arguments of let-bound constructors]
     in
-    case occAnalKont env (fun_uds +++ final_args_uds) kont of { (total_uds, kont') ->
-    (total_uds, Eval (Var fun) (map App args' `addFrames` kont')) }}
+    case occAnalKont env (fun_uds +++ final_args_uds) kont of { (total_uds, (frames', end')) ->
+    (total_uds, Eval (Var fun) (map App args' ++ frames') end') }}
   where
     n_val_args = length (filter isValueArg args)
     fun_uds    = mkOneOcc env fun (n_val_args > 0)
@@ -1441,8 +1443,8 @@ occAnalApp env fun args kont
         -- onto the context stack.
 
     case occAnalArgs env args []                     of { (args_uds, args') ->
-    case occAnalKont env (fun_uds +++ args_uds) kont of { (total_uds, kont') ->
-    (total_uds, Eval fun' (map App args' `addFrames` kont')) }}}
+    case occAnalKont env (fun_uds +++ args_uds) kont of { (total_uds, (frames', end')) ->
+    (total_uds, Eval fun' (map App args' ++ frames') end') }}}
   
 occAnalArgs :: OccEnv -> [SeqCoreTerm] -> [OneShots] -> (UsageDetails, [SeqCoreTerm])
 occAnalArgs _ [] _ 

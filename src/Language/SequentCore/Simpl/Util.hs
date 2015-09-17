@@ -104,7 +104,7 @@ mkArgInfo env term@(Var fun) co_m fs end
   | otherwise
   = ArgInfo { ai_target = TermTarget term, ai_frames = [], ai_co = co_m
             , ai_rules = rules
-            , ai_encl  = interestingArgContext endEnv rules (Kont (map unScope fs) end')
+            , ai_encl  = interestingArgContext endEnv rules (map unScope fs) end'
             , ai_strs  = add_type_str fun_ty (idArgStrictnesses fun n_val_args)
             , ai_discs = arg_discounts
             , ai_dup   = NoDup }
@@ -327,12 +327,12 @@ interestingArg e = goT e 0
        | otherwise     = ValueArg
     goT (Compute _ c) n    = goC c n
     
-    goC (Let _ c)    n = case goC c n of { ValueArg -> ValueArg; _ -> NonTrivArg }
-    goC (Eval v k)   n = maybe NonTrivArg (goT v) (goK k n)
-    goC (Jump vs j)  _ = goT (Var j) (length (filter isValueArg vs))
+    goC (Let _ c)     n = case goC c n of { ValueArg -> ValueArg; _ -> NonTrivArg }
+    goC (Eval v fs e) n = maybe NonTrivArg (goT v) (goK (fs, e) n)
+    goC (Jump vs j)   _ = goT (Var j) (length (filter isValueArg vs))
     
-    goK (Kont _ (Case {}))   _ = Nothing
-    goK (Kont fs Return)     n = Just $ length (filter realArg fs) + n
+    goK (_, Case {}) _ = Nothing
+    goK (fs, Return) n = Just $ length (filter realArg fs) + n
     
     realArg (App (Type _))     = False
     realArg (App (Coercion _)) = False
@@ -344,8 +344,8 @@ nonTriv TrivArg = False
 nonTriv _       = True
 
 -- See comments on SimplUtils.interestingArgContext
-interestingArgContext :: SimplEnv -> [CoreRule] -> InKont -> Bool
-interestingArgContext env rules (Kont fs end)
+interestingArgContext :: SimplEnv -> [CoreRule] -> [InFrame] -> InEnd -> Bool
+interestingArgContext env rules fs end
   | not (null rules)  = True
   | Case {} <- end    = False
   | any isAppFrame fs = False
@@ -590,7 +590,7 @@ mkCase, mkCase1, mkCase2
 
 mkCase dflags outer_bndr (Alt DEFAULT _ deflt_rhs : outer_alts)
   | gopt Opt_CaseMerge dflags
-  , Eval (Var inner_scrut_var) (Kont [] (Case inner_bndr inner_alts)) <- deflt_rhs
+  , Eval (Var inner_scrut_var) [] (Case inner_bndr inner_alts) <- deflt_rhs
   , inner_scrut_var == outer_bndr
   = do  { tick (CaseMerge outer_bndr)
 
@@ -635,8 +635,8 @@ mkCase1 _dflags case_bndr alts@(Alt _ _ rhs1 : _)      -- Identity case
   where
     identity_alt (Alt con args rhs) = check_eq rhs con args
 
-    check_eq (Eval term (Kont fs Return)) con args = check_eq_cut term fs con args
-    check_eq _                            _   _    = False
+    check_eq (Eval term fs Return) con args = check_eq_cut term fs con args
+    check_eq _                     _   _    = False
     
     check_eq_cut term fs con args | Just fs' <- match term con = all okCast fs'
                                   | otherwise                  = False
@@ -649,7 +649,7 @@ mkCase1 _dflags case_bndr alts@(Alt _ _ rhs1 : _)      -- Identity case
           where
             consComm = mkConstructionCommand dc arg_tys (map mkVarArg args)
             (appFrames, fs') = span isAppFrame fs
-            rhs' = Eval (Var v) (Kont appFrames Return)
+            rhs' = Eval (Var v) appFrames Return
         match _         _                  = Nothing
         
         okCast (Cast co) = not (any (`elemVarSet` tyCoVarsOfCo co) args)
@@ -669,8 +669,8 @@ mkCase1 _dflags case_bndr alts@(Alt _ _ rhs1 : _)      -- Identity case
         --
         -- Don't worry about nested casts, because the simplifier combines them
 
-    re_cast (Eval _ (Kont fs Return)) = Kont (dropWhile isAppFrame fs) Return
-    re_cast other                     = pprPanic "mkCase1" (ppr other)
+    re_cast (Eval _ fs Return) = (dropWhile isAppFrame fs, Return)
+    re_cast other              = pprPanic "mkCase1" (ppr other)
 
 mkCase1 dflags bndr alts = mkCase2 dflags bndr alts
 
@@ -678,7 +678,7 @@ mkCase1 dflags bndr alts = mkCase2 dflags bndr alts
 --      Catch-all
 --------------------------------------------------
 mkCase2 _dflags bndr alts
-  = return $ Kont [] (Case bndr alts)
+  = return ([], Case bndr alts)
 
 {-
 Note [Dead binders]

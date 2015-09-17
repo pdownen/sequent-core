@@ -10,7 +10,7 @@
 -- built-in pretty printer.
   
 module Language.SequentCore.Pretty (
-  pprTopLevelBinds, pprParendTerm
+  pprTopLevelBinds, pprParendTerm, pprCoreKont
 ) where
 
 import Language.SequentCore.Syntax
@@ -66,7 +66,7 @@ ppr_comm add_par comm
     maybe_add_par = if null binds then noParens else add_par
     ppr_cut
       = case cut of
-          Left (term, Kont fs end) 
+          Left (term, fs, end) 
             -> sep [char '<' <> pprCoreTerm term,
                     cat $ ppr_block (char '|') (char ';') (char '>') $ (ppr_kont_frames fs ++ [ppr_end end])]
           Right (args, j)
@@ -123,7 +123,7 @@ ppr_end (Case var alts)
       vcat $ ppr_block (char '{') (char ';') (char '}') (map pprCoreAlt alts)
 
 ppr_kont :: OutputableBndr b => (SDoc -> SDoc) -> Kont b -> SDoc
-ppr_kont add_par (Kont frames end)
+ppr_kont add_par (frames, end)
   = add_par $ sep $ punctuate semi (ppr_kont_frames frames ++ [ppr_end end])
 
 ppr_join :: OutputableBndr b => (SDoc -> SDoc) -> Join b -> SDoc
@@ -157,8 +157,8 @@ pprCoreComm comm = ppr_comm noParens comm
 pprCoreTerm :: OutputableBndr b => Term b -> SDoc
 pprCoreTerm val = ppr_term noParens val
 
-pprCoreJoin :: OutputableBndr b => Join b -> SDoc
-pprCoreJoin join = ppr_join noParens join
+pprCoreKont :: OutputableBndr b => Kont b -> SDoc
+pprCoreKont kont = ppr_kont noParens kont
 
 pprParendTerm :: OutputableBndr b => Term b -> SDoc
 pprParendTerm term = ppr_term parens term
@@ -177,9 +177,6 @@ instance OutputableBndr b => Outputable (Term b) where
 
 instance OutputableBndr b => Outputable (Command b) where
   ppr = ppr_comm noParens
-
-instance OutputableBndr b => Outputable (Kont b) where
-  ppr = ppr_kont noParens
 
 instance OutputableBndr b => Outputable (Frame b) where
   ppr = ppr_frame

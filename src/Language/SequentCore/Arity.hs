@@ -73,15 +73,12 @@ should have arity 3, regardless of f's arity.
 manifestArity :: SeqCoreTerm -> Arity
 -- ^ manifestArity sees how many leading value lambdas there are
 manifestArity v
-  = goT v
+  = go v
   where
-    goT (Lam v e) | isId v      = 1 + goT e
-                  | otherwise   = goT e
-    goT (Compute _ (Eval v k))  = goK v k
-    goT _                       = 0
-    
-    goK v (Kont fs Return)    | all skip fs = goT v
-    goK _ _                   = 0
+    go (Lam v e)                      | isId v      = 1 + go e
+                                      | otherwise   = go e
+    go (Compute _ (Eval v fs Return)) | all skip fs = go v
+    go _                                            = 0
     
     skip (Tick ti) = not (tickishIsCode ti)
     skip (Cast _)  = True
@@ -95,10 +92,8 @@ termArity e = goT e
     goT (Var v)                    = idArity v
     goT (Lam x e) | isId x         = goT e + 1
                   | otherwise      = goT e
-    goT (Compute _ (Eval v k))     = goK v k
+    goT (Compute _ (Eval v fs e))  = goF v fs e
     goT _                          = 0
-    
-    goK v (Kont fs e) = goF v fs e
     
     goF v (Tick t : fs)  e | not (tickishIsCode t)
                            = goF v fs e
@@ -590,12 +585,9 @@ rhsEtaExpandArity dflags cheap_app e
              , ae_ped_bot  = gopt Opt_PedanticBottoms dflags }
 
     has_lam (Lam b e)  = isId b || has_lam e
-    has_lam (Compute _ (Eval v k))
-                       = has_lam_K v k
+    has_lam (Compute _ (Eval v fs Return))
+                       = all skip fs && has_lam v
     has_lam _          = False
-    
-    has_lam_K v (Kont fs Return) = all skip fs && has_lam v
-    has_lam_K _ _                = False
     
     skip (Tick _) = True
     skip _        = False
@@ -800,8 +792,8 @@ arityType = goT
           other                         -> other
     goT _ _ = ATop
     
-    goC env (Eval v k) = let at = goT env v
-                             ca = goK env k
+    goC env (Eval v fs e) = let at = goT env v
+                                ca = goF env fs e
                          in cutArityType at ca
                          
     goC env (Let b e) 
@@ -814,8 +806,6 @@ arityType = goT
     
     goC _ (Jump {}) = ATop -- TODO
 
-    goK env (Kont fs e)      = goF env fs e
-    
     goF env (App arg : fs) e | Type _ <- arg = goF env fs e
                                | otherwise     = CApp cheap (goF env fs e)
       where cheap = cheapFlag $ ae_cheap_fn env arg Nothing
@@ -909,7 +899,7 @@ etaInfoApp :: SeqCoreTerm -> [EtaInfo] -> Type -> SeqCoreTerm
 --             ((substExpr s e) `appliedto` eis)
 
 etaInfoApp v eis ty
-  = mkCompute ty (Eval v (Kont (map frame eis) Return))
+  = mkCompute ty (Eval v (map frame eis) Return)
   where
     frame (EtaVar v) = App (mkVarArg v)
     frame (EtaCo co) = Cast co
