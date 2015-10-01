@@ -7,7 +7,7 @@ module Language.SequentCore.Simpl.Util (
   -- * State of argument processing
   RevList, ArgInfo(..), Target(..),
   mkArgInfo, mkJumpArgInfo, mkJoinArgInfo, addFrameToArgInfo,
-  addFramesToArgInfo, swallowCoercion,
+  addFramesToArgInfo,
   argInfoToTerm, argInfoHasTerm, argInfoSpanArgs,
   
   -- * Summary of arguments
@@ -15,7 +15,7 @@ module Language.SequentCore.Simpl.Util (
   interestingArg, nonTriv,
   
   -- * Coercion management
-  castApp, combineCo, consCastMaybe, simplCoercion, simplOutCoercion,
+  castApp, combineCo, consCastMaybe, simplCoercion, simplOutCoercion, simplOutCoercion_maybe,
   
   -- * Cases
   mkCase, prepareAlts,
@@ -74,7 +74,6 @@ data ArgInfo
   = ArgInfo {
         ai_target :: Target,     -- The term or join point
         ai_frames :: RevList OutFrame, -- ...applied to these args/casts (which are in *reverse* order)
-        ai_co     :: Maybe SubstedCoercion, -- Last coercion applied; not yet added to ai_frames
         ai_rules  :: [CoreRule], -- Rules for this function
         ai_encl   :: Bool,       -- Flag saying whether this function
                                  -- or an enclosing one has rules (recursively)
@@ -92,17 +91,17 @@ data Target = TermTarget OutTerm
             | JumpTarget OutJoinId
             | JoinTarget ScopedJoin
 
-mkArgInfo :: SimplEnv -> OutTerm -> Maybe SubstedCoercion
+mkArgInfo :: SimplEnv -> OutTerm
           -> [ScopedFrame] -> ScopedEnd -> ArgInfo
-mkArgInfo env term@(Var fun) co_m fs end
+mkArgInfo env term@(Var fun) fs end
   | n_val_args < idArity fun            -- Note [Unsaturated functions]
-  = ArgInfo { ai_target = TermTarget term, ai_frames = [], ai_co = co_m
+  = ArgInfo { ai_target = TermTarget term, ai_frames = []
             , ai_rules = rules, ai_encl = False
             , ai_strs  = vanilla_stricts
             , ai_discs = vanilla_discounts
             , ai_dup   = NoDup }
   | otherwise
-  = ArgInfo { ai_target = TermTarget term, ai_frames = [], ai_co = co_m
+  = ArgInfo { ai_target = TermTarget term, ai_frames = []
             , ai_rules = rules
             , ai_encl  = interestingArgContext endEnv rules (map unScope fs) end'
             , ai_strs  = add_type_str fun_ty (idArgStrictnesses fun n_val_args)
@@ -140,10 +139,10 @@ mkArgInfo env term@(Var fun) co_m fs end
         = (str || isStrictType arg_ty) : add_type_str fun_ty' strs
     add_type_str _ strs
         = strs
-mkArgInfo _env term co_m _fs _end
+mkArgInfo _env term _fs _end
   -- Build "arg info" for something that's not a function.
   -- Any App frame is a type error anyway, so many of these fields don't matter.
-  = ArgInfo { ai_target = TermTarget term, ai_frames = [], ai_co = co_m
+  = ArgInfo { ai_target = TermTarget term, ai_frames = []
             , ai_rules = [], ai_encl = False
             , ai_strs = repeat False -- Could be [], but applying to a non-function
                                      -- isn't bottom, it's ill-defined!
@@ -155,8 +154,7 @@ argInfoTerm (ArgInfo { ai_target = TermTarget term }) = term
 argInfoTerm ai = pprPanic "argInfoTerm" (ppr ai)
 
 argInfoToTerm :: ArgInfo -> OutTerm
-argInfoToTerm ai = mkComputeEval (argInfoTerm ai') (reverse (ai_frames ai'))
-  where ai' = swallowCoercion ai
+argInfoToTerm ai = mkComputeEval (argInfoTerm ai) (reverse (ai_frames ai))
 
 argInfoHasTerm :: ArgInfo -> Bool
 argInfoHasTerm (ArgInfo { ai_target = TermTarget {} }) = True
@@ -164,7 +162,7 @@ argInfoHasTerm _ = False
 
 mkJumpArgInfo :: SimplEnv -> OutJoinId -> [ScopedFrame] -> ArgInfo
 mkJumpArgInfo _env j fs
-  = ArgInfo { ai_target = JumpTarget j, ai_frames = [], ai_co = Nothing
+  = ArgInfo { ai_target = JumpTarget j, ai_frames = []
             , ai_rules = []
             , ai_encl  = False
             , ai_strs  = add_type_str j_ty (idArgStrictnesses j n_val_args)
@@ -208,7 +206,7 @@ mkJumpArgInfo _env j fs
 
 mkJoinArgInfo :: SimplEnv -> ScopedJoin -> [ScopedFrame] -> ArgInfo
 mkJoinArgInfo _env pk _fs
-  = ArgInfo { ai_target = JoinTarget pk, ai_frames = [], ai_co = Nothing
+  = ArgInfo { ai_target = JoinTarget pk, ai_frames = []
             , ai_rules = []
             , ai_encl  = False
             , ai_strs  = stricts ++ repeat False
@@ -243,37 +241,21 @@ idArgStrictnesses fun n_val_args
   where
     vanilla_stricts = repeat False
 
--- Add a frame to the ArgInfo. If it is an argument and the ArgInfo has a
--- coercion pending, this will call 'castApp' to push the coercion past the
--- argument. If it is a cast and the ArgInfo has a coercion pending, this will
--- call 'combineCo'.
 addFrameToArgInfo :: ArgInfo -> OutFrame -> ArgInfo
 addFrameToArgInfo ai f
   = case f of
-      App arg ->
-        let -- If we have a coercion, either push it into the arg or swallow it
-            (arg', ai1) | Just co <- ai_co ai
-                        = case castApp arg co of
-                            Just (arg', co') -> (arg', ai { ai_co = Just co' })
-                            Nothing          -> (arg, swallowCoercion ai)
-                        | otherwise
-                        = (arg, ai)
-            strs'       | null (ai_strs ai)
-                        = warnPprTrace True __FILE__ __LINE__
-                            (text "Adding frame to bottoming ArgInfo" $$ ppr f $$ ppr ai)
-                            []
-                        | otherwise
-                        = tail (ai_strs ai)
-            -- If the argument is a term, advance ai_strs and ai_discs
-            ai2         | isTypeArg arg
-                        = ai1
-                        | otherwise
-                        = ai1 { ai_strs  = strs'
-                              , ai_discs = tail (ai_discs ai1) }
-            -- Finally, add the (possibly modified) frame
-            in ai2 { ai_frames = App arg' : ai_frames ai2 }
-      Cast co -> ai { ai_co = ai_co ai `combineCo` co }
-      _       -> ai { ai_frames = f : ai_frames ai }
+      App arg | not (isTypeArg arg) ->
+        let strs' | null (ai_strs ai)
+                  = warnPprTrace True __FILE__ __LINE__
+                      (text "Adding frame to bottoming ArgInfo" $$ ppr f $$ ppr ai)
+                      []
+                  | otherwise
+                  = tail (ai_strs ai)
+        in ai' { ai_strs  = strs'
+               , ai_discs = tail (ai_discs ai) } -- ai_discs is infinite
+      _ -> ai'
+  where
+    ai' = ai { ai_frames = f : ai_frames ai }
 
 addFramesToArgInfo :: ArgInfo -> [OutFrame] -> ArgInfo
 addFramesToArgInfo ai fs
@@ -282,16 +264,6 @@ addFramesToArgInfo ai fs
 argInfoSpanArgs :: ArgInfo -> ([OutArg], [OutFrame])
 argInfoSpanArgs (ArgInfo { ai_frames = rev_fs })
   = mapWhileJust (\case { App arg -> Just arg; _ -> Nothing }) (reverse rev_fs)
-
--- Clear the coercion, if there is one, by adding it to the frames after
--- simplifying it.
-swallowCoercion :: ArgInfo -> ArgInfo
-swallowCoercion ai@(ArgInfo { ai_co = Just co, ai_frames = fs })
-  = ai { ai_co     = Nothing
-       , ai_frames = Cast co' : fs }
-  where
-    co' = simplOutCoercion co
-swallowCoercion ai = ai
 
 ----------------
 -- ArgSummary --
@@ -365,8 +337,14 @@ instance Outputable ArgSummary where
 simplCoercion :: SimplEnv -> InCoercion -> OutCoercion
 simplCoercion env co = optCoercion (getCvSubst env) co
 
-simplOutCoercion :: SubstedCoercion -> OutCoercion
+simplOutCoercion :: OutCoercion -> OutCoercion
 simplOutCoercion co = optCoercion emptyCvSubst co
+
+simplOutCoercion_maybe :: OutCoercion -> Maybe OutCoercion
+simplOutCoercion_maybe co | fromTy `eqType` toTy = Nothing
+                          | otherwise            = Just $ simplOutCoercion co
+  where
+    Pair fromTy toTy = coercionKind co
 
 combineCo :: Maybe OutCoercion -> OutCoercion -> Maybe OutCoercion
 combineCo co_m co'
@@ -806,13 +784,10 @@ mkLam env bndrs body
 instance Outputable ArgInfo where
   ppr (ArgInfo { ai_target = target
                , ai_frames = fs
-               , ai_co = co_m
                , ai_strs = strs
                , ai_dup = dup })
     = hang (text "ArgInfo") 8 $ vcat [ targetLabel <+> ppr target
                                      , text "Prev. frames:" <+> pprWithCommas ppr fs
-                                     , case co_m of Just co -> text "Coercion:" <+> ppr co
-                                                    Nothing -> empty
                                      , ppWhen (dup == OkToDup) $ text "Okay to duplicate"
                                      , strictDoc ]
     where

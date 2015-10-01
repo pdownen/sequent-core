@@ -28,9 +28,9 @@ module Language.SequentCore.Simpl.Env (
   
   -- * Objects with lexical scope information attached
   Scoped(..), DupFlag(..),
-  ScopedFrame, ScopedEnd, ScopedJoin, ScopedCommand,
+  ScopedFrame, ScopedEnd, ScopedJoin, ScopedCommand, ScopedKont,
   openScoped, unScope, substScoped,
-  okToDup,
+  dupFlag,
   pprMultiScopedKont,
   
   -- * Generalized notion of continuation
@@ -60,7 +60,6 @@ module Language.SequentCore.Simpl.Env (
   Out, OutCommand, OutTerm, OutArg, OutKont, OutFrame, OutEnd, OutJoin,
   OutAlt, OutBind, OutBndr, OutBindPair,
   OutType, OutCoercion, OutId, OutJoinId, OutVar, OutTyVar, OutCoVar,
-  SubstedCoercion,
   
   -- * Term information
   termIsHNF, termIsConLike, termIsConApp_maybe,
@@ -249,7 +248,6 @@ data MetaKont = SynKont { mk_frames :: [ScopedFrame]
               | StrictLamBind { mk_termEnv  :: StaticTermEnv
                               , mk_binder   :: InBndr
                               , mk_term     :: InTerm
-                              , mk_coercion :: Maybe SubstedCoercion
                               , mk_frames   :: [ScopedFrame]
                               , mk_end      :: ScopedEnd 
                               , mk_context  :: CallCtxt } -- Never dupable
@@ -304,7 +302,9 @@ type ScopedFrame = Scoped StaticTermEnv SeqCoreFrame
 type ScopedEnd   = Scoped StaticEnv SeqCoreEnd
 type ScopedJoin  = Scoped StaticEnv SeqCoreJoin
 type ScopedCommand = Scoped StaticEnv SeqCoreCommand
+type ScopedKont  = ([ScopedFrame], ScopedEnd)
 
+{-# INLINE openScoped #-} -- often used in pattern guards
 openScoped :: SimplEnvFragment env => SimplEnv -> Scoped env a -> (SimplEnv, In a)
 openScoped env scoped
   = case scoped of
@@ -317,12 +317,12 @@ unScope scoped
       Incoming   _ a   -> a
       Simplified _ _ a -> a
 
-okToDup :: Scoped env a -> Bool
-okToDup (Simplified OkToDup _ _) = True
-okToDup _                        = False
+dupFlag :: Scoped env a -> DupFlag
+dupFlag (Simplified flag _ _) = flag
+dupFlag (Incoming {})         = NoDup
 
 substScoped :: (SimplEnvFragment env, Substable a)
-            => SimplEnv -> Scoped env a -> a
+            => SimplEnv -> Scoped env a -> Out a
 substScoped env scoped = case openScoped env scoped of (env', a) -> subst env' a
 
 -----------------
@@ -526,11 +526,6 @@ type OutJoinId  = JoinId
 type OutVar     = Var
 type OutTyVar   = TyVar
 type OutCoVar   = CoVar
-
--- Coercions have a third state, where substitution has been performed but not
--- optimization. (It is hoped that coercions are not so large that making
--- multiple passes like this is expensive.)
-type SubstedCoercion = Coercion
 
 -----------------
 -- Environment --
@@ -1736,13 +1731,10 @@ instance Outputable MetaKont where
       hang (text "In command:") 2 (pprDeeper $ ppr command)
   ppr (StrictLamBind { mk_binder   = bndr
                      , mk_term     = term
-                     , mk_coercion = co_m
                      , mk_frames   = fs
                      , mk_end      = end })
     = vcat [ text "Strict lambda-binding of:" <+> pprBndr LambdaBind bndr
            , hang (text "In term:") 2 (pprDeeper $ ppr term)
-           , case co_m of Just co -> text "Coercion:" <+> ppr co
-                          Nothing -> empty
            , hang (text "With continuation:") 2 (pprMultiScopedKont fs end) ]
 
 instance Outputable Definition where
