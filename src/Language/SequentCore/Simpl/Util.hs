@@ -103,7 +103,7 @@ mkArgInfo env term@(Var fun) fs end
   | otherwise
   = ArgInfo { ai_target = TermTarget term, ai_frames = []
             , ai_rules = rules
-            , ai_encl  = interestingArgContext endEnv rules (map unScope fs) end'
+            , ai_encl  = interestingArgContext env rules (map unScope fs) (unScope end)
             , ai_strs  = add_type_str fun_ty (idArgStrictnesses fun n_val_args)
             , ai_discs = arg_discounts
             , ai_dup   = NoDup }
@@ -111,7 +111,6 @@ mkArgInfo env term@(Var fun) fs end
     fun_ty = idType fun
     n_val_args = count (isValueAppFrame . unScope) fs
     rules = getRules (getSimplRules env) fun
-    (endEnv, end') = openScoped env end
 
     vanilla_discounts, arg_discounts :: [Int]
     vanilla_discounts = repeat 0
@@ -334,8 +333,8 @@ instance Outputable ArgSummary where
 -- Coercion handling --
 -----------------------
 
-simplCoercion :: SimplEnv -> InCoercion -> OutCoercion
-simplCoercion env co = optCoercion (getCvSubst env) co
+simplCoercion :: SimplEnv -> DataScope -> InCoercion -> OutCoercion
+simplCoercion env dsc co = optCoercion (getCvSubst env dsc) co
 
 simplOutCoercion :: OutCoercion -> OutCoercion
 simplOutCoercion co = optCoercion emptyCvSubst co
