@@ -961,7 +961,7 @@ normalizeKont env (fs, end)
     
     doCasts :: Maybe OutCoercion -> [ScopedFrame] -> [ScopedFrame]
     doCasts Nothing (f : fs)
-      = case substScoped env f of
+      = case substScopedFrame env f of
           -- Here and below we use substScoped because we may need to combine
           -- bits of syntax from different scopes; the only way to do so is to
           -- apply their substitutions early. This may be inefficient, but we
@@ -970,7 +970,7 @@ normalizeKont env (fs, end)
           _        -> f : doCasts Nothing fs
     doCasts Nothing [] = []
     doCasts (Just co) (f : fs)
-      = case substScoped env f of
+      = case substScopedFrame env f of
           Cast co' -> doCasts (Just (co `mkTransCo` co')) fs
           App arg   | Just (arg', co') <- castApp arg co
                    -> let f' = case f of
@@ -1811,7 +1811,7 @@ callSiteInlineJoin env id active_unfolding fs end
 
 -- Impedence mismatch between Sequent Core code and logic from CoreUnfold.
 distillKont :: SimplEnv -> [ScopedFrame] -> ScopedEnd -> ([ArgSummary], CallCtxt)
-distillKont env fs end = (mapMaybe (doFrame . substScoped env) fs, doEnd (substScoped env end))
+distillKont env fs end = (mapMaybe (doFrame . substScopedFrame env) fs, doEnd (substScopedEnd env end))
   where
     doFrame (App v)    | not (isTypeArg v)
                        = Just (interestingArg v)

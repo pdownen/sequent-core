@@ -1,4 +1,4 @@
-{-# LANGUAGE ViewPatterns, BangPatterns, FlexibleInstances, CPP, FunctionalDependencies #-}
+{-# LANGUAGE CPP #-}
 
 module Language.SequentCore.Simpl.Env (
   -- * Simplifier context
@@ -7,7 +7,7 @@ module Language.SequentCore.Simpl.Env (
   getUnfoldingInRuleMatch, activeRule, getInScopeSet,
   
   -- * Substitution and lexical scope
-  DataScope, ControlScope, SubstAns(..), KontSubst, Substable(..),
+  DataScope, ControlScope, SubstAns(..), KontSubst,
   substId, substJv, substKv, substTy, substTyVar, substCo, substCoVar, lookupRecBndr,
   substTerm, substKont, substFrame, substEnd, substJoin, substCommand,
   extendIdSubst, extendJvSubst, extendTvSubst, extendCvSubst,
@@ -23,7 +23,7 @@ module Language.SequentCore.Simpl.Env (
   -- * Objects with lexical scope information attached
   Scoped(..), DupFlag(..),
   ScopedFrame, ScopedEnd, ScopedJoin, ScopedCommand, ScopedKont,
-  openScoped, unScope, substScoped,
+  openScoped, unScope, substScopedFrame, substScopedEnd,
   dupFlag,
   pprMultiScopedKont,
   
@@ -362,9 +362,15 @@ dupFlag :: Scoped env a -> DupFlag
 dupFlag (Simplified flag _ _) = flag
 dupFlag (Incoming {})         = NoDup
 
-substScoped :: (Scope scp, Substable a scp)
-            => SimplEnv -> Scoped scp a -> Out a
-substScoped env scoped = case openScoped scoped of (scp, a) -> subst env scp a
+substScopedFrame :: SimplEnv -> ScopedFrame -> OutFrame
+substScopedFrame env scopedFrame
+  = case openScoped scopedFrame of
+      (dsc, frame) -> substFrame (text "substScopedFrame") env dsc frame
+
+substScopedEnd :: SimplEnv -> ScopedEnd -> OutEnd
+substScopedEnd env scopedEnd
+  = case openScoped scopedEnd of
+      ((dsc, csc), end) -> substEnd (text "substScopedEnd") env dsc csc end
 
 -----------------
 -- Definitions --
@@ -999,16 +1005,6 @@ doSubstB env dsc csc bind
   where
     doRhs env' dsc' _    bndr' (BindTerm _ term) = BindTerm bndr' (doSubstT env' dsc' term)
     doRhs env' dsc' csc' bndr' (BindJoin _ join) = BindJoin bndr' (doSubstJ env' dsc' csc' join)
-
-class Substable a scp | a -> scp where
-  subst :: SimplEnv -> scp -> a -> a
-
-instance Substable SeqCoreTerm DataScope where subst = doSubstT
-instance Substable SeqCoreKont FullScope where subst env = uncurry (doSubstK env)
-instance Substable SeqCoreFrame DataScope where subst = doSubstF
-instance Substable SeqCoreEnd FullScope where subst env = uncurry (doSubstE env)
-instance Substable SeqCoreJoin FullScope where subst env = uncurry (doSubstJ env)
-instance Substable SeqCoreCommand FullScope where subst env = uncurry (doSubstC env)
 
 extendIdSubst :: DataScope -> InVar -> TermSubstAns -> DataScope
 extendIdSubst dsc x rhs
