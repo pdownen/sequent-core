@@ -215,7 +215,7 @@ seqCoreBindsSize = sum . map sizeB
     sizeT (Lam x v) = sizeX x + sizeT v
     sizeT (Compute ty c) = seqType ty `seq` sizeC c
     
-    sizeK (Kont fs e) = sum (sizeF <$> fs) + sizeE e
+    sizeK (fs, e)   = sum (sizeF <$> fs) + sizeE e
     
     sizeF (App arg) = sizeT arg
     sizeF (Cast co) = seqCo co `seq` 1
@@ -229,7 +229,7 @@ seqCoreBindsSize = sum . map sizeB
     
     sizeC (Let b c)     = sizeB b + sizeC c
     sizeC (Jump args j) = j `seq` sum (sizeT <$> args) + 1
-    sizeC (Eval v k)    = sizeT v + sizeK k
+    sizeC (Eval v fs e) = sizeT v + sizeK (fs, e)
 
 -------------------
 -- Eta-reduction --
@@ -237,7 +237,7 @@ seqCoreBindsSize = sum . map sizeB
 
 -- (from CoreUtils)
 tryEtaReduce :: [Var] -> SeqCoreTerm -> Maybe SeqCoreTerm
-tryEtaReduce bndrs body@(Compute _ (Eval fun (Kont fs Return)))
+tryEtaReduce bndrs body@(Compute _ (Eval fun fs Return))
   | ok_fun fun
   = go bndrs fs (mkReflCo Representational (termType body))
   where
@@ -299,7 +299,7 @@ tryEtaReduce bndrs body@(Compute _ (Eval fun (Kont fs Return)))
     ok_arg bndr (Var v) co
        | bndr == v   = Just (mkFunCo Representational
                                      (mkReflCo Representational (idType bndr)) co)
-    ok_arg bndr (Compute _ (Eval (Var v) (Kont [Cast co_arg] Return))) co
+    ok_arg bndr (Compute _ (Eval (Var v) [Cast co_arg] Return)) co
        | bndr == v  = Just (mkFunCo Representational (mkSymCo co_arg) co)
        -- The simplifier combines multiple casts into one,
        -- so we can have a simple-minded pattern match here

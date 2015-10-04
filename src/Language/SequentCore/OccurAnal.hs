@@ -1,3 +1,12 @@
+-- | 
+-- Module      : Language.SequentCore.OccurAnal
+-- Description : Occurrence analysis for Sequent Core
+-- Maintainer  : maurerl@cs.uoregon.edu
+-- Stability   : experimental
+--
+-- Normally occurrence analysis is performed by the simplifier, but if needed, this
+-- module can update a module or a single term on demand.
+
 {-
 %
 % (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -139,18 +148,19 @@ occAnalBind :: OccEnv           -- The incoming OccEnv
             -> (UsageDetails,           -- Of the whole let(rec)
                 [SeqCoreBind])
 
-occAnalBind env _ imp_rules_edges (NonRec (destBindPair -> (binder, rhs))) body_usage
+occAnalBind env _ imp_rules_edges bind@(NonRec pair) body_usage
   | isTyVar binder      -- A type let; we don't gather usage info
-  = (body_usage, [NonRec (mkBindPair binder rhs)])
+  = (body_usage, [bind])
 
   | not (binder `usedIn` body_usage)    -- It's not mentioned
   = (body_usage, [])
 
   | otherwise                   -- It's mentioned in the body
-  = (body_usage' +++ rhs_usage4, [NonRec (mkBindPair tagged_binder rhs')])
+  = (body_usage' +++ rhs_usage4, [NonRec pair'])
   where
+    binder = binderOfPair pair
     (body_usage', tagged_binder) = tagBinder body_usage binder
-    (rhs_usage1, rhs')           = occAnalNonRecRhs env tagged_binder rhs
+    (rhs_usage1, pair')          = occAnalNonRecRhs env (pair `setPairBinder` tagged_binder)
     rhs_usage2 = addIdOccs rhs_usage1 (Core.idUnfoldingVars binder)
     rhs_usage3 = addIdOccs rhs_usage2 (Core.idRuleVars binder)
        -- See Note [Rules are extra RHSs] and Note [Rule dependency info]
@@ -635,8 +645,7 @@ type Node details = (details, Unique, [Unique]) -- The Ints are gotten from the 
                                                 -- which is gotten from the Id.
 
 data Details
-  = ND { nd_bndr :: Id          -- Binder
-       , nd_rhs  :: SeqCoreRhs    -- RHS, already occ-analysed
+  = ND { nd_bind_pair :: SeqCoreBindPair -- Binder and RHS, already occ-analysed
 
        , nd_uds  :: UsageDetails  -- Usage from RHS, and RULES, and InlineRule unfolding
                                   -- ignoring phase (ie assuming all are active)
@@ -658,7 +667,7 @@ data Details
 
 instance Outputable Details where
    ppr nd = ptext (sLit "ND") <> braces
-             (sep [ ptext (sLit "bndr =") <+> ppr (nd_bndr nd)
+             (sep [ ptext (sLit "bndr =") <+> ppr (binderOfPair (nd_bind_pair nd))
                   , ptext (sLit "uds =") <+> ppr (nd_uds nd)
                   , ptext (sLit "inl =") <+> ppr (nd_inl nd)
                   , ptext (sLit "weak =") <+> ppr (nd_weak nd)
@@ -666,11 +675,11 @@ instance Outputable Details where
              ])
 
 makeNode :: OccEnv -> IdEnv IdSet -> VarSet -> SeqCoreBindPair -> Node Details
-makeNode env imp_rules_edges bndr_set (destBindPair -> (bndr, rhs))
+makeNode env imp_rules_edges bndr_set pair
   = (details, varUnique bndr, keysUFM node_fvs)
   where
-    details = ND { nd_bndr = bndr
-                 , nd_rhs  = rhs'
+    bndr = binderOfPair pair
+    details = ND { nd_bind_pair = pair'
                  , nd_uds  = rhs_usage3
                  , nd_weak = node_fvs `minusVarSet` inl_fvs
                  , nd_inl  = inl_fvs
@@ -678,7 +687,7 @@ makeNode env imp_rules_edges bndr_set (destBindPair -> (bndr, rhs))
 
     -- Constructing the edges for the main Rec computation
     -- See Note [Forming Rec groups]
-    (rhs_usage1, rhs') = occAnalRecRhs env rhs
+    (rhs_usage1, pair') = occAnalRecRhs env pair
     rhs_usage2 = addIdOccs rhs_usage1 all_rule_fvs   -- Note [Rules are extra RHSs]
                                                      -- Note [Rule dependency info]
     rhs_usage3 = case mb_unf_fvs of
@@ -722,15 +731,16 @@ occAnalRec :: SCC (Node Details)
            -> (UsageDetails, [SeqCoreBind])
 
         -- The NonRec case is just like a Let (NonRec ...) above
-occAnalRec (AcyclicSCC (ND { nd_bndr = bndr, nd_rhs = rhs, nd_uds = rhs_uds}, _, _))
+occAnalRec (AcyclicSCC (ND { nd_bind_pair = pair, nd_uds = rhs_uds}, _, _))
            (body_uds, binds)
   | not (bndr `usedIn` body_uds)
   = (body_uds, binds)           -- See Note [Dead code]
 
   | otherwise                   -- It's mentioned in the body
   = (body_uds' +++ rhs_uds,
-     NonRec (mkBindPair tagged_bndr rhs) : binds)
+     NonRec (pair `setPairBinder` tagged_bndr) : binds)
   where
+    bndr = binderOfPair pair
     (body_uds', tagged_bndr) = tagBinder body_uds bndr
 
         -- The Rec case is the interesting one
@@ -746,7 +756,7 @@ occAnalRec (CyclicSCC nodes) (body_uds, binds)
     (final_uds, Rec pairs : binds)
 
   where
-    bndrs    = [b | (ND { nd_bndr = b }, _, _) <- nodes]
+    bndrs    = [binderOfPair b | (ND { nd_bind_pair = b }, _, _) <- nodes]
     bndr_set = mkVarSet bndrs
 
         ----------------------------
@@ -757,8 +767,10 @@ occAnalRec (CyclicSCC nodes) (body_uds, binds)
     add_uds usage_so_far (nd, _, _) = usage_so_far +++ nd_uds nd
 
     tag_node :: Node Details -> Node Details
-    tag_node (details@ND { nd_bndr = bndr }, k, ks)
-      = (details { nd_bndr = setBinderOcc total_uds bndr }, k, ks)
+    tag_node (details@ND { nd_bind_pair = pair }, k, ks)
+      = (details { nd_bind_pair = pair `setPairBinder` setBinderOcc total_uds bndr }, k, ks)
+      where
+        bndr = binderOfPair pair
 
     ---------------------------
     -- Now reconstruct the cycle
@@ -784,8 +796,8 @@ occAnalRec (CyclicSCC nodes) (body_uds, binds)
         -- Domain is *subset* of bound vars (others have no rule fvs)
     rule_fv_env = transClosureFV (mkVarEnv init_rule_fvs)
     init_rule_fvs   -- See Note [Finding rule RHS free vars]
-      = [ (b, trimmed_rule_fvs)
-        | (ND { nd_bndr = b, nd_active_rule_fvs = rule_fvs },_,_) <- nodes
+      = [ (binderOfPair pair, trimmed_rule_fvs)
+        | (ND { nd_bind_pair = pair, nd_active_rule_fvs = rule_fvs },_,_) <- nodes
         , let trimmed_rule_fvs = rule_fvs `intersectVarSet` bndr_set
         , not (isEmptyVarSet trimmed_rule_fvs)]
 {-
@@ -809,14 +821,18 @@ recording inlinings for any Ids which aren't marked as "no-inline" as it goes.
 type Binding = SeqCoreBindPair
 
 mk_loop_breaker :: Node Details -> Binding
-mk_loop_breaker (ND { nd_bndr = bndr, nd_rhs = rhs}, _, _)
-  = mkBindPair (setIdOccInfo bndr strongLoopBreaker) rhs
+mk_loop_breaker (ND { nd_bind_pair = pair }, _, _)
+  = pair `setPairBinder` setIdOccInfo bndr strongLoopBreaker
+  where
+    bndr = binderOfPair pair
 
 mk_non_loop_breaker :: VarSet -> Node Details -> Binding
 -- See Note [Weak loop breakers]
-mk_non_loop_breaker used_in_rules (ND { nd_bndr = bndr, nd_rhs = rhs}, _, _)
-  | bndr `elemVarSet` used_in_rules = mkBindPair (setIdOccInfo bndr weakLoopBreaker) rhs
-  | otherwise                       = mkBindPair bndr rhs
+mk_non_loop_breaker used_in_rules (ND { nd_bind_pair = pair}, _, _)
+  | bndr `elemVarSet` used_in_rules = pair `setPairBinder` setIdOccInfo bndr weakLoopBreaker
+  | otherwise                       = pair
+  where
+    bndr = binderOfPair pair
 
 udFreeVars :: VarSet -> UsageDetails -> VarSet
 -- Find the subset of bndrs that are mentioned in uds
@@ -886,7 +902,7 @@ reOrderNodes depth bndr_set weak_fvs (node : nodes) binds
           sc = score node
 
     score :: Node Details -> Int        -- Higher score => less likely to be picked as loop breaker
-    score (ND { nd_bndr = bndr, nd_rhs = rhs }, _, _)
+    score (ND { nd_bind_pair = pair@(binderOfPair -> bndr) }, _, _)
         | not (isId bndr) = 100     -- A type or cercion variable is never a loop breaker
 
         | isDFunId bndr = 9   -- Never choose a DFun as a loop breaker
@@ -900,9 +916,10 @@ reOrderNodes depth bndr_set weak_fvs (node : nodes) binds
                -- never look at 'rhs' for InlineRule stuff. That's right, because
                -- 'rhs' is irrelevant for inlining things with an InlineRule
 
-        | is_con_app rhs = 5  -- Data types help with cases: Note [Constructor applications]
+        | BindTerm _ term <- pair
+        , is_con_app term = 5  -- Data types help with cases: Note [Constructor applications]
 
-        | either isTrivialTerm isTrivialJoin rhs = 10  -- Practically certain to be inlined
+        | trivial pair = 10  -- Practically certain to be inlined
                 -- Used to have also: && not (isExportedId bndr)
                 -- But I found this sometimes cost an extra iteration when we have
                 --      rec { d = (a,b); a = ...df...; b = ...df...; df = d }
@@ -934,16 +951,16 @@ reOrderNodes depth bndr_set weak_fvs (node : nodes) binds
         -- However we *also* treat (\x. C p q) as a con-app-like thing,
         --      Note [Closure conversion]
         
-    is_con_app (Left v)        = is_term_con_app v
-    is_con_app (Right _)       = False
+    is_con_app (Var x)    = isConLikeId x
+    is_con_app (Lam _ v)  = is_con_app v
+    is_con_app (Compute _ c) = is_command_con_app c
+    is_con_app _          = False
     
-    is_term_con_app (Var x)    = isConLikeId x
-    is_term_con_app (Lam _ v)  = is_term_con_app v
-    is_term_con_app (Compute _ c) = is_command_con_app c
-    is_term_con_app _          = False
+    is_command_con_app (Eval v _ _) = is_con_app v
+    is_command_con_app _            = False
     
-    is_command_con_app (Eval v _) = is_term_con_app v
-    is_command_con_app _          = False
+    trivial (BindTerm _ term) = isTrivialTerm term
+    trivial (BindJoin _ join) = isTrivialJoin join
 {-
 
 Note [Complexity of loop breaking]
@@ -1088,20 +1105,20 @@ ToDo: try using the occurrence info for the inline'd binder.
 
 
 -}
-occAnalRecRhs :: OccEnv -> SeqCoreRhs    -- Rhs
-           -> (UsageDetails, SeqCoreRhs)
+occAnalRecRhs :: OccEnv -> SeqCoreBindPair    -- Binder and rhs
+           -> (UsageDetails, SeqCoreBindPair)
               -- Returned usage details covers only the RHS,
               -- and *not* the RULE or INLINE template for the Id
-occAnalRecRhs env rhs = occAnal (rhsCtxt env) rhs
+occAnalRecRhs env rhs = occAnalRhs (rhsCtxt env) rhs
 
 occAnalNonRecRhs :: OccEnv
-                 -> Id -> SeqCoreRhs    -- Binder and rhs
+                 -> SeqCoreBindPair    -- Binder and rhs
                      -- Binder is already tagged with occurrence info
-                 -> (UsageDetails, SeqCoreRhs)
+                 -> (UsageDetails, SeqCoreBindPair)
               -- Returned usage details covers only the RHS,
               -- and *not* the RULE or INLINE template for the Id
-occAnalNonRecRhs env bndr rhs
-  = occAnal rhs_env rhs
+occAnalNonRecRhs env pair
+  = occAnalRhs rhs_env pair
   where
     -- See Note [Use one-shot info]
     env1 = env { occ_one_shots = argOneShots OneShotLam dmd }
@@ -1115,6 +1132,7 @@ occAnalNonRecRhs env bndr rhs
           OneOcc in_lam one_br _ -> not in_lam && one_br && active && not_stable
           _                      -> False
 
+    bndr       = binderOfPair pair
     dmd        = idDemandInfo bndr
     active     = isAlwaysActive (idInlineActivation bndr)
     not_stable = not (Core.isStableUnfolding (idUnfolding bndr))
@@ -1174,12 +1192,14 @@ for the various clauses.
 Expressions
 ~~~~~~~~~~~
 -}
-occAnal :: OccEnv
-        -> SeqCoreRhs
-        -> (UsageDetails,
-            SeqCoreRhs)
-occAnal env (Left term)  = let (details, term') = occAnalTerm env term in (details, Left term')
-occAnal env (Right join) = let (details, join') = occAnalJoin env join in (details, Right join')
+occAnalRhs :: OccEnv
+           -> SeqCoreBindPair       -- Only the RHS is used
+           -> (UsageDetails,
+               SeqCoreBindPair)     -- Binder unchanged
+occAnalRhs env (BindTerm x term)
+  = let (details, term') = occAnalTerm env term in (details, BindTerm x term')
+occAnalRhs env (BindJoin j join)
+  = let (details, join') = occAnalJoin env join in (details, BindJoin j join')
 
 occAnalTerm :: OccEnv
             -> SeqCoreTerm
@@ -1240,17 +1260,19 @@ occAnalTerm env (Compute ty comm)
 occAnalKont :: OccEnv
             -> UsageDetails         -- ^ Usage details for the term
             -> SeqCoreKont
-            -> (UsageDetails,       -- ^ Usage details for the term *and* continuation
-                SeqCoreKont)
-occAnalKont env uds kont@(Kont (App {} : _) _)
+            -> (UsageDetails,
+                SeqCoreKont)        -- ^ Usage details for the term *and* continuation
+occAnalKont env uds (frames@(App {} : _), end)
   = case occAnalArgs env args []                  of { ( args_uds, args' ) ->
-    case occAnalKont env (uds +++ args_uds) kont' of { ( final_uds, kont'' ) ->
-    (final_uds, map App args' `addFrames` kont'') }}
-  where (args, kont') = collectArgs kont
+    case occAnalKont env (uds +++ args_uds) kont' of { ( final_uds, (frames'', end') ) ->
+    (final_uds, (map App args' ++ frames'', end')) }}
+  where
+    (args, frames') = collectArgs frames
+    kont' = (frames', end)
 
-occAnalKont env uds (Kont [] (Case bndr alts))
+occAnalKont env uds ([], Case bndr alts)
   = case occAnalCase env Nothing bndr alts of { ( case_uds, kont' ) ->
-    (uds +++ case_uds, Kont [] kont') }
+    (uds +++ case_uds, ([], kont')) }
 
 {-
 Note [Gather occurrences of coercion veriables]
@@ -1258,31 +1280,31 @@ Note [Gather occurrences of coercion veriables]
 We need to gather info about what coercion variables appear, so that
 we can sort them into the right place when doing dependency analysis.
 -}
-occAnalKont env uds (Kont (Tick tickish : frames) end)
+occAnalKont env uds (Tick tickish : frames, end)
   | Core.Breakpoint _ ids <- tickish
   = (mapVarEnv markInsideSCC usage
          +++ mkVarEnv (zip ids (repeat NoOccInfo)),
-     Tick tickish `consFrame` kont')
+     (Tick tickish : frames', end'))
     -- never substitute for any of the Ids in a Breakpoint
   | Core.tickishScoped tickish
-  = (mapVarEnv markInsideSCC usage, Tick tickish `consFrame` kont')
+  = (mapVarEnv markInsideSCC usage, (Tick tickish : frames', end'))
   | otherwise
-  = (usage, Tick tickish `consFrame` kont')
+  = (usage, (Tick tickish : frames, end'))
   where
-    !(usage,kont') = occAnalKont env uds (Kont frames end)
+    !(usage,(frames', end')) = occAnalKont env uds (frames, end)
 
-occAnalKont env usage (Kont (Cast co : frames) end)
+occAnalKont env usage (Cast co : frames, end)
   = let usage1 = markManyIf (isRhsEnv env) usage
         -- If we see let x = y `cast` co
         -- then mark y as 'Many' so that we don't
         -- immediately inline y again.
         usage2 = addIdOccs usage1 (coVarsOfCo co)
           -- See Note [Gather occurrences of coercion veriables]
-    in case occAnalKont env usage2 (Kont frames end) of { (usage3, kont') ->
-      (usage3, Cast co `consFrame` kont')
+    in case occAnalKont env usage2 (frames, end) of { (usage3, (frames', end')) ->
+      (usage3, (Cast co : frames', end'))
     }
     
-occAnalKont _env uds kont@(Kont [] Return)
+occAnalKont _env uds kont@([], Return)
   = (uds, kont)
 
 occAnalJoin :: OccEnv
@@ -1314,8 +1336,8 @@ occAnalCommand env (Let bind comm)
   = case occAnalCommand env comm                         of { ( body_usage, body' ) ->
     case occAnalBind env env emptyVarEnv bind body_usage of { ( final_usage, binds' ) ->
     (final_usage, addLets binds' body') }}
-occAnalCommand env (Eval term kont)
-  = occAnalCut env term kont
+occAnalCommand env (Eval term frames end)
+  = occAnalCut env term (frames, end)
 occAnalCommand env (Jump args j)
   = occAnalJump env args j
     
@@ -1324,12 +1346,12 @@ occAnalCut :: OccEnv
            -> SeqCoreKont
            -> (UsageDetails,
                SeqCoreCommand)
-occAnalCut env (Var x) (Kont [] (Case bndr alts@(alt1 : otherAlts)))
+occAnalCut env (Var x) ([], Case bndr alts@(alt1 : otherAlts))
   -- If a variable is scrutinised by a case with at least one non-default
   -- alternative, mark it as appearing in an interesting context
   | not (null otherAlts) || not (isDefaultAlt alt1)
   = case occAnalCase env (Just (x, Nothing)) bndr alts of { ( kont_usage, end') ->
-    (kont_usage +++ mkOneOcc env x True, Eval (Var x) (Kont [] end')) }
+    (kont_usage +++ mkOneOcc env x True, Eval (Var x) [] end') }
 
 -- FIXME This logic could probably be made cleaner.
 -- mkAltEnv (and hence occAnalCase) has two special cases it checks for: When
@@ -1340,20 +1362,20 @@ occAnalCut env (Var x) (Kont [] (Case bndr alts@(alt1 : otherAlts)))
 occAnalCut env (Var x) kont
   | Just (co_maybe, fs, bndr, alts) <- match kont
   = case occAnalCase env (Just (x, co_maybe)) bndr alts of { ( kont_usage, end') ->
-    (kont_usage +++ mkOneOcc env x False, Eval (Var x) (Kont fs end')) }
+    (kont_usage +++ mkOneOcc env x False, Eval (Var x) fs end') }
   where
-    match (Kont fs@[Cast co] (Case bndr alts)) = Just (Just co, fs, bndr, alts)
-    match (Kont []           (Case bndr alts)) = Just (Nothing, [], bndr, alts)
-    match _                                    = Nothing
+    match (fs@[Cast co], Case bndr alts) = Just (Just co, fs, bndr, alts)
+    match ([],           Case bndr alts) = Just (Nothing, [], bndr, alts)
+    match _                              = Nothing
 
-occAnalCut env fun kont@(Kont (App {} : _) _)
-  = let (args, kont') = collectArgs kont
-    in occAnalApp env fun args kont'
+occAnalCut env fun (frames@(App {} : _), end)
+  = let (args, frames') = collectArgs frames
+    in occAnalApp env fun args (frames', end)
     
 occAnalCut env term kont
   = case occAnalTerm (vanillaCtxt env) term of { ( term_usage, term' ) ->
-    case occAnalKont env term_usage kont    of { ( final_usage, kont' ) ->
-    ( final_usage, Eval term' kont' ) }}
+    case occAnalKont env term_usage kont    of { ( final_usage, (frames', end') ) ->
+    ( final_usage, Eval term' frames' end' ) }}
 
 occAnalJump :: OccEnv
             -> [SeqCoreArg]
@@ -1399,8 +1421,8 @@ occAnalApp env (Var fun) args kont
           -- This is the *whole point* of the isRhsEnv predicate
           -- See Note [Arguments of let-bound constructors]
     in
-    case occAnalKont env (fun_uds +++ final_args_uds) kont of { (total_uds, kont') ->
-    (total_uds, Eval (Var fun) (map App args' `addFrames` kont')) }}
+    case occAnalKont env (fun_uds +++ final_args_uds) kont of { (total_uds, (frames', end')) ->
+    (total_uds, Eval (Var fun) (map App args' ++ frames') end') }}
   where
     n_val_args = length (filter isValueArg args)
     fun_uds    = mkOneOcc env fun (n_val_args > 0)
@@ -1430,8 +1452,8 @@ occAnalApp env fun args kont
         -- onto the context stack.
 
     case occAnalArgs env args []                     of { (args_uds, args') ->
-    case occAnalKont env (fun_uds +++ args_uds) kont of { (total_uds, kont') ->
-    (total_uds, Eval fun' (map App args' `addFrames` kont')) }}}
+    case occAnalKont env (fun_uds +++ args_uds) kont of { (total_uds, (frames', end')) ->
+    (total_uds, Eval fun' (map App args' ++ frames') end') }}}
   
 occAnalArgs :: OccEnv -> [SeqCoreTerm] -> [OneShots] -> (UsageDetails, [SeqCoreTerm])
 occAnalArgs _ [] _ 

@@ -83,7 +83,7 @@ termFromCoreExpr expr
 -- already in that case.
 joinFromCoreExprByKontType :: Type -> Core.CoreExpr -> SeqCoreJoin
 joinFromCoreExprByKontType ty expr
-  = fromCoreExprAsJoin env (Kont [] Return) (argDescsForKontTy ty) markedExpr
+  = fromCoreExprAsJoin env ([], Return) (argDescsForKontTy ty) markedExpr
   where
     markedExpr = runEscM (escAnalExpr expr)
     env = initFromCoreEnvForExpr expr
@@ -633,7 +633,7 @@ escAnalUnfolding _                                            = return ()
 -- Continuation calling conventions --
 
 -- | The protocol for invoking a given let-bound continuation. Currently all
--- such continuations must be invoked using a jump, so 'ByJump' is the only
+-- such continuations must be invoked using a jump, so @ByJump@ is the only
 -- constructor, but we must still keep track of which arguments are fixed and
 -- should be omitted when converting a function call.
 newtype KontCallConv = ByJump [ArgDesc]
@@ -772,7 +772,7 @@ kontCallConv env var = lookupVarEnv (fce_boundKonts env) var
 
 fromCoreExpr :: FromCoreEnv -> Core.Expr MarkedVar -> SeqCoreKont
                             -> SeqCoreCommand
-fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
+fromCoreExpr env expr (fs, end) = go [] env expr fs end
   where
     go :: [SeqCoreBind] -> FromCoreEnv -> Core.Expr MarkedVar
        -> [SeqCoreFrame] -> SeqCoreEnd -> SeqCoreCommand
@@ -786,7 +786,7 @@ fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
         in go binds env e1 (App e2' : fs) end
       Core.Lam x e       -> done $ fromCoreLams env x e
       Core.Let bs e      ->
-        let (env', bs')   = fromCoreBind env (Just (Kont fs end)) bs
+        let (env', bs')   = fromCoreBind env (Just (fs, end)) bs
         in go (bs' : binds) env' e fs end
       Core.Case e (Marked x _) _ as
         -- If the continuation is just a return, copy it into the branches
@@ -796,7 +796,7 @@ fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
         -- part (see splitDupableKont); for now just share the whole thing.
         | otherwise -> 
         let join_arg  = mkKontArgId (idType x')
-            join_rhs  = Join [join_arg] (Eval (Var join_arg) (Kont [] end'))
+            join_rhs  = Join [join_arg] (Eval (Var join_arg) [] end')
             join_ty   = mkKontTy (mkTupleTy UnboxedTuple [idType x'])
             join_bndr = mkInlinableJoinBinder join_ty
             join_bind = NonRec (BindJoin join_bndr join_rhs)
@@ -804,28 +804,28 @@ fromCoreExpr env expr (Kont fs end) = go [] env expr fs end
         where
           (subst_rhs, x') = substBndr subst x
           env_rhs = env { fce_subst = subst_rhs }
-          end'    = Case x' $ map (fromCoreAlt env_rhs (Kont fs end)) as
+          end'    = Case x' $ map (fromCoreAlt env_rhs (fs, end)) as
       Core.Coercion co   -> done $ Coercion (substCo subst co)
       Core.Cast e co     -> go binds env e (Cast (substCo subst co) : fs) end
       Core.Tick ti e     -> go binds env e (Tick (substTickish subst ti) : fs) end
       Core.Type t        -> done $ Type (substTy subst t)
       where
         subst = fce_subst env
-        done term = mkCommand (reverse binds) term (Kont fs end)
+        done term = mkCommand (reverse binds) term fs end
         
         goApp x args = case conv_maybe of
           Just conv@(ByJump descs)
             -> assert (length args == length descs) $
                doneJump (removeFixedArgs args' conv) p
           Nothing
-            -> doneEval (Var x') (Kont (map App args' ++ fs) end)
+            -> doneEval (Var x') (map App args' ++ fs) end
           where
             x' = substIdOcc subst x
             args' = map (\e -> fromCoreExprAsTerm env e) args
             conv_maybe = kontCallConv env x'
             p = let Just conv = conv_maybe in idToJoinId x' conv
             
-            doneEval v k = mkCommand (reverse binds) v k
+            doneEval v fs e = mkCommand (reverse binds) v fs e
             doneJump vs j = foldr Let (Jump vs j) (reverse binds)
 
 fromCoreLams :: FromCoreEnv -> MarkedVar -> Core.Expr MarkedVar
@@ -834,7 +834,7 @@ fromCoreLams env (Marked x _) expr
   = mkLambdas xs' body'
   where
     (xs, body) = Core.collectBinders expr
-    bodyComm = fromCoreExpr env' body (Kont [] Return)
+    bodyComm = fromCoreExpr env' body ([], Return)
     body' = mkCompute ty bodyComm
     (subst', xs') = substBndrs (fce_subst env) (x : map unmark xs)
     env' = env { fce_subst = subst' }
@@ -844,7 +844,7 @@ fromCoreExprAsTerm :: FromCoreEnv -> Core.Expr MarkedVar -> SeqCoreTerm
 fromCoreExprAsTerm env expr
   = mkCompute ty body
   where
-    body = fromCoreExpr env expr (Kont [] Return)
+    body = fromCoreExpr env expr ([], Return)
     subst = fce_subst env
     ty = substTy subst (Core.exprType (unmarkExpr expr))
 
@@ -987,11 +987,11 @@ fromCoreBinds = snd . mapAccumL (\env -> fromCoreBind env Nothing) initFromCoreE
 commandToCoreExpr :: Type -> SeqCoreCommand -> Core.CoreExpr
 commandToCoreExpr retTy comm
   = case comm of
-      Let bind comm' -> Core.mkCoreLet (bindToCore (Just retTy) bind)
-                                       (commandToCoreExpr retTy comm')
-      Eval term kont -> kontToCoreExpr retTy kont (termToCoreExpr term)
-      Jump args j    -> Core.mkCoreApps (Core.Var (joinIdToCore retTy j))
-                                        (map termToCoreExpr args ++ extraArgs)
+      Let bind comm'   -> Core.mkCoreLet (bindToCore (Just retTy) bind)
+                                         (commandToCoreExpr retTy comm')
+      Eval term fs end -> kontToCoreExpr retTy (fs, end) (termToCoreExpr term)
+      Jump args j      -> Core.mkCoreApps (Core.Var (joinIdToCore retTy j))
+                                          (map termToCoreExpr args ++ extraArgs)
         where
           extraArgs | all isTypeArg args = [ Core.Var voidPrimId ]
                     | otherwise          = []
@@ -1007,6 +1007,7 @@ termToCoreExpr val =
     Coercion co  -> Core.Coercion co
     Compute kb c -> commandToCoreExpr kb c
 
+-- | Translates a join point into Core.
 joinToCoreExpr :: Type -> SeqCoreJoin -> Core.CoreExpr
 joinToCoreExpr = joinToCoreExpr' NonRecursive
 
@@ -1021,13 +1022,14 @@ joinToCoreExpr' recFlag retTy (Join xs comm)
     setOneShotLambdaIfId x | isId x = setOneShotLambda x
                            | otherwise = x
 
+-- | Functional representation of expression contexts in Core.
 type CoreContext = Core.CoreExpr -> Core.CoreExpr
 
 -- | Translates a continuation into a function that will wrap a Core expression
 -- with a fragment of context (an argument to apply to, a case expression to
 -- run, etc.).
 kontToCoreExpr :: Type -> SeqCoreKont -> CoreContext
-kontToCoreExpr retTy (Kont fs end) =
+kontToCoreExpr retTy (fs, end) =
   foldr (flip (.)) (endToCoreExpr retTy end) (map frameToCoreExpr fs)
 
 frameToCoreExpr :: SeqCoreFrame -> CoreContext
@@ -1043,6 +1045,11 @@ endToCoreExpr retTy k =
     Case {- expr -} b as -> \e -> Core.Case e b retTy (map (altToCore retTy) as)
     Return               -> \e -> e
 
+-- | Convert a join id to its Core form. For instance, given a return type of 
+--   String,
+--     @j :: Cont# (exists# a. (# a, Int, Char #))
+--   becomes
+--     @j :: forall a. a -> Int -> Char -> String
 joinIdToCore :: Type -> JoinId -> Id
 joinIdToCore retTy j = maybeAddArity $ j `setIdType` kontTyToCoreTy argTy retTy
   where
